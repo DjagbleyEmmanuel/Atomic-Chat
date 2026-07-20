@@ -1,0 +1,1034 @@
+import { type UIMessage } from '@ai-sdk/react'
+import {
+  convertToModelMessages,
+  streamText,
+  NoSuchToolError,
+  type ChatRequestOptions,
+  type ChatTransport,
+  type LanguageModel,
+  type UIMessageChunk,
+  type Tool,
+  type LanguageModelUsage,
+  type TextStreamPart,
+  jsonSchema,
+} from 'ai'
+import { repairToolCallArguments } from './repairToolCall'
+import { prepareToolResultImagesForModel } from './toolResultImages'
+
+/// Hugging Face special-token convention (`<|im_end|>`, `<|eot_id|>`,
+/// `<|endoftext|>`, etc.). Some MLX backends — most visibly the DFlash
+/// custom `stream_generate` path — leak the EOS marker as plain text in
+/// the final delta instead of using it purely as a stop signal. These
+/// markers never appear in well-formed assistant output, so we strip
+/// them unconditionally before the chunk reaches the UI or the saved
+/// message body.
+const SPECIAL_TOKEN_REGEX = /<\|[a-zA-Z0-9_]+\|>/g
+
+/// `streamText` transform that scrubs the special-token markers from
+/// every `text-delta`. We pass `unknown` for `TOOLS` because the
+/// transform doesn't introspect tools.
+const stripSpecialTokensTransform = () =>
+  new TransformStream<TextStreamPart<never>, TextStreamPart<never>>({
+    transform(chunk, controller) {
+      if (chunk.type === 'text-delta') {
+        const cleaned = chunk.text.replace(SPECIAL_TOKEN_REGEX, '')
+        if (cleaned.length === 0) {
+          /// Emit a whitespace delta so the UI shows streaming state while
+          /// reasoning / special-token-only prefixes are stripped.
+          controller.enqueue({ ...chunk, text: ' ' })
+          return
+        }
+        controller.enqueue({ ...chunk, text: cleaned })
+        return
+      }
+      controller.enqueue(chunk)
+    },
+  })
+import { useServiceStore } from '@/hooks/useServiceHub'
+import { useToolAvailable } from '@/hooks/useToolAvailable'
+import { ModelFactory } from './model-factory'
+import { useModelProvider } from '@/hooks/useModelProvider'
+import { useSamplingSettings } from '@/hooks/useSamplingSettings'
+import { withRecommendedSampling } from '@/lib/predefinedParams'
+import { useGeneralSetting } from '@/hooks/useGeneralSetting'
+import { useThreads } from '@/hooks/useThreads'
+import { useAttachments } from '@/hooks/useAttachments'
+import { useAppState } from '@/hooks/useAppState'
+import { ExtensionManager } from '@/lib/extension'
+import { ExtensionTypeEnum, VectorDBExtension } from '@janhq/core'
+import { ttftMark } from '@/lib/ttft-timing'
+import { extractModelErrorMessage } from '@/lib/modelErrorMessage'
+
+/// Local inference backends (mlx, llamacpp, llamacpp-upstream,
+/// foundation-models) get special handling at the `streamText` boundary:
+///   * when tools are also active, the assistant system prompt is not passed
+///     as a `system` message — gemma-4 and similar local models reliably
+///     auto-emit a chain-of-thought block whenever the rendered prompt
+///     contains BOTH a system message and tools, even with
+///     `chat_template_kwargs.enable_thinking=false`. To avoid silently losing
+///     the user's instructions they are instead folded into the first user
+///     message (see foldSystemIntoFirstUserMessage). When no tools are active
+///     there is no CoT risk, so the system prompt is sent normally.
+/// Tool inclusion is **independent of the reasoning toggle** for all
+/// providers: tools are forwarded whenever the tools on/off setting has
+/// them enabled and the model supports tool calling.
+/// Remote providers (OpenAI, Anthropic, …) are unaffected.
+const LOCAL_INFERENCE_PROVIDERS = new Set<string>([
+  'mlx',
+  'llamacpp',
+  'llamacpp-upstream',
+  'foundation-models',
+])
+
+/// Map an audio MIME type to the `format` string expected by the OpenAI-style
+/// `input_audio` content part (which the MLX/omni backend consumes).
+function audioMediaTypeToFormat(mediaType: string): string {
+  const mt = mediaType.toLowerCase()
+  if (mt.includes('mpeg') || mt.includes('mp3')) return 'mp3'
+  if (mt.includes('wav') || mt.includes('wave')) return 'wav'
+  if (mt.includes('ogg')) return 'ogg'
+  if (mt.includes('flac')) return 'flac'
+  // Fall back to the subtype (audio/<x> → <x>); the backend rejects unknowns.
+  return mt.split('/')[1] ?? 'mp3'
+}
+
+/// Pull audio attachments out of the latest user message as `input_audio`
+/// payloads. Audio is carried in the UI as a `file` part with an `audio/*`
+/// media type, but the `@ai-sdk/openai-compatible` message converter only
+/// understands `image/*` file parts and throws `UnsupportedFunctionalityError`
+/// on anything else — so audio never travels through the normal message path.
+/// Instead we extract it here and inject it at the MLX fetch layer.
+export function extractAudioInputParts(
+  messages: UIMessage[]
+): Array<{ data: string; format: string }> {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (message.role !== 'user') continue
+    const parts = Array.isArray(message.parts) ? message.parts : []
+    const audio: Array<{ data: string; format: string }> = []
+    for (const part of parts as Array<Record<string, unknown>>) {
+      if (
+        part.type === 'file' &&
+        typeof part.mediaType === 'string' &&
+        part.mediaType.startsWith('audio/') &&
+        typeof part.url === 'string'
+      ) {
+        const url = part.url as string
+        const data = url.includes(',') ? url.slice(url.indexOf(',') + 1) : url
+        audio.push({ data, format: audioMediaTypeToFormat(part.mediaType) })
+      }
+    }
+    // Only the most recent user turn can carry freshly attached audio.
+    return audio
+  }
+  return []
+}
+
+/// Return a copy of `messages` with audio `file` parts removed. The audio is
+/// delivered out-of-band (see extractAudioInputParts), and leaving the parts in
+/// place would make the OpenAI-compatible converter throw. Non-audio parts and
+/// untouched messages are preserved by reference.
+function stripAudioFileParts(messages: UIMessage[]): UIMessage[] {
+  return messages.map((message) => {
+    const parts = Array.isArray(message.parts) ? message.parts : []
+    const hasAudio = parts.some(
+      (p) =>
+        (p as Record<string, unknown>).type === 'file' &&
+        typeof (p as Record<string, unknown>).mediaType === 'string' &&
+        ((p as Record<string, unknown>).mediaType as string).startsWith(
+          'audio/'
+        )
+    )
+    if (!hasAudio) return message
+    return {
+      ...message,
+      parts: parts.filter(
+        (p) =>
+          !(
+            (p as Record<string, unknown>).type === 'file' &&
+            typeof (p as Record<string, unknown>).mediaType === 'string' &&
+            ((p as Record<string, unknown>).mediaType as string).startsWith(
+              'audio/'
+            )
+          )
+      ),
+    } as UIMessage
+  })
+}
+
+/// Fold the assistant system prompt into the first user message.
+///
+/// Local backends (gemma-4 et al.) reliably emit a spurious chain-of-thought
+/// block when the rendered prompt contains BOTH a `system` message and tools,
+/// so we cannot pass `system` alongside tools. Dropping it entirely, however,
+/// means the user's assistant instructions are silently ignored whenever an
+/// MCP/RAG tool is active. Instead we prepend the instructions to the first
+/// user turn — the same position a system prompt occupies once gemma's chat
+/// template merges it — so the model still honors them without the CoT trigger.
+export function foldSystemIntoFirstUserMessage<
+  T extends { role: string; content: unknown },
+>(messages: T[], system: string): T[] {
+  const idx = messages.findIndex((m) => m.role === 'user')
+  if (idx === -1) {
+    return [{ role: 'user', content: system } as unknown as T, ...messages]
+  }
+
+  const target = messages[idx]
+  const content = target.content
+  let newContent: unknown
+  if (typeof content === 'string') {
+    newContent = `${system}\n\n${content}`
+  } else if (Array.isArray(content)) {
+    newContent = [{ type: 'text', text: `${system}\n\n` }, ...content]
+  } else {
+    newContent = system
+  }
+
+  const copy = [...messages]
+  copy[idx] = { ...target, content: newContent } as T
+  return copy
+}
+
+export function shouldSuppressToolsForUpstreamDflash(
+  providerId: string,
+  settings: readonly ProviderSetting[] | undefined
+): boolean {
+  return (
+    providerId === 'llamacpp-upstream' &&
+    settings?.some(
+      (setting) =>
+        setting.key === 'dflash' &&
+        setting.controller_props.value === true
+    ) === true
+  )
+}
+
+export function withUpstreamDflashSampling(
+  providerId: string,
+  settings: readonly ProviderSetting[] | undefined,
+  params: Record<string, unknown>
+): Record<string, unknown> {
+  if (!shouldSuppressToolsForUpstreamDflash(providerId, settings)) return params
+  return {
+    ...params,
+    temperature: 0,
+    top_k: 1,
+    repeat_penalty: 1,
+    presence_penalty: 0,
+    frequency_penalty: 0,
+  }
+}
+
+export function withUpstreamDflashReasoningOverride(
+  providerId: string,
+  settings: readonly ProviderSetting[] | undefined,
+  override: Record<string, unknown>
+): Record<string, unknown> {
+  if (!shouldSuppressToolsForUpstreamDflash(providerId, settings)) {
+    return override
+  }
+
+  const existingTemplateKwargs =
+    typeof override.chat_template_kwargs === 'object' &&
+    override.chat_template_kwargs !== null &&
+    !Array.isArray(override.chat_template_kwargs)
+      ? (override.chat_template_kwargs as Record<string, unknown>)
+      : {}
+
+  return {
+    ...override,
+    chat_template_kwargs: {
+      ...existingTemplateKwargs,
+      enable_thinking: false,
+    },
+    reasoning_budget: 0,
+  }
+}
+
+export type TokenUsageCallback = (
+  usage: LanguageModelUsage,
+  messageId: string
+) => void
+export type StreamingTokenSpeedCallback = (
+  tokenCount: number,
+  elapsedMs: number
+) => void
+export type OnFinishCallback = (params: {
+  message: UIMessage
+  isAbort?: boolean
+}) => void
+export type OnToolCallCallback = (params: {
+  toolCall: { toolCallId: string; toolName: string; input: unknown }
+}) => void
+export type ServiceHub = {
+  rag(): {
+    getTools(): Promise<
+      Array<{ name: string; description: string; inputSchema: unknown }>
+    >
+  }
+  mcp(): {
+    getTools(): Promise<
+      Array<{ name: string; description: string; inputSchema: unknown }>
+    >
+  }
+}
+
+/**
+ * Wraps a UIMessageChunk stream so that when the first `text-start` chunk
+ * arrives, a `text-delta` carrying `prefixText` is immediately injected into
+ * the same text block. This makes the new message show the partial content
+ * right away while continuation tokens stream in after it.
+ */
+function prependTextDeltaToUIStream(
+  stream: ReadableStream<UIMessageChunk>,
+  prefixText: string
+): ReadableStream<UIMessageChunk> {
+  const reader = stream.getReader()
+  let prefixEmitted = false
+  return new ReadableStream<UIMessageChunk>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read()
+        if (done) {
+          controller.close()
+          return
+        }
+        controller.enqueue(value)
+        if (
+          !prefixEmitted &&
+          (value as { type: string }).type === 'text-start'
+        ) {
+          prefixEmitted = true
+          const id = (value as { type: 'text-start'; id: string }).id
+          controller.enqueue({
+            type: 'text-delta',
+            id,
+            delta: prefixText,
+          } as UIMessageChunk)
+        }
+      } catch (error) {
+        controller.error(error)
+      }
+    },
+    cancel() {
+      reader.cancel()
+    },
+  })
+}
+
+export class CustomChatTransport implements ChatTransport<UIMessage> {
+  public model: LanguageModel | null = null
+  private tools: Record<string, Tool> = {}
+  private onTokenUsage?: TokenUsageCallback
+  private hasDocuments = false
+  private modelSupportsTools = false
+  private ragFeatureAvailable = false
+  private systemMessage?: string
+  private serviceHub: ServiceHub | null
+  private threadId?: string
+  private continueFromContent: string | null = null
+  private toolsCacheKey = ''
+  private toolsCacheValid = false
+
+  constructor(systemMessage?: string, threadId?: string) {
+    this.systemMessage = systemMessage
+    this.threadId = threadId
+    this.serviceHub = useServiceStore.getState().serviceHub
+    // Tools will be loaded when updateRagToolsAvailability is called with model capabilities
+  }
+
+  updateSystemMessage(systemMessage: string | undefined) {
+    this.systemMessage = systemMessage
+  }
+
+  /** Thread this transport is bound to. RAG/project lookups key off it. */
+  getThreadId(): string | undefined {
+    return this.threadId
+  }
+
+  setOnTokenUsage(callback: TokenUsageCallback | undefined) {
+    this.onTokenUsage = callback
+  }
+
+  /**
+   * Update RAG tools availability based on thread metadata and model capabilities
+   * @param hasDocuments - Whether the thread has documents attached
+   * @param modelSupportsTools - Whether the current model supports tool calling
+   * @param ragFeatureAvailable - Whether RAG features are available on the platform
+   */
+  async updateRagToolsAvailability(
+    hasDocuments: boolean,
+    modelSupportsTools: boolean,
+    ragFeatureAvailable: boolean
+  ) {
+    this.hasDocuments = hasDocuments
+    this.modelSupportsTools = modelSupportsTools
+    this.ragFeatureAvailable = ragFeatureAvailable
+
+    // Update tools based on current state
+    await this.refreshTools()
+  }
+
+  /**
+   * Refresh tools based on current state
+   * Reloads both RAG and MCP tools and merges them
+   * Filters out disabled tools based on thread settings
+   * @private
+   */
+  invalidateToolsCache() {
+    this.toolsCacheValid = false
+  }
+
+  private buildToolsCacheKey(
+    disabledToolKeys: string[],
+    hasDocuments: boolean,
+    ragFeatureAvailable: boolean,
+    modelSupportsTools: boolean
+  ): string {
+    const mcp = [...useAppState.getState().mcpToolNames].sort().join(',')
+    const rag = [...useAppState.getState().ragToolNames].sort().join(',')
+    return [
+      this.threadId ?? '',
+      hasDocuments,
+      ragFeatureAvailable,
+      modelSupportsTools,
+      disabledToolKeys.join(','),
+      mcp,
+      rag,
+    ].join('|')
+  }
+
+  async refreshTools(force = false) {
+    if (!this.serviceHub) {
+      this.tools = {}
+      this.toolsCacheValid = false
+      return
+    }
+
+    const getDisabledToolsForThread =
+      useToolAvailable.getState().getDisabledToolsForThread
+    const disabledToolKeys = this.threadId
+      ? getDisabledToolsForThread(this.threadId)
+      : useToolAvailable.getState().getDefaultDisabledTools()
+
+    const selectedModel = useModelProvider.getState().selectedModel
+    const modelSupportsTools =
+      selectedModel?.capabilities?.includes('tools') ?? this.modelSupportsTools
+
+    let hasDocuments = this.hasDocuments
+    let ragFeatureAvailable = this.ragFeatureAvailable
+
+    if (!hasDocuments && this.threadId) {
+      const thread = useThreads.getState().threads[this.threadId]
+      hasDocuments = Boolean(thread?.metadata?.hasDocuments)
+    }
+    if (!ragFeatureAvailable) {
+      ragFeatureAvailable = Boolean(useAttachments.getState().enabled)
+    }
+
+    const cacheKey = this.buildToolsCacheKey(
+      disabledToolKeys,
+      hasDocuments,
+      ragFeatureAvailable,
+      modelSupportsTools
+    )
+    if (!force && this.toolsCacheValid && cacheKey === this.toolsCacheKey) {
+      return
+    }
+
+    const toolsRecord: Record<string, Tool> = {}
+
+    const isToolDisabled = (serverName: string, toolName: string): boolean => {
+      const toolKey = `${serverName}::${toolName}`
+      return disabledToolKeys.includes(toolKey)
+    }
+
+    if (modelSupportsTools) {
+      if (!hasDocuments && this.threadId) {
+        const thread = useThreads.getState().threads[this.threadId]
+        const hasThreadDocuments = Boolean(thread?.metadata?.hasDocuments)
+
+        const projectId = thread?.metadata?.project?.id
+        if (projectId) {
+          try {
+            const ext = ExtensionManager.getInstance().get<VectorDBExtension>(
+              ExtensionTypeEnum.VectorDB
+            )
+            if (ext?.listAttachmentsForProject) {
+              const projectFiles =
+                await ext.listAttachmentsForProject(projectId)
+              hasDocuments = hasThreadDocuments || projectFiles.length > 0
+            }
+          } catch (error) {
+            console.warn('Failed to check project files:', error)
+            hasDocuments = hasThreadDocuments
+          }
+        } else {
+          hasDocuments = hasThreadDocuments
+        }
+      }
+
+      if (!ragFeatureAvailable) {
+        ragFeatureAvailable = Boolean(useAttachments.getState().enabled)
+      }
+
+      // Load RAG tools if documents are available
+      if (hasDocuments && ragFeatureAvailable) {
+        try {
+          const ragTools = await this.serviceHub.rag().getTools()
+          if (Array.isArray(ragTools) && ragTools.length > 0) {
+            // Convert RAG tools to AI SDK format, filtering out disabled tools
+            ragTools.forEach((tool) => {
+              // RAG tools use MCPTool interface with server field
+              const serverName =
+                (tool as { server?: string }).server || 'unknown'
+              if (!isToolDisabled(serverName, tool.name)) {
+                toolsRecord[tool.name] = {
+                  description: tool.description,
+                  inputSchema: jsonSchema(
+                    tool.inputSchema as Record<string, unknown>
+                  ),
+                } as Tool
+              }
+            })
+          }
+        } catch (error) {
+          console.warn('Failed to load RAG tools:', error)
+        }
+      }
+
+      // Read MCP tools from the global store (populated once at app
+      // startup by useTools and refreshed on MCP_UPDATE events). Avoids a
+      // cold ~1.8s round-trip into the MCP service on every new thread's
+      // first sendMessages call.
+      try {
+        const mcpTools = useAppState.getState().tools
+        if (Array.isArray(mcpTools) && mcpTools.length > 0) {
+          // Convert MCP tools to AI SDK format, filtering out disabled tools
+          // MCP tools added after RAG tools, so they take precedence in case of name conflicts
+          mcpTools.forEach((tool) => {
+            // MCP tools use MCPTool interface with server field
+            const serverName = (tool as { server?: string }).server || 'unknown'
+            if (!isToolDisabled(serverName, tool.name)) {
+              toolsRecord[tool.name] = {
+                description: tool.description,
+                inputSchema: jsonSchema(
+                  tool.inputSchema as Record<string, unknown>
+                ),
+              } as Tool
+            }
+          })
+        }
+      } catch (error) {
+        console.warn('Failed to load MCP tools:', error)
+      }
+    }
+
+    const sortedEntries = Object.entries(toolsRecord).sort(([a], [b]) =>
+      a.localeCompare(b)
+    )
+    this.tools = Object.fromEntries(sortedEntries)
+    this.toolsCacheKey = cacheKey
+    this.toolsCacheValid = true
+  }
+
+  /**
+   * Get current tools
+   */
+  getTools(): Record<string, Tool> {
+    return this.tools
+  }
+
+  /**
+   * Set partial assistant content to send as a prefill on the next request,
+   * so the model continues generation from where it left off.
+   */
+  setContinueFromContent(content: string) {
+    this.continueFromContent = content
+  }
+
+  async sendMessages(
+    options: {
+      chatId: string
+      messages: UIMessage[]
+      abortSignal: AbortSignal | undefined
+    } & {
+      trigger: 'submit-message' | 'regenerate-message'
+      messageId: string | undefined
+    } & ChatRequestOptions
+  ): Promise<ReadableStream<UIMessageChunk>> {
+    ttftMark('gammaStart')
+    await this.refreshTools()
+    ttftMark('gammaEnd')
+
+    // Capture the effective provider name early so the Anthropic serial
+    // tool-use repair later uses the same value that was used to create the
+    // model, even if the user switches provider mid-request.
+    const modelId = useModelProvider.getState().selectedModel?.id
+    const providerId = useModelProvider.getState().selectedProvider
+    const effectiveProviderName = providerId
+    const provider = useModelProvider.getState().getProviderByName(providerId)
+    if (this.serviceHub && modelId && provider) {
+      try {
+        const updatedProvider = useModelProvider
+          .getState()
+          .getProviderByName(providerId)
+
+        // Global sampling parameters (no longer per-assistant). Injected
+        // verbatim into local-backend request bodies by ModelFactory. For
+        // Gemma 4 QAT, Google's recommended sampler (temp 1.0 / top_p 0.95 /
+        // top_k 64) is layered on at request time unless the user has tuned
+        // sampling themselves — non-destructive, follows the active model.
+        const samplingState = useSamplingSettings.getState()
+        const providerSettings =
+          updatedProvider?.settings ?? provider.settings
+        const inferenceParams = withUpstreamDflashSampling(
+          providerId,
+          providerSettings,
+          withRecommendedSampling(
+            modelId,
+            samplingState.getParams(),
+            samplingState.userOverridden
+          )
+        )
+
+        // Global "Disable reasoning" setting — best-effort: dispatch the
+        // provider-specific flag that skips the thinking phase. Unknown keys
+        // are silently ignored by most providers, but we still branch per
+        // provider to stay safe with stricter APIs (e.g. Anthropic).
+        //
+        // The override is kept SEPARATE from `inferenceParams` so local-only
+        // fields (top_k, repeat_penalty, …) never leak into cloud-provider
+        // request bodies. See ModelFactory for the fetch wiring.
+        const { disableReasoning, reasoningBudget } =
+          useGeneralSetting.getState()
+        const reasoningOverride: Record<string, unknown> = {}
+        const reasoningBudgetTokens: Record<
+          typeof reasoningBudget,
+          number | undefined
+        > = {
+          off: 0,
+          low: 256,
+          medium: 1024,
+          high: 4096,
+          unlimited: undefined,
+        }
+        if (disableReasoning || reasoningBudget === 'off') {
+          switch (effectiveProviderName) {
+            case 'llamacpp':
+            case 'llamacpp-upstream':
+            case 'mlx':
+              reasoningOverride.chat_template_kwargs = {
+                enable_thinking: false,
+              }
+              reasoningOverride.reasoning_budget = 0
+              break
+            case 'anthropic':
+              reasoningOverride.thinking = { type: 'disabled' }
+              break
+            case 'openai':
+              reasoningOverride.reasoning_effort = 'minimal'
+              break
+            case 'xai':
+              reasoningOverride.reasoning_effort = 'low'
+              break
+            case 'google':
+            case 'gemini':
+              reasoningOverride.reasoning_effort = 'minimal'
+              reasoningOverride.extra_body = {
+                google: { thinking_config: { thinking_budget: 0 } },
+              }
+              break
+            case 'moonshot':
+              // Moonshot (Kimi) accepts only high|low|medium|max|xhigh; rejects
+              // `minimal`. `low` is the closest analogue to "skip thinking".
+              reasoningOverride.reasoning_effort = 'low'
+              break
+            default:
+              // Unknown / user-added custom providers: do NOT inject
+              // `reasoning_effort` — strict OpenAI-compatible schemas
+              // (e.g. Moonshot, some self-hosted gateways) reject unknown
+              // variants like `minimal`. The chat_template_kwargs hint is
+              // safe: most servers ignore unknown keys.
+              reasoningOverride.chat_template_kwargs = {
+                enable_thinking: false,
+              }
+          }
+        } else if (
+          (effectiveProviderName === 'llamacpp' ||
+            effectiveProviderName === 'llamacpp-upstream' ||
+            effectiveProviderName === 'mlx') &&
+          reasoningBudgetTokens[reasoningBudget] !== undefined
+        ) {
+          reasoningOverride.reasoning_budget =
+            reasoningBudgetTokens[reasoningBudget]
+        }
+        const effectiveReasoningOverride =
+          withUpstreamDflashReasoningOverride(
+            providerId,
+            providerSettings,
+            reasoningOverride
+          )
+        const hasOverride =
+          Object.keys(effectiveReasoningOverride).length > 0
+
+        // Audio attachments (omni/audio-capable models, MLX backend) are
+        // injected as `input_audio` at the MLX fetch layer rather than as
+        // file parts — the OpenAI-compatible converter rejects audio file
+        // parts. Only the MLX provider consumes them today.
+        const audioInputParts =
+          effectiveProviderName === 'mlx'
+            ? extractAudioInputParts(options.messages)
+            : []
+
+        ttftMark('deltaStart')
+        this.model = await ModelFactory.createModel(
+          modelId,
+          updatedProvider ?? provider,
+          inferenceParams ?? {},
+          hasOverride ? effectiveReasoningOverride : undefined,
+          audioInputParts.length > 0 ? audioInputParts : undefined
+        )
+        ttftMark('deltaEnd')
+      } catch (error) {
+        console.error('Failed to create model:', error)
+        throw new Error(
+          `Failed to create model: ${extractModelErrorMessage(error)}`
+        )
+      }
+    } else {
+      throw new Error('ServiceHub not initialized or model/provider missing.')
+    }
+
+    // Fix for Anthropic serial tool-use (error 400): when an assistant message
+    // contains tool parts interleaved with text parts (serial tool calls),
+    // split it into separate messages so convertToModelMessages produces the
+    // tool_use / tool_result pairing that the Claude API requires.
+    // See: https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use#parallel-tool-use
+    const messagesToConvert = (() => {
+      if (effectiveProviderName !== 'anthropic') {
+        return options.messages
+      }
+      return options.messages.flatMap((message) => {
+        if (message.role !== 'assistant') return [message]
+
+        const parts = Array.isArray(message.parts) ? message.parts : []
+        if (parts.length === 0) return [message]
+
+        const isToolPart = (p: (typeof parts)[number]) =>
+          p.type.startsWith('tool-')
+
+        const waves: (typeof parts)[] = []
+        let currentWave: typeof parts = []
+        let seenToolParts = false
+
+        for (const part of parts) {
+          if (isToolPart(part)) {
+            seenToolParts = true
+            currentWave.push(part)
+          } else if (!isToolPart(part) && seenToolParts) {
+            // Any non-tool part (text, reasoning, file, etc.) after tool parts
+            // marks the start of a new wave
+            waves.push(currentWave)
+            currentWave = [part]
+            seenToolParts = false
+          } else {
+            currentWave.push(part)
+          }
+        }
+        if (currentWave.length > 0) waves.push(currentWave)
+
+        // No serial tool calls detected — return original message unchanged
+        if (waves.length <= 1) return [message]
+
+        return waves.map((waveParts, i) => ({
+          ...message,
+          id: `${message.id}_w${i}`,
+          parts: waveParts,
+        }))
+      })
+    })()
+
+    // Convert UI messages to model messages. Audio file parts are stripped
+    // first: they are delivered out-of-band as `input_audio` (see
+    // extractAudioInputParts), and the OpenAI-compatible converter throws on
+    // any non-image file part.
+    let preparedMessages = stripAudioFileParts(
+      this.mapUserInlineAttachments(messagesToConvert)
+    )
+    // Local backends serialize tool results to a `role: "tool"` text message
+    // (JSON.stringify), so an image in a tool result (e.g. an MCP screenshot
+    // tool) would otherwise be sent as full base64 TEXT and flood the context
+    // window — the root cause of ATO-208's MLX 400s. Strip the base64 out of
+    // the model payload (placeholder) and, for vision models, re-attach the
+    // image as a proper multimodal user message. Cloud providers are left
+    // untouched (they have large contexts and handle this differently).
+    if (LOCAL_INFERENCE_PROVIDERS.has(effectiveProviderName)) {
+      const supportsVision =
+        useModelProvider
+          .getState()
+          .selectedModel?.capabilities?.includes('vision') ?? false
+      preparedMessages = prepareToolResultImagesForModel(preparedMessages, {
+        supportsVision,
+      })
+    }
+    const baseMessages = convertToModelMessages(preparedMessages)
+
+    // If continuing a truncated response, append the partial assistant content as a
+    // prefill so the model resumes from where it left off rather than regenerating.
+    const continueContent = this.continueFromContent
+    this.continueFromContent = null
+    const modelMessages = continueContent
+      ? [
+          ...baseMessages,
+          { role: 'assistant' as const, content: continueContent },
+        ]
+      : baseMessages
+
+    // Local-providers (mlx, llamacpp, llamacpp-upstream, foundation-models):
+    // when tools are also active we don't pass a `system` message (gemma-4 and
+    // similar local models reliably auto-emit a chain-of-thought block whenever
+    // the rendered prompt contains BOTH a system message and tools). Instead of
+    // discarding the user's assistant instructions, they are folded into the
+    // first user message below so the model still honors them. Without tools
+    // there is no CoT risk, so the system prompt is forwarded normally.
+    // See LOCAL_INFERENCE_PROVIDERS for rationale. Tool inclusion is
+    // independent of the reasoning toggle and governed solely by the tools
+    // on/off setting (via refreshTools -> useToolAvailable).
+    const isLocalProvider =
+      LOCAL_INFERENCE_PROVIDERS.has(effectiveProviderName)
+
+    const hasTools = Object.keys(this.tools).length > 0
+    const selectedModel = useModelProvider.getState().selectedModel
+    const modelSupportsTools =
+      selectedModel?.capabilities?.includes('tools') ?? this.modelSupportsTools
+    const suppressToolsForDflash = shouldSuppressToolsForUpstreamDflash(
+      effectiveProviderName,
+      provider.settings
+    )
+    const shouldEnableTools =
+      hasTools && modelSupportsTools && !suppressToolsForDflash
+
+    const dropSystemForTools =
+      isLocalProvider && shouldEnableTools && !!this.systemMessage
+    const effectiveSystemMessage = dropSystemForTools
+      ? undefined
+      : this.systemMessage
+
+    // When we drop the `system` field for the gemma+tools CoT workaround, fold
+    // the instructions into the first user message so they still reach the
+    // model instead of being silently lost.
+    const finalModelMessages =
+      dropSystemForTools && this.systemMessage
+        ? foldSystemIntoFirstUserMessage(modelMessages, this.systemMessage)
+        : modelMessages
+
+    // Track stream timing and token count for token speed calculation.
+    // We start the clock on the *first generated delta* (text or reasoning),
+    // not on the `start` event, so the wall-clock fallback measures decode
+    // throughput rather than (TTFT + prefill + decode). Without this, long
+    // system prompts and MTP/dflash spin-up artificially deflate the
+    // displayed tokens/sec.
+    let streamStartTime: number | undefined
+
+    const maxOutputTokens = useSamplingSettings.getState().getParams()
+      ?.max_output_tokens as number | undefined
+
+    const result = streamText({
+      model: this.model,
+      messages: finalModelMessages,
+      abortSignal: options.abortSignal,
+      tools: shouldEnableTools ? this.tools : undefined,
+      toolChoice: shouldEnableTools ? 'auto' : undefined,
+      system: effectiveSystemMessage,
+      maxOutputTokens,
+      experimental_transform: stripSpecialTokensTransform,
+      experimental_repairToolCall: async ({ toolCall, error }) => {
+        if (NoSuchToolError.isInstance(error)) return null
+        const repaired = repairToolCallArguments(toolCall.input)
+        if (repaired === null) return null
+        return { ...toolCall, input: repaired }
+      },
+    })
+
+    let tokensPerSecond = 0
+    let draftTokensTotal: number | null = null
+    let draftTokensAccepted: number | null = null
+
+    const uiStream = result.toUIMessageStream({
+      messageMetadata: ({ part }) => {
+        // Start the wall-clock timer on the first generated delta (text or
+        // reasoning), NOT on `start` — the latter fires before prefill, so
+        // including it would tank the fallback TPS on long prompts.
+        if (
+          !streamStartTime &&
+          (part.type === 'text-delta' || part.type === 'reasoning-delta')
+        ) {
+          streamStartTime = Date.now()
+        }
+
+        if (part.type === 'finish-step') {
+          const pm = part.providerMetadata?.providerMetadata as
+            | Record<string, unknown>
+            | undefined
+          tokensPerSecond = (pm?.tokensPerSecond as number) || 0
+          draftTokensTotal = (pm?.draftTokensTotal as number) ?? null
+          draftTokensAccepted = (pm?.draftTokensAccepted as number) ?? null
+        }
+
+        // Add usage and token speed to metadata on finish
+        if (part.type === 'finish') {
+          const finishPart = part as {
+            type: 'finish'
+            totalUsage: LanguageModelUsage
+            finishReason: string
+          }
+          const usage = finishPart.totalUsage
+          const durationMs = streamStartTime ? Date.now() - streamStartTime : 0
+          const durationSec = durationMs / 1000
+
+          // Use provider's outputTokens, or llama.cpp completionTokens, or fall back to text delta count
+          const outputTokens = usage?.outputTokens ?? 0
+          const inputTokens = usage?.inputTokens
+
+          // Prefer the provider-reported decode TPS (mlx-vlm `generation_tps`
+          // or llama.cpp / dflash `predicted_per_second`). Fall back to a
+          // wall-clock estimate measured from the first delta — but only if
+          // the timer ever started AND we actually produced tokens (e.g. a
+          // pure tool-call response yields 0 tokens and no delta, so the
+          // fallback would otherwise divide by zero).
+          let tokenSpeed: number
+          if (tokensPerSecond > 0) {
+            tokenSpeed = tokensPerSecond
+          } else if (
+            streamStartTime !== undefined &&
+            durationSec > 0 &&
+            outputTokens > 0
+          ) {
+            tokenSpeed = outputTokens / durationSec
+          } else {
+            tokenSpeed = 0
+          }
+
+          return {
+            finishReason: finishPart.finishReason,
+            usage: {
+              inputTokens: inputTokens,
+              outputTokens: outputTokens,
+              totalTokens:
+                usage?.totalTokens ?? (inputTokens ?? 0) + outputTokens,
+            },
+            tokenSpeed: {
+              tokenSpeed: Math.round(tokenSpeed * 10) / 10, // Round to 1 decimal
+              tokenCount: outputTokens,
+              durationMs,
+              ...(draftTokensTotal != null && draftTokensTotal > 0
+                ? {
+                    draftTokensTotal,
+                    draftTokensAccepted: draftTokensAccepted ?? 0,
+                  }
+                : {}),
+            },
+          }
+        }
+
+        return undefined
+      },
+      onError: (error) => {
+        const errorMessage =
+          error == null
+            ? 'Unknown error'
+            : typeof error === 'string'
+              ? error
+              : error instanceof Error
+                ? error.message
+                : JSON.stringify(error)
+
+        return errorMessage
+      },
+      onFinish: ({ responseMessage }) => {
+        // Call the token usage callback with usage data when stream completes
+        if (responseMessage) {
+          const metadata = responseMessage.metadata as
+            | Record<string, unknown>
+            | undefined
+          const usage = metadata?.usage as LanguageModelUsage | undefined
+          if (usage) {
+            this.onTokenUsage?.(usage, responseMessage.id)
+          }
+        }
+      },
+    })
+
+    // When continuing a truncated response, inject the partial content as the
+    // very first text-delta so the new message immediately shows it and the
+    // user sees a seamless continuation rather than an empty box.
+    const finalStream = continueContent
+      ? prependTextDeltaToUIStream(uiStream, continueContent)
+      : uiStream
+
+    return finalStream
+  }
+
+  async reconnectToStream(
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    _options: {
+      chatId: string
+    } & ChatRequestOptions
+  ): Promise<ReadableStream<UIMessageChunk> | null> {
+    // This function normally handles reconnecting to a stream on the backend, e.g. /api/chat
+    // Since this project has no backend, we can't reconnect to a stream, so this is intentionally no-op.
+    return null
+  }
+
+  /**
+   *  Map user messages to include inline attachments in the message parts
+   * @param messages
+   * @returns
+   */
+  mapUserInlineAttachments(messages: UIMessage[]): UIMessage[] {
+    return messages.map((message) => {
+      if (message.role === 'user') {
+        const metadata = message.metadata as
+          | {
+              inline_file_contents?: Array<{ name?: string; content?: string }>
+            }
+          | undefined
+        const inlineFileContents = Array.isArray(metadata?.inline_file_contents)
+          ? metadata.inline_file_contents.filter((f) => f?.content)
+          : []
+        // Tool messages have content as array of ToolResultPart
+        if (inlineFileContents.length > 0) {
+          if (message.parts.length > 0) {
+            const inlineBlock = inlineFileContents
+              .map((f) => `File: ${f.name || 'attachment'}\n${f.content ?? ''}`)
+              .join('\n\n')
+            const lastTextIdx = message.parts.reduce(
+              (acc, part, index) => (part.type === 'text' ? index : acc),
+              -1
+            )
+            if (lastTextIdx >= 0) {
+              const parts = [...message.parts]
+              const part = parts[lastTextIdx]
+              if (part.type === 'text') {
+                const base = part.text ?? ''
+                parts[lastTextIdx] = {
+                  type: 'text' as const,
+                  text: base ? `${base}\n\n${inlineBlock}` : inlineBlock,
+                }
+              }
+              message.parts = parts
+            } else {
+              message.parts = [
+                ...message.parts,
+                { type: 'text' as const, text: inlineBlock },
+              ]
+            }
+          }
+        }
+      }
+
+      return message
+    })
+  }
+}
