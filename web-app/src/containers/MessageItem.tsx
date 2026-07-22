@@ -60,6 +60,7 @@ export type MessageItemProps = {
   status: ChatStatus
   requestActive?: boolean
   reasoningContainerRef?: React.RefObject<HTMLDivElement | null>
+  onReasoningScroll?: () => void
   onRegenerate?: (messageId: string) => void
   onEdit?: (messageId: string, newText: string) => void
   onDelete?: (messageId: string) => void
@@ -79,6 +80,7 @@ export const MessageItem = memo(
     isAnimating,
     hideActions,
     reasoningContainerRef,
+    onReasoningScroll,
     onRegenerate,
     onEdit,
     onDelete,
@@ -365,10 +367,11 @@ export const MessageItem = memo(
             <ActivityDetail label={t('activity.reasoned')}>
               <div
                 ref={active ? reasoningContainerRef : null}
+                onScroll={active ? onReasoningScroll : undefined}
                 className={twMerge(
                   'relative w-full overflow-auto',
                   active
-                    ? 'max-h-32 opacity-70 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden'
+                    ? 'max-h-32 opacity-70 [overflow-anchor:none] [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden'
                     : 'h-auto opacity-100'
                 )}
               >
