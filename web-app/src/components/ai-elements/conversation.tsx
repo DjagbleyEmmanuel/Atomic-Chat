@@ -5,13 +5,15 @@ import type { ComponentProps } from 'react'
 import { useCallback, useEffect, memo } from 'react'
 import { StickToBottom, useStickToBottomContext } from 'use-stick-to-bottom'
 
-export type ConversationProps = ComponentProps<typeof StickToBottom>
+export type ConversationProps = ComponentProps<typeof StickToBottom> & {
+  isStreaming?: boolean
+}
 
 export const Conversation = memo(
-  ({ className, ...props }: ConversationProps) => (
+  ({ className, isStreaming, ...props }: ConversationProps) => (
     <StickToBottom
       className={cn('relative flex-1 overflow-y-hidden', className)}
-      initial="smooth"
+      initial="instant"
       resize="instant"
       role="log"
       {...props}
