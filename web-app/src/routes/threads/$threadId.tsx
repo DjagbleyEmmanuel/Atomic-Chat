@@ -4,6 +4,7 @@ import { cn, isLlamacppProvider } from '@/lib/utils'
 
 import HeaderPage from '@/containers/HeaderPage'
 import { useThreads } from '@/hooks/useThreads'
+import { useAutoScrollToBottom } from '@/hooks/useAutoScrollToBottom'
 import ChatInput from '@/containers/ChatInput'
 import { useShallow } from 'zustand/react/shallow'
 import { MessageItem } from '@/containers/MessageItem'
@@ -524,16 +525,14 @@ function ThreadDetail() {
     disabledTools, // Re-run when tools are enabled/disabled
   ])
 
-  // Ref for reasoning container auto-scroll
+  // Ref for reasoning container auto-scroll. The hook pins it to the bottom as
+  // new tokens arrive, but pauses the moment the user scrolls up to read and
+  // resumes once they return to the bottom — so it never fights the user.
   const reasoningContainerRef = useRef<HTMLDivElement>(null)
-
-  // Auto-scroll reasoning container to bottom during streaming
-  useEffect(() => {
-    if (status === 'streaming' && reasoningContainerRef.current) {
-      reasoningContainerRef.current.scrollTop =
-        reasoningContainerRef.current.scrollHeight
-    }
-  }, [status, chatMessages])
+  const { handleScroll: handleReasoningScroll } = useAutoScrollToBottom(
+    reasoningContainerRef,
+    { enabled: status === 'streaming', forceStick: true }
+  )
 
   // Note: no unmount cleanup of the optimistic bubble store here. React
   // StrictMode in dev simulates mount → unmount → remount on initial mount;
@@ -1559,7 +1558,7 @@ function ThreadDetail() {
           <div className="flex flex-1 flex-col h-full overflow-hidden min-w-0">
             {/* Messages Area */}
             <div className="flex-1 relative">
-              <Conversation className="absolute inset-0 text-start">
+              <Conversation className="absolute inset-0 text-start" isStreaming={status === 'streaming'}>
                 <ConversationContent
                   className={cn('mx-auto w-full max-w-3xl md:w-4/5 xl:w-4/6')}
                 >
@@ -1575,6 +1574,7 @@ function ThreadDetail() {
                         status={inputStatus}
                         requestActive={requestActive}
                         reasoningContainerRef={reasoningContainerRef}
+                        onReasoningScroll={handleReasoningScroll}
                         onRegenerate={handleRegenerate}
                         onEdit={agentModeActive ? undefined : handleEditMessage}
                         onDelete={
@@ -1597,6 +1597,7 @@ function ThreadDetail() {
                         isLastMessage={true}
                         status={status}
                         reasoningContainerRef={reasoningContainerRef}
+                        onReasoningScroll={handleReasoningScroll}
                         onRegenerate={handleRegenerate}
                         onEdit={agentModeActive ? undefined : handleEditMessage}
                         onDelete={
@@ -1609,6 +1610,7 @@ function ThreadDetail() {
                         <Shimmer duration={1}>Indexing attachments...</Shimmer>
                       </div>
                     </>
+                  )}
                   )}
                   {pendingContinueMessage && status === 'submitted' && (
                     <MessageItem
