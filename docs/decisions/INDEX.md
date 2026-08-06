@@ -9,7 +9,7 @@ decision is reversed, add a new one that says which record it supersedes.
 2. Add one line to the right section of this index.
 3. Do **not** paste the record body into `AGENTS.md`.
 
-165 records, 2026-05-19 → 2026-07-31.
+169 records, 2026-05-19 → 2026-08-05.
 
 ---
 
@@ -122,8 +122,10 @@ decision is reversed, add a new one that says which record it supersedes.
 - **2026-06-02** — [Surface MLX KV-cache quantization (TurboQuant / uniform) as a provider setting](2026-06-02-surface-mlx-kv-cache-quantization-turboquant-uniform-as-a.md)
 - **2026-05-19** — [Use `AtomicBot-ai/mlx-vlm` as the MLX backend](2026-05-19-use-atomicbot-ai-mlx-vlm-as-the-mlx-backend.md)
 
-## llama.cpp providers & backend selection (39)
+## llama.cpp providers & backend selection (41)
 
+- **2026-08-05** — [Resolve TurboQuant engines from a dynamic stable-release index instead of a pinned conf revision](2026-08-05-resolve-turboquant-engines-from-a-dynamic-stable-release-index.md)
+- **2026-08-05** — [Expose version-gated reasoning preservation and direct llama-server arguments](2026-08-05-expose-version-gated-reasoning-preservation-and-direct-llama-server-arguments.md)
 - **2026-07-31** — [Reconcile the TurboQuant release tag automatically on app update](2026-07-31-reconcile-turboquant-release-tag-automatically-on-app-update.md)
 - **2026-07-31** — [Adopt unified TurboQuant release tags and expand the Linux backend matrix to CUDA/ROCm](2026-07-31-adopt-unified-turboquant-releases-and-expand-linux-backends.md)
 - **2026-07-30** — [Cache optimal backends for chat upgrade prompts](2026-07-30-cache-optimal-backends-for-chat-upgrade-prompts.md)
@@ -164,8 +166,10 @@ decision is reversed, add a new one that says which record it supersedes.
 - **2026-05-19** — [Use `AtomicBot-ai/atomic-llama-cpp-turboquant` as the LLM backend](2026-05-19-use-atomicbot-ai-atomic-llama-cpp-turboquant-as-the-llm-backend.md)
 - **2026-05-19** — [Ship upstream `ggml-org/llama.cpp` as a second macOS provider, no fork](2026-05-19-ship-upstream-ggml-org-llama-cpp-as-a-second-macos-provider-no.md)
 
-## Models, Hub & downloads (13)
+## Models, Hub & downloads (15)
 
+- **2026-08-03** — [Repair mis-named MLX shards in place on load](2026-08-03-repair-mis-named-mlx-shards-in-place-on-load.md)
+- **2026-08-03** — [Store MLX weight shards under their Hub filenames](2026-08-03-store-mlx-weight-shards-under-their-hub-filenames.md)
 - **2026-07-31** — [Store model catalog snapshots in IndexedDB](2026-07-31-store-model-catalog-snapshots-in-indexeddb.md)
 - **2026-07-14** — [Resume interrupted model downloads from verified persisted offsets](2026-07-14-resume-interrupted-model-downloads-from-verified-persisted.md)
 - **2026-06-16** — [Validate the model/mmproj GGUF (presence + size) before load so a missing/partial download fails fast with an actionable, classified error (ATO-187)](2026-06-16-validate-the-model-mmproj-gguf-presence-size-before-load-so-a.md)
@@ -186,15 +190,19 @@ decision is reversed, add a new one that says which record it supersedes.
 - **2026-07-15** — [Aggregate Local API Server request telemetry into three-minute summaries (ATO-297)](2026-07-15-aggregate-local-api-server-request-telemetry-into-three-minute.md)
 - **2026-06-09** — [Make the Local API Server "Invalid host header" rejection actionable + fix Trusted Hosts field copy (ATO-118, scope I+II)](2026-06-09-make-the-local-api-server-invalid-host-header-rejection.md)
 
-## Telemetry, crash reporting & error handling (4)
+## Telemetry, crash reporting & error handling (5)
 
+- **2026-08-03** — [Triage the Sentry backlog: fix real defects and stop reporting recoverable failures as crashes](2026-08-03-triage-the-sentry-backlog-fix-real-defects-and-stop.md)
 - **2026-07-31** — [Use a valid ADL2 context for Windows AMD VRAM monitoring](2026-07-31-use-a-valid-adl2-context-for-windows-amd-vram-monitoring.md)
 - **2026-06-11** — [ATO-135 (web-app slice): clear the stuck "Failed to load" toast on a successful load (ATO-63) + map classified engine errors to actionable messages (ATO-121)](2026-06-11-ato-135-web-app-slice-clear-the-stuck-failed-to-load-toast-on-a.md)
 - **2026-06-10** — [Throttle crashloop `model_load` failure spam client-side; confirm `model_load.status` / api 404-noise are already-fixed-pending-rollout, not code bugs (ATO-130: ATO-133 + ATO-131 + ATO-132)](2026-06-10-throttle-crashloop-model-load-failure-spam-client-side-confirm.md)
 - **2026-06-09** — [Add zero-PII Sentry crash/error tracking to both the React frontend and the Rust/Tauri desktop, gated behind `productAnalytic` (ATO-113)](2026-06-09-add-zero-pii-sentry-crash-error-tracking-to-both-the-react.md)
 
-## Packaging, installers, autostart & platform policy (9)
+## Packaging, installers, autostart & platform policy (12)
 
+- **2026-08-05** — [Default autostart on only for clean desktop installs](2026-08-05-default-autostart-on-only-for-clean-desktop-installs.md)
+- **2026-08-05** — [Keep launch at startup opt-in and ignore development binaries](2026-08-05-keep-launch-at-startup-opt-in-and-ignore-development-binaries.md)
+- **2026-08-03** — [Disable WebKit DMABUF rendering on Linux](2026-08-03-disable-webkit-dmabuf-rendering-on-linux.md)
 - **2026-07-31** — [Keep Linux AppImage updates compatible with AppImageLauncher](2026-07-31-keep-linux-appimage-updates-compatible-with-appimagelauncher.md)
 - **2026-07-13** — [Run tray status synchronization on Windows](2026-07-13-run-tray-status-synchronization-on-windows.md)
 - **2026-06-16** — [Switch macOS autostart from `LaunchAgent` to `AppleScript` (real Login Item) + one-time choice-preserving migration for existing users](2026-06-16-switch-macos-autostart-from-launchagent-to-applescript-real.md)

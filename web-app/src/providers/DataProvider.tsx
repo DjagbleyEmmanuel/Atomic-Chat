@@ -41,6 +41,7 @@ import {
 } from '@/utils/registerRemoteProvider'
 import { hydrateActiveModelsForRunningServer } from '@/utils/activeModelsSync'
 import { ensureRemoteProviderReady } from '@/utils/ensureRemoteProviderReady'
+import { reconcileLaunchAtStartup } from '@/lib/launchAtStartup'
 
 const safeRegisterRemoteProvider = async (provider: ModelProvider) => {
   try {
@@ -113,55 +114,37 @@ export function DataProvider() {
     }
   }, [])
 
-  // Default "Launch at startup" to ON for every user (new and existing). We
-  // seed the OS autostart entry exactly once and record it, so a later manual
-  // disable in Settings → General is never overridden. (Flips the ATO-96
-  // default from OFF to ON; users can still turn it off.)
   useEffect(() => {
-    if (!IS_TAURI) return
-    if (localStorage.getItem(localStorageKey.autostartSeeded) === 'true') return
+    if (!IS_TAURI || isDev()) return
     ;(async () => {
-      try {
-        if (!(await isAutostartEnabled())) {
-          await enableAutostart()
-        }
-        localStorage.setItem(localStorageKey.autostartSeeded, 'true')
-      } catch (error) {
-        console.error('Failed to seed launch-at-startup default:', error)
-      }
-    })()
-  }, [])
-
-  // macOS: migrate the autostart mechanism from the legacy LaunchAgent plist to
-  // a real AppleScript Login Item (visible in System Settings, reliably started
-  // on reboot). Runs once. The Rust side removes the stale plist and reports
-  // whether the user had launch-at-startup ON under the old launcher; if so we
-  // re-register a Login Item so it keeps working after the switch. A user who
-  // had it off has no legacy plist and is left untouched (choice preserved).
-  useEffect(() => {
-    if (!IS_TAURI || !IS_MACOS) return
-    if (
-      localStorage.getItem(localStorageKey.autostartAppleScriptMigrated) ===
-      'true'
-    )
-      return
-    ;(async () => {
-      try {
-        const hadLegacyAutostart = await invoke<boolean>(
-          'migrate_macos_autostart_launchagent'
-        )
-        if (hadLegacyAutostart && !(await isAutostartEnabled())) {
-          await enableAutostart()
-        }
-        localStorage.setItem(
-          localStorageKey.autostartAppleScriptMigrated,
+      if (
+        IS_MACOS &&
+        localStorage.getItem(localStorageKey.autostartAppleScriptMigrated) !==
           'true'
-        )
+      ) {
+        try {
+          const hadLegacyAutostart = await invoke<boolean>(
+            'migrate_macos_autostart_launchagent'
+          )
+          if (hadLegacyAutostart && !(await isAutostartEnabled())) {
+            await enableAutostart()
+          }
+          localStorage.setItem(
+            localStorageKey.autostartAppleScriptMigrated,
+            'true'
+          )
+        } catch (error) {
+          console.error('Failed to migrate macOS autostart launcher:', error)
+        }
+      }
+
+      try {
+        await reconcileLaunchAtStartup(serviceHub.app())
       } catch (error) {
-        console.error('Failed to migrate macOS autostart launcher:', error)
+        console.error('Failed to reconcile launch-at-startup state:', error)
       }
     })()
-  }, [])
+  }, [serviceHub])
 
   useEffect(() => {
     console.log('Initializing DataProvider...')
@@ -209,10 +192,15 @@ export function DataProvider() {
       .getAssistants()
       .then((data) => {
         if (data && Array.isArray(data) && data.length > 0) {
-          //? Миграция: ассистент с id 'jan' всегда подменяем на дефолт Atomic Chat (name/description/avatar)
+          // Keep built-in branding current without overwriting user settings.
           const migrated = (data as unknown as Assistant[]).map((a) =>
             a.id === 'jan'
-              ? { ...defaultAssistant, id: 'jan', created_at: a.created_at }
+              ? {
+                  ...a,
+                  name: defaultAssistant.name,
+                  description: defaultAssistant.description,
+                  avatar: defaultAssistant.avatar,
+                }
               : a
           )
           setAssistants(migrated)

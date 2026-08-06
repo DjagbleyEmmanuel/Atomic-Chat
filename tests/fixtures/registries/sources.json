@@ -1,13 +1,13 @@
 {
   "atomic-chat-conf": {
-    "revision": "40665589ef2820f36cbdec282b23f554b60dd563",
+    "revision": "b8fb5951118ec63657b1558b10cfc7597e408aea",
     "fixtures": [
       "upstream-manifest.json",
       "turboquant-manifest.json",
       "recommended-models.json",
       "provider-registry.json"
     ],
-    "note": "Backend and recommendation fixtures are exact. The provider fixture is a deterministic representative slice of the pinned registry."
+    "note": "Backend and recommendation fixtures are exact. The provider fixture is a deterministic representative slice of the pinned registry. turboquant-manifest.json is now only the legacy fallback index for the TurboQuant provider, which resolves releases from turboquant-index.json published on the fork's releases."
   },
   "atomic-chat-model-catalog": {
     "revision": "355f4c0f37f4c56eaf241705b10dc862faa9b450",

@@ -1,10 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { invoke } from '@tauri-apps/api/core'
-import {
-  enable as enableAutostart,
-  disable as disableAutostart,
-  isEnabled as isAutostartEnabled,
-} from '@tauri-apps/plugin-autostart'
+import { isEnabled as isAutostartEnabled } from '@tauri-apps/plugin-autostart'
 import { route } from '@/constants/routes'
 import SettingsMenu from '@/containers/SettingsMenu'
 import HeaderPage from '@/containers/HeaderPage'
@@ -39,6 +35,7 @@ import LanguageSwitcher from '@/containers/LanguageSwitcher'
 import { isRootDir } from '@/utils/path'
 import { useAnalytic } from '@/hooks/useAnalytic'
 import posthog from 'posthog-js'
+import { setLaunchAtStartup } from '@/lib/launchAtStartup'
 const TOKEN_VALIDATION_TIMEOUT_MS = 10_000
 const ATOMIC_CLI_COMMAND = 'atomic-chat-cli'
 
@@ -104,6 +101,7 @@ function General() {
   const [cliPath, setCliPath] = useState<string | null>(null)
   const [isCliLoading, setIsCliLoading] = useState(false)
   const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null)
+  const canManageAutostart = IS_TAURI && !isDev()
 
   useEffect(() => {
     const fetchDataFolder = async () => {
@@ -127,28 +125,24 @@ function General() {
   }, [])
 
   useEffect(() => {
-    if (!IS_TAURI) return
+    if (!canManageAutostart) return
     isAutostartEnabled()
       .then(setAutostartEnabled)
       .catch(() => setAutostartEnabled(false))
-  }, [])
+  }, [canManageAutostart])
 
   const handleToggleAutostart = useCallback(
     async (next: boolean) => {
+      if (!canManageAutostart) return
       try {
-        if (next) {
-          await enableAutostart()
-        } else {
-          await disableAutostart()
-        }
-        setAutostartEnabled(await isAutostartEnabled())
+        setAutostartEnabled(await setLaunchAtStartup(serviceHub.app(), next))
       } catch (error) {
         console.error('Failed to toggle launch at startup:', error)
         toast.error(t('settings:general.launchAtStartupError'))
         setAutostartEnabled(await isAutostartEnabled().catch(() => !next))
       }
     },
-    [t]
+    [canManageAutostart, serviceHub, t]
   )
 
   const handleInstallCli = async () => {
@@ -338,7 +332,7 @@ function General() {
                 title={t('common:language')}
                 actions={<LanguageSwitcher />}
               />
-              {IS_TAURI && (
+              {canManageAutostart && (
                 <CardItem
                   title={t('settings:general.launchAtStartup')}
                   description={t('settings:general.launchAtStartupDesc')}
