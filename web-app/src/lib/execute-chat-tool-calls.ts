@@ -51,6 +51,11 @@ type ExecuteChatToolCallsOptions = {
   processOutput: (content: unknown) => Promise<unknown>
   addToolOutput: (output: ChatToolOutput) => void
   onError?: (error: unknown) => void
+  // Per-tool-call cancellation: the caller owns one AbortController per
+  // toolCallId (so the user can cancel a single running tool without
+  // stopping the whole request). The batch-level `signal` still gates the
+  // entire run.
+  getToolController?: (toolCallId: string) => AbortController | undefined
 }
 
 export async function executeChatToolCalls({
@@ -66,9 +71,29 @@ export async function executeChatToolCalls({
   processOutput,
   addToolOutput,
   onError = (error) => console.error('Tool call error:', error),
+  getToolController,
 }: ExecuteChatToolCallsOptions): Promise<void> {
   for (const toolCall of toolCalls) {
     if (signal.aborted) break
+
+    const toolController = getToolController?.(toolCall.toolCallId)
+    const toolSignal = toolController?.signal
+// Only surface the cancellation if the tool was not retried since
+      // (retry installs a fresh controller for the same toolCallId). Without
+      // this guard, the cancelled tool's late completion would clobber the
+      // retried tool's result that landed on the same tool part.
+      if (
+        toolSignal?.aborted &&
+        getToolController?.(toolCall.toolCallId) === toolController
+      ) {
+        addToolOutput({
+          state: 'output-error',
+          tool: toolCall.toolName,
+          toolCallId: toolCall.toolCallId,
+          errorText: 'Tool execution cancelled by user',
+        })
+        continue
+      }
 
     try {
       const approved = await approve(
@@ -76,6 +101,16 @@ export async function executeChatToolCalls({
         threadId,
         toolCall.input
       )
+
+      if (toolSignal?.aborted) {
+        addToolOutput({
+          state: 'output-error',
+          tool: toolCall.toolName,
+          toolCallId: toolCall.toolCallId,
+          errorText: 'Tool execution cancelled by user',
+        })
+        continue
+      }
 
       if (!approved) {
         addToolOutput({
@@ -106,6 +141,16 @@ export async function executeChatToolCalls({
         result = {
           error: `Tool '${toolCall.toolName}' not found in any service`,
         }
+      }
+
+      if (toolSignal?.aborted) {
+        addToolOutput({
+          state: 'output-error',
+          tool: toolCall.toolName,
+          toolCallId: toolCall.toolCallId,
+          errorText: 'Tool execution cancelled by user',
+        })
+        continue
       }
 
       if (result.error) {

@@ -7,6 +7,9 @@ import { useTranslation } from '@/i18n/react-i18next-compat'
 import { ThemeSwitcher } from '@/containers/ThemeSwitcher'
 import { FontSizeSwitcher } from '@/containers/FontSizeSwitcher'
 import { AccentColorPicker } from '@/containers/AccentColorPicker'
+import { ChatBackgroundPicker } from '@/containers/ChatBackgroundPicker'
+import { ThreadScrollPicker } from '@/containers/ThreadScrollPicker'
+import { MessageDisplayModePicker } from '@/containers/MessageDisplayModePicker'
 import { useInterfaceSettings } from '@/hooks/useInterfaceSettings'
 import { Button } from '@/components/ui/button'
 import { toast } from 'sonner'
@@ -42,6 +45,21 @@ function InterfaceSettings() {
                 title={t('settings:interface.fontSize')}
                 description={t('settings:interface.fontSizeDesc')}
                 actions={<FontSizeSwitcher />}
+              />
+              <CardItem
+                title={t('settings:interface.threadScrollTitle')}
+                description={t('settings:interface.threadScrollDesc')}
+                actions={<ThreadScrollPicker />}
+              />
+              <CardItem
+                title={t('settings:interface.messageDisplayTitle')}
+                description={t('settings:interface.messageDisplayDesc')}
+                actions={<MessageDisplayModePicker />}
+              />
+              <CardItem
+                title={t('settings:interface.chatBackground')}
+                description={t('settings:interface.chatBackgroundDesc')}
+                actions={<ChatBackgroundPicker />}
               />
               {/* Accent color — скрыто */}
               {false && (

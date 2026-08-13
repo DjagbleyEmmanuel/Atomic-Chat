@@ -2,10 +2,13 @@ import {
   memo,
   useState,
   useCallback,
+  useEffect,
+  useRef,
   type ComponentPropsWithoutRef,
 } from 'react'
 import type { UIMessage, ChatStatus } from 'ai'
 import { RenderMarkdown } from './RenderMarkdown'
+import { useInterfaceSettings } from '@/hooks/useInterfaceSettings'
 import { cn } from '@/lib/utils'
 import { twMerge } from 'tailwind-merge'
 import { ReasoningContent } from '@/components/ai-elements/reasoning'
@@ -13,7 +16,7 @@ import { Tool } from '@/components/ai-elements/tools/tool'
 import { CopyButton } from './CopyButton'
 import { useModelProvider } from '@/hooks/useModelProvider'
 import { useGeneralSetting } from '@/hooks/useGeneralSetting'
-import { IconRefresh } from '@tabler/icons-react'
+import { IconMessageReply, IconRefresh } from '@tabler/icons-react'
 import { AudioPlayer } from '@/containers/AudioPlayer'
 import { EditMessageDialog } from '@/containers/dialogs/EditMessageDialog'
 import { DeleteMessageDialog } from '@/containers/dialogs/DeleteMessageDialog'
@@ -64,6 +67,13 @@ export type MessageItemProps = {
   onRegenerate?: (messageId: string) => void
   onEdit?: (messageId: string, newText: string) => void
   onDelete?: (messageId: string) => void
+  onReply?: (messageId: string, snippet: string) => void
+  onCancelToolCall?: (toolCallId: string) => void
+  onRetryToolCall?: (
+    toolCallId: string,
+    toolName: string,
+    input: unknown
+  ) => void
   assistant?: { avatar?: React.ReactNode; name?: string }
   showAssistant?: boolean
   isAnimating?: boolean
@@ -84,11 +94,17 @@ export const MessageItem = memo(
     onRegenerate,
     onEdit,
     onDelete,
+    onReply,
+    onCancelToolCall,
+    onRetryToolCall,
     agentAttachmentReferences = [],
   }: MessageItemProps) => {
     const { t } = useTranslation('chat')
     const serviceHub = useServiceHub()
     const selectedModel = useModelProvider((state) => state.selectedModel)
+    const messageDisplayMode = useInterfaceSettings(
+      (state) => state.messageDisplayMode
+    )
     // Global "Disable reasoning" toggle: some providers (e.g. MiniMax) ignore
     // every known API flag and keep streaming chain-of-thought. Hide those
     // parts in the UI so the experience matches the user's intent.
@@ -99,6 +115,56 @@ export const MessageItem = memo(
       url: string
       filename?: string
     } | null>(null)
+    const [longTextExpanded, setLongTextExpanded] = useState(false)
+
+    // Reply-to selection UI: when the user highlights text inside a message,
+    // show a floating reply chip near the selection. Clicking it quotes the
+    // highlighted words.
+    const contentRef = useRef<HTMLDivElement>(null)
+    const [replySelection, setReplySelection] = useState<{
+      x: number
+      y: number
+      text: string
+    } | null>(null)
+
+    useEffect(() => {
+      if (!replySelection) return
+      const dismiss = () => setReplySelection(null)
+      document.addEventListener('mousedown', dismiss)
+      window.addEventListener('scroll', dismiss, true)
+      return () => {
+        document.removeEventListener('mousedown', dismiss)
+        window.removeEventListener('scroll', dismiss, true)
+      }
+    }, [replySelection])
+
+    const handleContentMouseUp = useCallback(() => {
+      const selection = window.getSelection()
+      const text = selection?.toString().trim()
+      if (
+        !text ||
+        !selection ||
+        !selection.anchorNode ||
+        !contentRef.current?.contains(selection.anchorNode)
+      ) {
+        setReplySelection(null)
+        return
+      }
+      if (selection.rangeCount === 0) {
+        setReplySelection(null)
+        return
+      }
+      const rect = selection.getRangeAt(0).getBoundingClientRect()
+      if (!rect || (rect.width === 0 && rect.height === 0)) {
+        setReplySelection(null)
+        return
+      }
+      setReplySelection({
+        x: rect.left,
+        y: rect.top - 8,
+        text: text.slice(0, 400),
+      })
+    }, [])
 
     const handleRegenerate = useCallback(() => {
       onRegenerate?.(message.id)
@@ -139,6 +205,13 @@ export const MessageItem = memo(
     const isAgentMessage = Boolean(
       (message.metadata as { agent_run?: unknown } | undefined)?.agent_run
     )
+    const messageModelId =
+      !isAgentMessage &&
+      (message.metadata as Record<string, unknown> | undefined)?.model
+    const modelLabel =
+      typeof messageModelId === 'string'
+        ? messageModelId.split(/[\\/]/).pop() || messageModelId
+        : undefined
     const agentFileReferences = useMemo(
       () =>
         isAgentMessage
@@ -216,6 +289,50 @@ export const MessageItem = memo(
         .join('\n')
     }, [message.parts])
 
+    // A reply message starts with a markdown blockquote (the quoted text the
+    // composer prepends when replying). Extract that snippet for the badge.
+    const extractReplyQuote = useCallback((text: string): string | undefined => {
+      const quoteLines: string[] = []
+      for (const raw of text.split('\n')) {
+        const line = raw.trimStart()
+        if (line.startsWith('>')) {
+          quoteLines.push(line.slice(1).trim())
+        } else if (quoteLines.length > 0) {
+          break
+        } else if (line) {
+          return undefined
+        }
+      }
+      if (quoteLines.length === 0) return undefined
+      const snippet = quoteLines.filter(Boolean).join(' ')
+      return snippet.slice(0, 140)
+    }, [])
+
+    // Remove the leading blockquote lines (plus any blank separator) so the
+    // quoted text is only shown in the reply badge, not duplicated in the body.
+    const stripLeadingReplyQuote = useCallback((text: string): string => {
+      const lines = text.split('\n')
+      let index = 0
+      while (index < lines.length && lines[index].trimStart().startsWith('>')) {
+        index++
+      }
+      while (index < lines.length && !lines[index].trim()) {
+        index++
+      }
+      return lines.slice(index).join('\n').trim()
+    }, [])
+
+    const handleReplyFromSelection = useCallback(() => {
+      const selected = replySelection?.text
+      setReplySelection(null)
+      onReply?.(message.id, selected || getFullTextContent())
+    }, [replySelection, onReply, message.id, getFullTextContent])
+
+    const handleReplyToMessage = useCallback(() => {
+      setReplySelection(null)
+      onReply?.(message.id, getFullTextContent())
+    }, [onReply, message.id, getFullTextContent])
+
     const renderTextBlock = (block: TextTraceBlock, index: number) => {
       const isLastBlock = index === traceBlocks.length - 1
       const displayText =
@@ -230,6 +347,9 @@ export const MessageItem = memo(
       ) {
         return null
       }
+
+      const isCollapsible = !isStreaming && displayText.length > 2400
+      const clampBody = isCollapsible && !longTextExpanded
 
       return (
         <div key={block.key} className="w-full">
@@ -248,26 +368,90 @@ export const MessageItem = memo(
                     ))}
                   </div>
                 )}
-                {displayText && (
-                  <div dir="auto" className="select-text whitespace-pre-wrap">
-                    {displayText}
-                  </div>
-                )}
+                {(() => {
+                  const replyQuote =
+                    message.role === 'user'
+                      ? extractReplyQuote(displayText)
+                      : undefined
+                  // The quote is shown in the badge; drop the leading
+                  // blockquote from the body so it isn't duplicated.
+                  const bodyText = replyQuote
+                    ? stripLeadingReplyQuote(displayText)
+                    : displayText
+                  return (
+                    <>
+                      {replyQuote && (
+                        <div className="mb-1.5 flex items-center gap-1.5 rounded-md border border-border/70 bg-background/60 px-2 py-1 text-xs text-muted-foreground max-w-full">
+                          <IconMessageReply
+                            size={12}
+                            className="shrink-0 text-primary"
+                          />
+                          <span className="truncate">{replyQuote}</span>
+                        </div>
+                      )}
+                      {bodyText && (
+                        <div
+                          dir="auto"
+                          className={cn(
+                            'relative select-text whitespace-pre-wrap',
+                            clampBody && 'max-h-64 overflow-hidden'
+                          )}
+                        >
+                          {bodyText}
+                          {clampBody && (
+                            <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-secondary to-transparent" />
+                          )}
+                        </div>
+                      )}
+                      {isCollapsible && (
+                        <button
+                          type="button"
+                          onClick={() => setLongTextExpanded((v) => !v)}
+                          className="mt-1 text-xs font-medium text-primary hover:underline"
+                        >
+                          {longTextExpanded ? 'Show less' : 'Show more'}
+                        </button>
+                      )}
+                    </>
+                  )
+                })()}
               </div>
             </div>
           ) : (
-            <RenderMarkdown
-              content={
-                isAgentMessage
-                  ? linkAgentFileReferences(block.text, agentFileReferences)
-                  : block.text
-              }
-              components={agentMarkdownComponents}
-              isStreaming={isStreaming && isLastBlock}
-              messageId={message.id}
-              isAnimating={isAnimating}
-              enableHtmlPreview
-            />
+            <>
+              <div
+                className={cn(
+                  'relative',
+                  clampBody && 'max-h-96 overflow-hidden'
+                )}
+              >
+                <RenderMarkdown
+                  content={
+                    isAgentMessage
+                      ? linkAgentFileReferences(block.text, agentFileReferences)
+                      : block.text
+                  }
+                  components={agentMarkdownComponents}
+                  isStreaming={isStreaming && isLastBlock}
+                  messageId={message.id}
+                  isAnimating={isAnimating}
+                  enableHtmlPreview
+                  displayMode={messageDisplayMode}
+                />
+                {clampBody && (
+                  <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-background to-transparent" />
+                )}
+              </div>
+              {isCollapsible && (
+                <button
+                  type="button"
+                  onClick={() => setLongTextExpanded((v) => !v)}
+                  className="mt-1 text-xs font-medium text-primary hover:underline"
+                >
+                  {longTextExpanded ? 'Show less' : 'Show more'}
+                </button>
+              )}
+            </>
           )}
         </div>
       )
@@ -354,7 +538,27 @@ export const MessageItem = memo(
               )}
             >
               {block.tools.map((tool) => (
-                <Tool key={tool.key} state={tool.state} className="py-1">
+                <Tool
+                  key={tool.key}
+                  state={tool.state}
+                  className="py-1"
+                  toolCallId={tool.toolCallId}
+                  toolName={tool.toolName}
+                  input={
+                    'input' in tool.presentation
+                      ? tool.presentation.input
+                      : 'rawInput' in tool.presentation
+                        ? tool.presentation.rawInput
+                        : undefined
+                  }
+                  /* Agent-run tools execute inside the Rust backend, so the
+                     JS cancel/retry handlers cannot reach them — hide the
+                     controls rather than offering dead buttons. */
+                  onCancel={
+                    block.agentSummary ? undefined : onCancelToolCall
+                  }
+                  onRetry={block.agentSummary ? undefined : onRetryToolCall}
+                >
                   <ToolRenderer
                     presentation={tool.presentation}
                     state={tool.state}
@@ -410,7 +614,7 @@ export const MessageItem = memo(
     )
 
     return (
-      <div className="w-full mb-4">
+      <div className="w-full mb-4" ref={contentRef} onMouseUp={handleContentMouseUp}>
         {/* Render message parts */}
         {traceBlocks.map((block, index) => {
           switch (block.kind) {
@@ -430,6 +634,17 @@ export const MessageItem = memo(
         {/* Message actions for user messages */}
         {message.role === 'user' && !hideActions && (
           <div className="flex items-center justify-end gap-1 text-muted-foreground text-xs mt-4">
+            {onReply && (
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                onClick={handleReplyToMessage}
+                title={t('common:reply')}
+              >
+                <IconMessageReply size={16} />
+              </Button>
+            )}
+
             <CopyButton text={getFullTextContent()} />
 
             {onEdit && status !== CHAT_STATUS.STREAMING && (
@@ -457,6 +672,17 @@ export const MessageItem = memo(
             >
               <CopyButton text={getFullTextContent()} />
 
+              {onReply && !isStreaming && (
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={handleReplyToMessage}
+                  title={t('common:reply')}
+                >
+                  <IconMessageReply size={16} />
+                </Button>
+              )}
+
               {onEdit && !isStreaming && (
                 <EditMessageDialog
                   message={getFullTextContent()}
@@ -483,6 +709,15 @@ export const MessageItem = memo(
                 )}
             </div>
 
+            {modelLabel && !isStreaming && (
+              <span
+                title={typeof messageModelId === 'string' ? messageModelId : undefined}
+                className="inline-flex max-w-[180px] items-center truncate rounded-full border border-border bg-background/60 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground/80"
+              >
+                {modelLabel}
+              </span>
+            )}
+
             {!isRequestActive && (
               <TokenSpeedIndicator
                 streaming={false}
@@ -491,6 +726,25 @@ export const MessageItem = memo(
                 }
               />
             )}
+          </div>
+        )}
+
+        {/* Floating reply chip for highlighted text */}
+        {replySelection && onReply && (
+          <div
+            className="fixed z-50"
+            style={{ left: replySelection.x, top: replySelection.y }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+              <Button
+                variant="secondary"
+                size="sm"
+                className="shadow-md"
+                onClick={handleReplyFromSelection}
+              >
+                <IconMessageReply size={14} className="mr-1" />
+                {t('common:reply')}
+              </Button>
           </div>
         )}
 
@@ -527,6 +781,9 @@ export const MessageItem = memo(
       prevProps.isLastMessage === nextProps.isLastMessage &&
       prevProps.status === nextProps.status &&
       prevProps.requestActive === nextProps.requestActive &&
+      prevProps.onReply === nextProps.onReply &&
+      prevProps.onCancelToolCall === nextProps.onCancelToolCall &&
+      prevProps.onRetryToolCall === nextProps.onRetryToolCall &&
       prevProps.showAssistant === nextProps.showAssistant &&
       prevProps.hideActions === nextProps.hideActions &&
       prevProps.agentAttachmentReferences ===

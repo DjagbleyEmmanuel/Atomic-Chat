@@ -312,6 +312,7 @@ function prependTextDeltaToUIStream(
 
 export class CustomChatTransport implements ChatTransport<UIMessage> {
   public model: LanguageModel | null = null
+  private activeModelId: string | null = null
   private tools: Record<string, Tool> = {}
   private onTokenUsage?: TokenUsageCallback
   private hasDocuments = false
@@ -652,6 +653,7 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
           hasOverride ? effectiveReasoningOverride : undefined,
           audioInputParts.length > 0 ? audioInputParts : undefined
         )
+        this.activeModelId = modelId || null
         ttftMark('deltaEnd')
       } catch (error) {
         console.error('Failed to create model:', error)
@@ -778,6 +780,30 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     let draftTokensTotal: number | null = null
     let draftTokensAccepted: number | null = null
 
+    // Token-speed variance sampling: every SAMPLE_INTERVAL_MS we snapshot the
+    // decode throughput so the UI can render a small chart of how the TPS
+    // fluctuated over the stream instead of a single scalar. Char deltas are
+    // approximated as tokens at ~4 chars/token (English convention).
+    const SAMPLE_INTERVAL_MS = 500
+    let sampleWindowChars = 0
+    let sampleWindowStart = streamStartTime
+    const tokenSpeedSeries: Array<{ t: number; tps: number }> = []
+
+    const noteDeltaChars = (delta: string | undefined) => {
+      if (!delta) return
+      if (streamStartTime === undefined) return
+      const now = Date.now()
+      if (sampleWindowStart === undefined) sampleWindowStart = now
+      sampleWindowChars += delta.length
+      if (now - sampleWindowStart >= SAMPLE_INTERVAL_MS) {
+        const elapsedSec = (now - sampleWindowStart) / 1000
+        const tps = sampleWindowChars > 0 ? sampleWindowChars / 4 / elapsedSec : 0
+        tokenSpeedSeries.push({ t: now - streamStartTime, tps })
+        sampleWindowChars = 0
+        sampleWindowStart = now
+      }
+    }
+
     const uiStream = result.toUIMessageStream({
       messageMetadata: ({ part }) => {
         // Start the wall-clock timer on the first generated delta (text or
@@ -788,6 +814,12 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
           (part.type === 'text-delta' || part.type === 'reasoning-delta')
         ) {
           streamStartTime = Date.now()
+        }
+
+        if (part.type === 'text-delta') {
+          noteDeltaChars((part as { delta?: string }).delta)
+        } else if (part.type === 'reasoning-delta') {
+          noteDeltaChars((part as { delta?: string }).delta)
         }
 
         if (part.type === 'finish-step') {
@@ -835,6 +867,7 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
 
           return {
             finishReason: finishPart.finishReason,
+            model: this.activeModelId ?? undefined,
             activityDurationMs: Math.max(0, Date.now() - requestStartedAt),
             usage: {
               inputTokens: inputTokens,
@@ -851,6 +884,12 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
                     draftTokensTotal,
                     draftTokensAccepted: draftTokensAccepted ?? 0,
                   }
+                : {}),
+              // Time-series of decode throughput samples (t=elapsed ms from
+              // first delta, tps=tokens/sec in that window). Empty unless the
+              // stream produced enough deltas to fill at least one window.
+              ...(tokenSpeedSeries.length > 0
+                ? { tokenSpeedSeries }
                 : {}),
             },
           }

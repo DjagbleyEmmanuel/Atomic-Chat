@@ -14,11 +14,17 @@ import { useServiceHub } from '@/hooks/useServiceHub'
 import { useAssistant } from '@/hooks/useAssistant'
 import { useTools } from '@/hooks/useTools'
 import { useAppState } from '@/hooks/useAppState'
+import { useThreadNotifications } from '@/hooks/useThreadNotifications'
+import {
+  useInterfaceSettings,
+  CHAT_BACKGROUNDS,
+} from '@/hooks/useInterfaceSettings'
 import {
   InitialMessageFile,
   useInitialMessage,
 } from '@/hooks/useInitialMessage'
 import { useOptimisticUserMessage } from '@/hooks/useOptimisticUserMessage'
+import { useReplyTo } from '@/hooks/useReplyTo'
 import { buildOptimisticUserMessage } from '@/lib/optimisticUserMessage'
 import { useChat } from '@/hooks/use-chat'
 import { useModelProvider } from '@/hooks/useModelProvider'
@@ -27,6 +33,7 @@ import {
   Conversation,
   ConversationAutoScroll,
   ConversationContent,
+  ConversationFollow,
   ConversationScrollButton,
 } from '@/components/ai-elements/conversation'
 import { generateId } from 'ai'
@@ -38,6 +45,10 @@ import {
   extractContentPartsFromUIMessage,
 } from '@/lib/messages'
 import { newUserThreadContent } from '@/lib/completion'
+import {
+  deriveThreadTitle,
+  threadMessageText,
+} from '@/lib/thread-title'
 import { ttftBegin, ttftMark, ttftPreBegin } from '@/lib/ttft-timing'
 import {
   ThreadMessage,
@@ -82,6 +93,8 @@ import {
 } from '@/utils/error'
 import { captureHandledError } from '@/lib/sentry'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Search, X, ChevronUp, ChevronDown, Bell, BellOff } from 'lucide-react'
 import { LinkifiedText } from '@/components/LinkifiedText'
 import { IconAlertCircle, IconRefresh } from '@tabler/icons-react'
 import { useToolApproval } from '@/hooks/useToolApproval'
@@ -199,6 +212,7 @@ const agentAttachmentsFromMessage = (
 
 type SearchParams = {
   threadModel?: ThreadModel
+  messageId?: string
 }
 
 // as route.threadsDetail
@@ -207,6 +221,7 @@ export const Route = createFileRoute('/threads/$threadId')({
   validateSearch: (search: Record<string, unknown>): SearchParams => {
     return {
       threadModel: search.threadModel as ThreadModel | undefined,
+      messageId: typeof search.messageId === 'string' ? search.messageId : undefined,
     }
   },
 })
@@ -242,6 +257,11 @@ function ThreadDetail() {
 
   // AbortController for cancelling tool calls
   const toolCallAbortController = useRef<AbortController | null>(null)
+  // Per-tool-call controllers so a single running tool can be cancelled
+  // (feature I: cancel+retry single tool call) without stopping the request.
+  const toolCallControllersRef = useRef<Map<string, AbortController>>(
+    new Map()
+  )
 
   // Check if we should follow up with tool calls (respects abort signal)
   const followUpMessage = useCallback(
@@ -304,6 +324,7 @@ function ThreadDetail() {
   const setContinueFromContentRef = useRef<((content: string) => void) | null>(
     null
   )
+  const autoTitleRef = useRef(false)
 
   // Use the AI SDK chat hook
   const {
@@ -321,7 +342,7 @@ function ThreadDetail() {
     sessionId: threadId,
     sessionTitle: thread?.title,
     systemMessage,
-    experimental_throttle: 16,
+    experimental_throttle: 50,
     onFinish: ({ message, isAbort }) => {
       const msgMeta = message.metadata as Record<string, unknown> | undefined
       const finishReason = msgMeta?.finishReason as string | undefined
@@ -423,6 +444,37 @@ function ThreadDetail() {
             addMessage(assistantMessage)
           }
         }
+
+        // Auto-title: once the first assistant reply lands, replace the raw
+        // prompt title with a clean one-line summary — unless the user already
+        // renamed the thread. Runs once per thread (guarded by ref).
+        if (!autoTitleRef.current) {
+          autoTitleRef.current = true
+          const currentThread = useThreads.getState().threads[threadId]
+          const firstUserMessage = useMessages
+            .getState()
+            .getMessages(threadId)
+            .find((m) => m.role === ChatCompletionRole.User)
+          if (currentThread && firstUserMessage) {
+            const firstPrompt = threadMessageText(firstUserMessage)
+            if (currentThread.title && currentThread.title === firstPrompt) {
+              const replyText = contentParts
+                .map((part) =>
+                  threadMessageText({
+                    role: 'assistant',
+                    content: [part],
+                  })
+                )
+                .join('')
+              const derived = deriveThreadTitle(firstPrompt, replyText)
+              if (derived && derived !== currentThread.title) {
+                useThreads.getState().updateThread(threadId, {
+                  title: derived,
+                })
+              }
+            }
+          }
+        }
       }
 
       // Create a new AbortController for tool calls
@@ -456,11 +508,18 @@ function ThreadDetail() {
               useGeneralSetting.getState().maxImageSizePx
             ),
           addToolOutput,
+          getToolController: (toolCallId) =>
+            toolCallControllersRef.current.get(toolCallId),
         })
 
         // Clear tools after processing all
         sessionData.tools = []
         toolCallAbortController.current = null
+        toolCallControllersRef.current.clear()
+        // Release the request-active flag once tool execution settles so the
+        // stop button and streaming indicators clear when no follow-up stream
+        // is running. A genuine continuation re-raises it via sendMessage.
+        setIsChatRequestActive(false)
       })().catch((error) => {
         // Ignore abort errors
         if (error.name !== 'AbortError') {
@@ -468,10 +527,18 @@ function ThreadDetail() {
         }
         sessionData.tools = []
         toolCallAbortController.current = null
+        toolCallControllersRef.current.clear()
+        setIsChatRequestActive(false)
       })
     },
     onToolCall: ({ toolCall }) => {
       sessionData.tools.push(toolCall)
+      if (!toolCallControllersRef.current.has(toolCall.toolCallId)) {
+        toolCallControllersRef.current.set(
+          toolCall.toolCallId,
+          new AbortController()
+        )
+      }
     },
     sendAutomaticallyWhen: followUpMessage,
   })
@@ -1309,6 +1376,21 @@ function ThreadDetail() {
     [threadId, deleteMessage, chatMessages, setChatMessages]
   )
 
+  // Handle reply-to: set the reply target so the composer quotes the message
+  // (or the highlighted words) and embeds it as a blockquote on send.
+  const handleReply = useCallback(
+    (messageId: string, snippet: string) => {
+      const message = chatMessages.find((m) => m.id === messageId)
+      if (!message) return
+      useReplyTo.getState().set(threadId, {
+        messageId,
+        role: message.role === 'user' ? 'user' : 'assistant',
+        snippet: snippet.trim().slice(0, 400) || '…',
+      })
+    },
+    [threadId, chatMessages]
+  )
+
   // Handler for increasing context size
   const handleContextSizeIncrease = useCallback(async () => {
     if (!selectedModel) return
@@ -1481,6 +1563,82 @@ function ThreadDetail() {
   )
   const isAgentRunning =
     agentRun?.status === 'running' || agentRun?.status === 'awaiting_approval'
+
+  // Cancel a single in-flight tool call (feature I). Aborts only that tool's
+  // controller; the rest of the request and other queued tools proceed. Flipping
+  // the tool part to output-error immediately means the UI reacts instantly
+  // instead of waiting for the tool promise to settle (which may never happen
+  // for a hung call) — the Retry button appears right away.
+  const handleCancelToolCall = useCallback(
+    (toolCallId: string) => {
+      toolCallControllersRef.current.get(toolCallId)?.abort()
+      const tool = sessionData.tools.find(
+        (item) => item.toolCallId === toolCallId
+      )
+      if (tool) {
+        void addToolOutput({
+          state: 'output-error',
+          tool: tool.toolName,
+          toolCallId,
+          errorText: 'Tool execution cancelled by user',
+        })
+      }
+    },
+    [sessionData, addToolOutput]
+  )
+
+  // Retry a single failed tool call (feature I). Re-runs the same tool with
+  // the same input through the standard execution path so the result lands
+  // back on the original tool part via addToolOutput. Resolves once the re-run
+  // settles so the caller can clear its busy state.
+  const handleRetryToolCall = useCallback(
+    (toolCallId: string, toolName: string, input: unknown) => {
+      const ragToolNames = useAppState.getState().ragToolNames
+      const mcpToolNames = useAppState.getState().mcpToolNames
+      const controller = new AbortController()
+      toolCallControllersRef.current.set(toolCallId, controller)
+
+      return executeChatToolCalls({
+        toolCalls: [
+          {
+            toolCallId,
+            toolName,
+            input:
+              typeof input === 'object' && input !== null
+                ? (input as object)
+                : { value: String(input) },
+          },
+        ],
+        signal: controller.signal,
+        threadId,
+        ragToolNames,
+        mcpToolNames,
+        approve: (name, currentThreadId, args) =>
+          useToolApproval.getState().showApprovalModal(name, currentThreadId, args),
+        callRagTool: (args) => serviceHub.rag().callTool(args),
+        callMcpTool: (args) => serviceHub.mcp().callTool(args),
+        getProjectId: () =>
+          useThreads.getState().threads[threadId]?.metadata?.project?.id,
+        processOutput: (content) =>
+          downscaleToolResultContent(
+            content,
+            useGeneralSetting.getState().maxImageSizePx
+          ),
+        addToolOutput,
+        getToolController: (id) => toolCallControllersRef.current.get(id),
+      })
+        .catch((error) => {
+          if ((error as Error).name !== 'AbortError') {
+            console.error('Tool call retry error:', error)
+          }
+        })
+        .finally(() => {
+          toolCallControllersRef.current.delete(toolCallId)
+        })
+    },
+    [threadId, addToolOutput, serviceHub]
+  )
+
   const handleStop = useCallback(() => {
     if (!agentModeActive || !isAgentRunning || !agentRun?.runId) {
       toolCallAbortController.current?.abort()
@@ -1510,7 +1668,24 @@ function ThreadDetail() {
   ])
   const requestActive =
     isAgentRunning || (!agentModeActive && isChatRequestActive)
-  const inputStatus = requestActive ? CHAT_STATUS.SUBMITTED : status
+  const inputStatus =
+    requestActive && status !== 'ready'
+      ? CHAT_STATUS.SUBMITTED
+      : status
+
+  // Belt-and-suspenders: release the request-active flag once the stream has
+  // fully settled so the last assistant message's action row un-hides even if
+  // an onFinish path left it set. The tools/pending guards keep the flag raised
+  // while tool execution or a context-limit reload is still running.
+  useEffect(() => {
+    if (
+      status === 'ready' &&
+      !pendingContinueMessage &&
+      sessionData.tools.length === 0
+    ) {
+      setIsChatRequestActive(false)
+    }
+  }, [status, pendingContinueMessage, sessionData, isChatRequestActive])
   const lastChatMessage = chatMessages[chatMessages.length - 1]
   const hasActiveAssistantMessage = lastChatMessage?.role === 'assistant'
   const latestUserMessageId = useMemo(() => {
@@ -1539,6 +1714,104 @@ function ThreadDetail() {
     return referencesByMessageId
   }, [chatMessages])
 
+  // Message search + jump (thread-local): finds matching messages in the
+  // current conversation and scrolls them into view.
+  const [messageSearchOpen, setMessageSearchOpen] = useState(false)
+  const [messageSearchQuery, setMessageSearchQuery] = useState('')
+  const [messageSearchIndex, setMessageSearchIndex] = useState(0)
+
+  // Per-thread notification mute (reacts to the persisted store).
+  const threadNotificationsMuted = useThreadNotifications(
+    (state) => state.isThreadMuted(threadId)
+  )
+
+  // Chat background customization (app-wide, from interface settings).
+  const chatBackground = useInterfaceSettings(
+    (state) => state.chatBackground
+  )
+  const chatWallpaper = useInterfaceSettings((state) => state.chatWallpaper)
+  const threadScroll = useInterfaceSettings((state) => state.threadScroll)
+  const chatBackgroundCss = useMemo(
+    () =>
+      CHAT_BACKGROUNDS.find((b) => b.value === chatBackground)?.css ?? '',
+    [chatBackground]
+  )
+
+  const messageSearchMatches = useMemo(() => {
+    const query = messageSearchQuery.trim().toLowerCase()
+    if (!query) return []
+    const matches: Array<{ id: string; snippet: string }> = []
+    for (const message of chatMessages) {
+      const text = message.parts
+        .filter(
+          (part): part is { type: 'text'; text: string } =>
+            part.type === 'text'
+        )
+        .map((part) => part.text)
+        .join('\n')
+      if (text.toLowerCase().includes(query)) {
+        matches.push({ id: message.id, snippet: text.slice(0, 90) })
+      }
+    }
+    return matches
+  }, [chatMessages, messageSearchQuery])
+
+  useEffect(() => {
+    setMessageSearchIndex(0)
+  }, [messageSearchQuery])
+
+  const jumpToMessage = useCallback(
+    (index: number) => {
+      if (messageSearchMatches.length === 0) return
+      const next = (index + messageSearchMatches.length) %
+        messageSearchMatches.length
+      setMessageSearchIndex(next)
+    },
+    [messageSearchMatches.length]
+  )
+
+  useEffect(() => {
+    const match = messageSearchMatches[messageSearchIndex]
+    if (!match) return
+    const el = document.querySelector(`[data-message-id="${match.id}"]`)
+    el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [messageSearchMatches, messageSearchIndex])
+
+  // Cross-thread search result jump: when arriving with ?messageId=, scroll the
+  // target message into view once the conversation has rendered.
+  const jumpTargetMessageId = search.messageId
+  useEffect(() => {
+    if (!jumpTargetMessageId) return
+    const el = document.querySelector(
+      `[data-message-id="${jumpTargetMessageId}"]`
+    )
+    el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }, [jumpTargetMessageId, chatMessages.length])
+
+  // Cmd/Ctrl+F toggles the in-thread search, unless focus is already inside
+  // an input/textarea (let the native find / textarea behavior win).
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {
+        const target = event.target as HTMLElement | null
+        const tag = target?.tagName?.toLowerCase()
+        if (tag === 'input' || tag === 'textarea' || target?.isContentEditable) {
+          return
+        }
+        event.preventDefault()
+        setMessageSearchOpen((open) => {
+          if (!open) {
+            setMessageSearchQuery('')
+            setMessageSearchIndex(0)
+          }
+          return !open
+        })
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [])
+
   return (
     <AgentWorkspaceLayout
       threadId={threadId}
@@ -1552,13 +1825,110 @@ function ThreadDetail() {
         <HeaderPage>
           <div className="flex items-center justify-between w-full pr-2">
             <DropdownModelProvider showSampler={!agentModeActive} />
+            <div className="flex items-center gap-1">
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                type="button"
+                title={
+                  threadNotificationsMuted
+                    ? 'Notifications off for this chat — click to enable'
+                    : 'Notifications on for this chat — click to mute'
+                }
+                onClick={() =>
+                  useThreadNotifications
+                    .getState()
+                    .setThreadMuted(threadId, !threadNotificationsMuted)
+                }
+              >
+                {threadNotificationsMuted ? (
+                  <BellOff className="size-4" />
+                ) : (
+                  <Bell className="size-4" />
+                )}
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                type="button"
+                title={messageSearchOpen ? 'Close search' : 'Search in chat (Ctrl+F)'}
+                onClick={() =>
+                  setMessageSearchOpen((open) => {
+                    if (open) {
+                      setMessageSearchQuery('')
+                      setMessageSearchIndex(0)
+                    }
+                    return !open
+                  })
+                }
+              >
+                {messageSearchOpen ? <X className="size-4" /> : <Search className="size-4" />}
+              </Button>
+            </div>
           </div>
         </HeaderPage>
+        {messageSearchOpen && (
+          <div className="flex items-center gap-2 border-b border-border bg-background px-4 py-2">
+            <Search className="size-4 shrink-0 text-muted-foreground" />
+            <Input
+              autoFocus
+              value={messageSearchQuery}
+              onChange={(event) => setMessageSearchQuery(event.target.value)}
+              placeholder="Search messages…"
+              className="h-8"
+            />
+            <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+              {messageSearchMatches.length > 0
+                ? `${messageSearchIndex + 1}/${messageSearchMatches.length}`
+                : '0/0'}
+            </span>
+            <div className="flex shrink-0 items-center gap-1">
+              <Button
+                variant="outline"
+                size="icon-xs"
+                type="button"
+                title="Previous match"
+                disabled={messageSearchMatches.length === 0}
+                onClick={() => jumpToMessage(messageSearchIndex - 1)}
+              >
+                <ChevronUp className="size-4" />
+              </Button>
+              <Button
+                variant="outline"
+                size="icon-xs"
+                type="button"
+                title="Next match"
+                disabled={messageSearchMatches.length === 0}
+                onClick={() => jumpToMessage(messageSearchIndex + 1)}
+              >
+                <ChevronDown className="size-4" />
+              </Button>
+            </div>
+          </div>
+        )}
         <div className="flex flex-1 overflow-hidden">
           <div className="flex flex-1 flex-col h-full overflow-hidden min-w-0">
             {/* Messages Area */}
-            <div className="flex-1 relative">
-              <Conversation className="absolute inset-0 text-start" isStreaming={status === 'streaming'}>
+            <div
+              className="flex-1 relative"
+              style={
+                chatWallpaper
+                  ? {
+                      backgroundImage: `url("${chatWallpaper}")`,
+                      backgroundSize: 'cover',
+                      backgroundPosition: 'center',
+                      backgroundRepeat: 'no-repeat',
+                    }
+                  : chatBackgroundCss
+                    ? { backgroundImage: chatBackgroundCss }
+                    : undefined
+              }
+            >
+              <Conversation
+                className="absolute inset-0 text-start"
+                scrollBehavior={threadScroll}
+                streaming={requestActive}
+              >
                 <ConversationContent
                   className={cn('mx-auto w-full max-w-3xl md:w-4/5 xl:w-4/6')}
                 >
@@ -1566,26 +1936,30 @@ function ThreadDetail() {
                     const isLastMessage = index === chatMessages.length - 1
                     const isFirstMessage = index === 0
                     return (
-                      <MessageItem
-                        key={message.id}
-                        message={message}
-                        isFirstMessage={isFirstMessage}
-                        isLastMessage={isLastMessage}
-                        status={inputStatus}
-                        requestActive={requestActive}
-                        reasoningContainerRef={reasoningContainerRef}
-                        onReasoningScroll={handleReasoningScroll}
-                        onRegenerate={handleRegenerate}
-                        onEdit={agentModeActive ? undefined : handleEditMessage}
-                        onDelete={
-                          agentModeActive ? undefined : handleDeleteMessage
-                        }
-                        isAnimating={!pendingContinueMessage}
-                        hideActions={!!pendingContinueMessage}
-                        agentAttachmentReferences={agentAttachmentReferencesByMessageId.get(
-                          message.id
-                        )}
-                      />
+                      <div key={message.id} data-message-id={message.id}>
+                        <MessageItem
+                          message={message}
+                          isFirstMessage={isFirstMessage}
+                          isLastMessage={isLastMessage}
+                          status={status}
+                          requestActive={requestActive}
+                          reasoningContainerRef={reasoningContainerRef}
+                          onReasoningScroll={handleReasoningScroll}
+                          onRegenerate={handleRegenerate}
+                          onEdit={agentModeActive ? undefined : handleEditMessage}
+                          onDelete={
+                            agentModeActive ? undefined : handleDeleteMessage
+                          }
+                          onReply={handleReply}
+                          onCancelToolCall={handleCancelToolCall}
+                          onRetryToolCall={handleRetryToolCall}
+                          isAnimating={!pendingContinueMessage}
+                          hideActions={!!pendingContinueMessage}
+                          agentAttachmentReferences={agentAttachmentReferencesByMessageId.get(
+                            message.id
+                          )}
+                        />
+                      </div>
                     )
                   })}
                   {pendingInitialUserMessage && (
@@ -1610,7 +1984,6 @@ function ThreadDetail() {
                         <Shimmer duration={1}>Indexing attachments...</Shimmer>
                       </div>
                     </>
-                  )}
                   )}
                   {pendingContinueMessage && status === 'submitted' && (
                     <MessageItem
@@ -1722,6 +2095,10 @@ function ThreadDetail() {
                 <ConversationAutoScroll
                   trigger={requestActive ? latestUserMessageId : undefined}
                 />
+                <ConversationFollow
+                  isStreaming={status === 'streaming'}
+                  behavior={threadScroll}
+                />
                 <ConversationScrollButton />
               </Conversation>
             </div>
@@ -1733,6 +2110,7 @@ function ThreadDetail() {
                 onSubmit={handleSubmit}
                 onStop={handleStop}
                 chatStatus={inputStatus}
+                threadId={threadId}
               />
             </div>
           </div>

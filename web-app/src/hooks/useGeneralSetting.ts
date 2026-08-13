@@ -9,6 +9,9 @@ export type ReasoningBudgetLevel =
   | 'high'
   | 'unlimited'
 
+/** Refresh cadence for live code colours while a code block is streaming. */
+export type CodeHighlightCadence = 'fast' | 'smooth' | 'relaxed'
+
 /**
  * Longest-edge cap (in pixels) applied to images before they are sent to the
  * model. Large images otherwise flood the context window. `0` disables
@@ -27,6 +30,8 @@ type GeneralSettingState = {
   huggingfaceToken?: string
   scanLocalModels: boolean
   localScanFolders: string[]
+  codeLiveHighlight: boolean
+  codeHighlightCadence: CodeHighlightCadence
   // Drives the "New" pill on the Integrations nav item — cleared on first visit.
   integrationsBadgeSeen: boolean
   markIntegrationsBadgeSeen: () => void
@@ -41,6 +46,8 @@ type GeneralSettingState = {
   setScanLocalModels: (value: boolean) => void
   addLocalScanFolder: (folder: string) => void
   removeLocalScanFolder: (folder: string) => void
+  setCodeLiveHighlight: (value: boolean) => void
+  setCodeHighlightCadence: (value: CodeHighlightCadence) => void
 }
 
 export const useGeneralSetting = create<GeneralSettingState>()(
@@ -56,6 +63,8 @@ export const useGeneralSetting = create<GeneralSettingState>()(
       huggingfaceToken: undefined,
       scanLocalModels: true,
       localScanFolders: [],
+      codeLiveHighlight: true,
+      codeHighlightCadence: 'smooth',
       integrationsBadgeSeen: false,
       markIntegrationsBadgeSeen: () =>
         set((state) =>
@@ -80,6 +89,9 @@ export const useGeneralSetting = create<GeneralSettingState>()(
         set((state) => ({
           localScanFolders: state.localScanFolders.filter((f) => f !== folder),
         })),
+      setCodeLiveHighlight: (value) => set({ codeLiveHighlight: value }),
+      setCodeHighlightCadence: (value) =>
+        set({ codeHighlightCadence: value }),
       setHuggingfaceToken: (token) => {
         set({ huggingfaceToken: token })
         ExtensionManager.getInstance()

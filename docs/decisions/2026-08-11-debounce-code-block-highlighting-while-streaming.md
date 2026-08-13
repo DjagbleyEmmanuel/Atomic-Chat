@@ -1,0 +1,17 @@
+---
+date: 2026-08-11
+title: "Debounce + progressive Shiki code-block highlighting while tokens stream"
+---
+
+# 2026-08-11 — Debounce + progressive Shiki code-block highlighting while tokens stream
+
+- **Context:** Reported as 3.0.0 bug "UI freezes while the model generates tokens". `code-block.tsx` ran a full synchronous Shiki `highlightCode` pass (light **and** dark themes, both requested with `setTimeout(0)` and awaited) inside a `useEffect` keyed on `[code, ...]`, so every streamed token triggered a whole-buffer re-highlight on the main thread. With a large streamed file this blocked input/rendering continuously. After the initial debounce fix, users reported the counterpart problem: HTML code stayed plain white until generation *finished* because the 180 ms debounce reset on every token and never fired mid-stream. A follow-up fix then surfaced a third issue: re-wiping the highlight on every token (`setHtml("")`) made streaming blocks flash plain-white between each colour refresh.
+- **Decision:** The standalone `CodeBlock` (`web-app/src/components/ai-elements/code-block.tsx`) is driven by:
+  - A **settle pass** — 180 ms after the code stops changing (debounced via `setTimeout`, cleared on re-run/unmount) — guarantees an exact final highlight.
+  - A **progressive pass** — a single interval whose cadence comes from the General → "Code Rendering & Streaming" setting (`fast` 150 ms / `smooth` 250 ms / `relaxed` 400 ms). It re-highlights the *latest* snapshot while the code keeps changing. A `codeRef` holds the newest `{code, language, showLineNumbers}` so tokens never re-create the effect. The interval is skipped when the "live code colours" toggle is off, for blocks over **1500 chars** (full Shiki passes on larger buffers freeze the UI — see the pinned `highlightInFlight` guard and the settlement ADR), and no-ops when the content is unchanged since the last pass.
+  - **One pass in flight.** A shared `highlightInFlight` ref gates the settle pass and the progressive interval, so Shiki passes can never pile up and starve the main thread while tokens stream.
+  - **No highlight wiping.** The last good highlight stays on screen while a fresh one computes and is swapped in when ready, so a streamed block never flashes back to plain white. The plain `<pre>` fallback only shows until the first highlight lands (e.g. initial mount).
+  - A per-call token guard (`highlightToken` ref captured at schedule time) discards stale results if the code changed while Shiki was in flight; `mounted` ref drops results after unmount.
+- **Consequences:** HTML code gains syntax colours live as it generates without white-flash or UI freeze, but only for small blocks (≤1500 chars); larger streamed blocks render plain text while streaming and get one highlight pass when the stream settles. The final exact pass lands ~350 ms after the stream stops. Cost is bounded — at most one light+dark Shiki pass every 150–400 ms (user-settable, never overlapping), and zero passes when static or when live colours are off. This applies to the standalone `CodeBlock` (used for HTML-preview blocks and tool I/O); regular fenced code still renders through Streamdown's own async, cached code plugin.
+- **Owner:** team
+- **Links:** `web-app/src/components/ai-elements/code-block.tsx`, `web-app/src/hooks/useGeneralSetting.ts`, `web-app/src/routes/settings/general.tsx`

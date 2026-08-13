@@ -7,7 +7,8 @@ import {
 import { cn } from '@/lib/utils'
 import { useAutoScrollToBottom } from '@/hooks/useAutoScrollToBottom'
 import type { ToolUIPart } from 'ai'
-import { ChevronDownIcon, Loader2, WrenchIcon } from 'lucide-react'
+import { ChevronDownIcon, Loader2, RotateCcw, Square, WrenchIcon } from 'lucide-react'
+import { Button } from '@/components/ui/button'
 import type { ComponentProps, ReactNode } from 'react'
 import {
   createContext,
@@ -45,6 +46,16 @@ export type ToolProps = ComponentProps<typeof Collapsible> & {
   open?: boolean
   defaultOpen?: boolean
   onOpenChange?: (open: boolean) => void
+  // Feature I: cancel+retry a single tool call.
+  toolCallId?: string
+  toolName?: string
+  input?: unknown
+  onCancel?: (toolCallId: string) => void
+  onRetry?: (
+    toolCallId: string,
+    toolName: string,
+    input: unknown
+  ) => void | Promise<void>
 }
 
 export const Tool = memo(
@@ -55,6 +66,11 @@ export const Tool = memo(
     defaultOpen = false,
     onOpenChange,
     children,
+    toolCallId,
+    toolName,
+    input,
+    onCancel,
+    onRetry,
     ...props
   }: ToolProps) => {
     const [isOpen, setIsOpen] = useControllableState({
@@ -77,7 +93,89 @@ export const Tool = memo(
         >
           {children}
         </Collapsible>
+        {toolCallId && (onCancel || onRetry) && (
+          <ToolActions
+            state={state}
+            toolCallId={toolCallId}
+            toolName={toolName ?? ''}
+            input={input}
+            onCancel={onCancel}
+            onRetry={onRetry}
+          />
+        )}
       </ToolContext.Provider>
+    )
+  }
+)
+
+const ToolActions = memo(
+  ({
+    state,
+    toolCallId,
+    toolName,
+    input,
+    onCancel,
+    onRetry,
+  }: {
+    state: ToolUIPart['state']
+    toolCallId: string
+    toolName: string
+    input: unknown
+    onCancel?: (toolCallId: string) => void
+    onRetry?: (
+      toolCallId: string,
+      toolName: string,
+      input: unknown
+    ) => void | Promise<void>
+  }) => {
+    const isRunning = state === 'input-streaming' || state === 'input-available'
+    const hasError = state === 'output-error'
+    const [retrying, setRetrying] = useState(false)
+
+    if (!isRunning && !hasError) return null
+
+    const actionClasses =
+      'h-6 px-2 text-xs transition-all active:scale-[0.97] disabled:pointer-events-none disabled:opacity-60'
+
+    return (
+      <div className="mt-1 flex items-center gap-2">
+        {isRunning && onCancel && (
+          <Button
+            variant="ghost"
+            size="sm"
+            type="button"
+            className={cn(actionClasses, 'text-muted-foreground')}
+            onClick={() => onCancel(toolCallId)}
+          >
+            <Square size={12} className="mr-1" />
+            Cancel
+          </Button>
+        )}
+        {hasError && onRetry && toolName && (
+          <Button
+            variant="ghost"
+            size="sm"
+            type="button"
+            disabled={retrying}
+            className={cn(actionClasses, 'text-muted-foreground')}
+            onClick={() => {
+              setRetrying(true)
+              Promise.resolve(
+                onRetry?.(toolCallId, toolName, input)
+              ).finally(() => {
+                setRetrying(false)
+              })
+            }}
+          >
+            {retrying ? (
+              <Loader2 size={12} className="mr-1 animate-spin" />
+            ) : (
+              <RotateCcw size={12} className="mr-1" />
+            )}
+            {retrying ? 'Retrying…' : 'Retry'}
+          </Button>
+        )}
+      </div>
     )
   }
 )
@@ -237,7 +335,6 @@ const ToolTextBlock = memo(
 
     const latestRef = useRef(displayText)
     latestRef.current = displayText
-    const runningRef = useRef(false)
     const aliveRef = useRef(true)
     const [html, setHtml] = useState('')
     const [darkHtml, setDarkHtml] = useState('')
@@ -260,26 +357,32 @@ const ToolTextBlock = memo(
       }
     }, [])
 
+    // Highlight only once the write settles. Re-highlighting the tail on every
+    // chunk ran back-to-back Shiki passes on the main thread, which froze the
+    // whole UI (buttons included) while a long file streamed into the frame.
+    // While streaming, the raw text renders below instead — instant and free —
+    // and a single highlight pass runs when the stream goes quiet.
     useEffect(() => {
-      if (runningRef.current) return
-      runningRef.current = true
+      if (streaming) return
+      let cancelled = false
       void (async () => {
-        let rendered: string | null = null
-        while (aliveRef.current && latestRef.current !== rendered) {
-          const target: string = latestRef.current
-          try {
-            const [light, dark] = await highlightCode(target, language as never)
-            if (!aliveRef.current) break
-            setHtml(light)
-            setDarkHtml(dark)
-          } catch {
-            // Keep the last good render rather than blanking the preview.
-          }
-          rendered = target
+        const target: string = latestRef.current
+        try {
+          const [light, dark] = await highlightCode(
+            target,
+            language as never
+          )
+          if (cancelled || !aliveRef.current) return
+          setHtml(light)
+          setDarkHtml(dark)
+        } catch {
+          // Keep the last good render rather than blanking the preview.
         }
-        runningRef.current = false
       })()
-    }, [displayText, language])
+      return () => {
+        cancelled = true
+      }
+    }, [displayText, language, streaming])
 
     return (
       <div className="space-y-1">
@@ -299,11 +402,14 @@ const ToolTextBlock = memo(
             wrapper would scroll the wrong element. */}
         <StickToBottom
           className={cn('relative rounded-md border', isScrollable && 'h-80')}
-          initial="smooth"
-          resize="smooth"
+          initial="instant"
+          resize={streaming ? 'instant' : 'smooth'}
         >
           <StickToBottom.Content>
-            {html ? (
+            {/* While streaming, always render the current raw text so the
+                preview never falls behind; the highlight swaps in once the
+                write settles. */}
+            {html && !streaming ? (
               <>
                 <div
                   className={cn('dark:hidden', HIGHLIGHT_SURFACE)}

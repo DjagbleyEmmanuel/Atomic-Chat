@@ -1,10 +1,30 @@
 import { Assistant, AssistantExtension, fs, joinPath } from '@janhq/core'
+
+/**
+ * Atomic Chat default assistant instructions.
+ *
+ * Deliberately does NOT ask the model to narrate its thought process: models
+ * that follow that instruction dump their reasoning as plain text, which then
+ * renders as a normal message (outside the reasoning UI) and can crowd out the
+ * actual answer. Reasoning is requested internally via the backend thinking
+ * flag instead, and the model is told to output only its final answer.
+ */
+const ATOMIC_CHAT_INSTRUCTIONS = `You are Atomic Chat, a helpful AI assistant who assists users with their requests. Atomic Chat is trained by Atomic Chat (https://atomic.chat).
+
+You must output your response in the exact language used in the latest user message. Do not provide translations or switch languages unless explicitly instructed to do so. If the input is mostly English, respond in English.
+
+Reason through requests before responding, but keep your reasoning internal — never narrate or show your thought process. Output only your final answer.
+
+You have tools to search for and access real-time, up-to-date data. Use them whenever the answer requires current or external information. Search before stating that you can't or don't know.
+
+Current date: {{current_date}}`
+
 /**
  * JanAssistantExtension is an AssistantExtension implementation that provides
  * functionality for managing assistants.
  */
 export default class JanAssistantExtension extends AssistantExtension {
-  private readonly CURRENT_MIGRATION_VERSION = 2
+  private readonly CURRENT_MIGRATION_VERSION = 3
   private readonly MIGRATION_FILE = 'file://assistants/.migration_version'
 
   /**
@@ -79,6 +99,12 @@ export default class JanAssistantExtension extends AssistantExtension {
       await this.saveMigrationVersion(2)
     }
 
+    if (currentVersion < 3) {
+      console.log('Running migration v3: Stop narrating the thought process')
+      await this.migrateToDirectAnswerInstructions()
+      await this.saveMigrationVersion(3)
+    }
+
     console.log(
       `Migrations complete. Current version: ${this.CURRENT_MIGRATION_VERSION}`
     )
@@ -131,26 +157,7 @@ export default class JanAssistantExtension extends AssistantExtension {
    */
   private async migrateToAtomicChatInstructions(): Promise<void> {
     const OLD_INSTRUCTION_PREFIX = 'You are Jan, a helpful AI assistant.'
-    const NEW_INSTRUCTION = `You are Atomic Chat, a helpful AI assistant who assists users with their requests. Atomic Chat is trained by Atomic Chat (https://atomic.chat).
-
-You must output your response in the exact language used in the latest user message. Do not provide translations or switch languages unless explicitly instructed to do so. If the input is mostly English, respond in English.
-
-When handling user queries:
-
-1. Think step by step about the query:
-   - Break complex questions into smaller, searchable parts
-   - Identify key search terms and parameters
-   - Consider what information is needed to provide a complete answer
-
-2. Mandatory logical analysis:
-   - Before engaging any tools, articulate your complete thought process in natural language. You must act as a "professional tool caller," demonstrating rigorous logic.
-   - Analyze the information gap: explicitly state what data is missing.
-   - Derive the strategy: explain why a specific tool is the logical next step.
-   - Justify parameters: explain why you chose those specific search keywords or that specific URL.
-
-You have tools to search for and access real-time, up-to-date data. Use them. Search before stating that you can't or don't know.
-
-Current date: {{current_date}}`
+    const NEW_INSTRUCTION = ATOMIC_CHAT_INSTRUCTIONS
 
     const DEFAULT_PARAMETERS = {
       temperature: 0.7,
@@ -194,6 +201,52 @@ Current date: {{current_date}}`
         } catch (error) {
           console.error(`Failed to migrate assistant ${assistant.id}:`, error)
         }
+      }
+    }
+  }
+
+  /**
+   * Migration v3: stop instructing the model to narrate its thought process.
+   * The v2 instructions told the assistant to "articulate your complete
+   * thought process in natural language", which made models emit their
+   * reasoning as plain text (shown outside the reasoning UI) and sometimes
+   * omit the actual answer. Replace with the direct-answer format.
+   */
+  private async migrateToDirectAnswerInstructions(): Promise<void> {
+    const OLD_FORMAT_MARKER = 'Mandatory logical analysis'
+
+    if (!(await fs.existsSync('file://assistants'))) {
+      return
+    }
+
+    const assistants = await this.getAssistants()
+
+    for (const assistant of assistants) {
+      if (
+        !assistant.instructions?.includes(OLD_FORMAT_MARKER) &&
+        !assistant.instructions?.startsWith('You are Jan,')
+      ) {
+        continue
+      }
+
+      assistant.instructions = ATOMIC_CHAT_INSTRUCTIONS
+
+      const assistantPath = await joinPath([
+        'file://assistants',
+        assistant.id,
+        'assistant.json',
+      ])
+
+      try {
+        await fs.writeFileSync(
+          assistantPath,
+          JSON.stringify(assistant, null, 2)
+        )
+        console.log(
+          `Migrated to direct-answer instructions for assistant: ${assistant.id}`
+        )
+      } catch (error) {
+        console.error(`Failed to migrate assistant ${assistant.id}:`, error)
       }
     }
   }
@@ -260,26 +313,7 @@ Current date: {{current_date}}`
     description:
       'Atomic Chat is a helpful desktop assistant that can reason through complex tasks and use tools to complete them on the user’s behalf.',
     model: '*',
-    instructions: `You are Atomic Chat, a helpful AI assistant who assists users with their requests. Atomic Chat is trained by Atomic Chat (https://atomic.chat).
-
-You must output your response in the exact language used in the latest user message. Do not provide translations or switch languages unless explicitly instructed to do so. If the input is mostly English, respond in English.
-
-When handling user queries:
-
-1. Think step by step about the query:
-   - Break complex questions into smaller, searchable parts
-   - Identify key search terms and parameters
-   - Consider what information is needed to provide a complete answer
-
-2. Mandatory logical analysis:
-   - Before engaging any tools, articulate your complete thought process in natural language. You must act as a "professional tool caller," demonstrating rigorous logic.
-   - Analyze the information gap: explicitly state what data is missing.
-   - Derive the strategy: explain why a specific tool is the logical next step.
-   - Justify parameters: explain why you chose those specific search keywords or that specific URL.
-
-You have tools to search for and access real-time, up-to-date data. Use them. Search before stating that you can't or don't know.
-
-Current date: {{current_date}}`,
+    instructions: ATOMIC_CHAT_INSTRUCTIONS,
     tools: [
       {
         type: 'retrieval',

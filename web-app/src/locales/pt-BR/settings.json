@@ -97,6 +97,8 @@
     "themeDesc": "Corresponder ao tema do Sistema Operacional.",
     "fontSize": "Tamanho da Fonte",
     "fontSizeDesc": "Ajustar o tamanho da fonte do app.",
+    "chatBackground": "Fundo do Chat",
+    "chatBackgroundDesc": "Definir o fundo da área de conversa.",
     "windowBackground": "Fundo da Janela",
     "windowBackgroundDesc": "Definir a cor de fundo da janela do app.",
     "appMainView": "Visualização Principal do App",
@@ -262,7 +264,15 @@
     "reportIssue": "Reportar Problema",
     "credits": "Créditos",
     "creditsDesc1": "👋 Atomic Bot é construído com ❤️ pela equipe Atomic Chat.",
-    "creditsDesc2": "Agradecimentos especiais às nossas dependências de código aberto—especialmente llama.cpp e Tauri—e à nossa incrível comunidade de IA."
+    "creditsDesc2": "Agradecimentos especiais às nossas dependências de código aberto—especialmente llama.cpp e Tauri—e à nossa incrível comunidade de IA.",
+    "codeRenderingTitle": "Renderização e streaming de código",
+    "liveCodeColors": "Cores de código ao vivo",
+    "liveCodeColorsDesc": "Mostrar as cores da sintaxe enquanto o código é gerado, atualizando-as durante o streaming. Quando desativado, o código permanece simples até terminar.",
+    "liveColorCadence": "Cadência das cores ao vivo",
+    "liveColorCadenceDesc": "Com que frequência o realce ao vivo é atualizado durante o streaming do código. Mais rápido parece mais imediato; mais lento poupa CPU.",
+    "liveColorCadenceFast": "Rápida (150 ms)",
+    "liveColorCadenceSmooth": "Suave (250 ms)",
+    "liveColorCadenceRelaxed": "Relaxada (400 ms)"
   },
   "extensions": {
     "title": "Extensões"

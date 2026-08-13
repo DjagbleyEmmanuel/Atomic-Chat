@@ -69,6 +69,7 @@ export type TraceBlock =
       tools: Array<{
         key: string
         toolName: string
+        toolCallId?: string
         state: ToolUIPart['state']
         presentation: ToolPresentation
       }>

@@ -8,7 +8,13 @@ import {
   type ReactNode,
 } from 'react'
 import { cn, disableIndentedCodeBlockPlugin } from '@/lib/utils'
+import { closeUnclosedCodeFence } from '@/lib/code-fence'
 import { ttftEnabled, ttftMark, ttftReport } from '@/lib/ttft-timing'
+import { CodeBlock } from '@/components/ai-elements/code-block'
+import {
+  type BundledLanguage,
+  bundledLanguagesInfo,
+} from 'shiki'
 // import 'katex/dist/katex.min.css'
 import {
   defaultRehypePlugins,
@@ -25,6 +31,7 @@ import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import { MermaidError } from '@/components/MermaidError'
 import { ArtifactTrigger } from './ArtifactPanel'
+import type { MessageDisplayMode } from '@/hooks/useInterfaceSettings'
 
 interface MarkdownProps {
   content: string
@@ -36,6 +43,7 @@ interface MarkdownProps {
   isAnimating?: boolean
   enableHtmlPreview?: boolean
   allowRawHtml?: boolean
+  displayMode?: MessageDisplayMode
 }
 
 const HTML_LANGUAGES = new Set(['html', 'htm'])
@@ -52,6 +60,12 @@ const REHYPE_PLUGINS_WITH_RAW_HTML = [
 ]
 const STREAMDOWN_PLUGINS = { code, mermaid, cjk }
 const STREAMDOWN_CONTROLS = { mermaid: { fullscreen: false } }
+
+// Shiki resolves language ids and aliases; unknown langs make codeToHtml throw,
+// so only highlight when the fence's info string maps to a real bundled lang.
+const SHIKI_LANG_IDS = new Set<string>(
+  bundledLanguagesInfo.flatMap((info) => [info.id, ...(info.aliases ?? [])])
+)
 
 /** Pick a fence longer than any backtick run inside the code. */
 function makeFence(source: string): string {
@@ -174,6 +188,7 @@ function RenderMarkdownComponent({
   isStreaming,
   enableHtmlPreview,
   allowRawHtml,
+  displayMode,
 }: MarkdownProps) {
   const rehypePlugins = allowRawHtml
     ? REHYPE_PLUGINS_WITH_RAW_HTML
@@ -181,7 +196,8 @@ function RenderMarkdownComponent({
 
   const normalizedContent = useMemo(() => {
     const prepared = enableHtmlPreview ? wrapBareHtmlDocument(content) : content
-    return normalizeLatex(prepared)
+    const fenced = closeUnclosedCodeFence(prepared)
+    return normalizeLatex(fenced)
   }, [content, enableHtmlPreview])
   const thetaMarked = useRef(false)
 
@@ -262,7 +278,21 @@ function RenderMarkdownComponent({
       const codeText = extractCodeText(children)
 
       if (HTML_LANGUAGES.has(language)) {
-        return <ArtifactTrigger code={codeText} streaming={!!isStreaming} />
+        // Show the code highlighted inline (Shiki) AND keep the artifact
+        // preview trigger, so HTML never appears as plain white text in chat.
+        return (
+          <div className="my-2 space-y-2">
+            <CodeBlock
+              code={codeText}
+              language={
+                SHIKI_LANG_IDS.has(language)
+                  ? (language as BundledLanguage)
+                  : 'html'
+              }
+            />
+            <ArtifactTrigger code={codeText} streaming={!!isStreaming} />
+          </div>
+        )
       }
 
       // Delegate every other code block (incl. mermaid) to streamdown.
@@ -278,11 +308,42 @@ function RenderMarkdownComponent({
     normalizedContent.includes('$$') ||
     /(^|[^\\])\$[^$\n]+\$/.test(normalizedContent)
 
+  // Short plain-text replies (e.g. "Yes", "4") skip the markdown pipeline for
+  // speed, but only when there's no markdown syntax that would be lost — a
+  // reply like "**Green**" must still render as bold, not literal asterisks.
+  const containsMarkdownSyntax = useMemo(
+    () =>
+      /[*_`~#[\]|]/.test(content) ||
+      content.includes('\n') ||
+      /^\s*(?:[-+>]|\d+\.)\s/m.test(content),
+    [content]
+  )
+
+  // Non-markdown display presets: render the raw message text as-is, skipping
+  // the markdown pipeline entirely. "monospace" is the same raw text in a
+  // monospace font for easy structural scanning of a token stream.
+  if (displayMode === 'plain' || displayMode === 'monospace') {
+    return (
+      <div
+        dir="auto"
+        className={cn(
+          'markdown wrap-break-word select-text whitespace-pre-wrap',
+          displayMode === 'monospace' && 'font-mono',
+          isUser && 'is-user',
+          className
+        )}
+      >
+        {content}
+      </div>
+    )
+  }
+
   if (
     content.length > 0 &&
     content.length < 32 &&
     !components &&
-    !containsMath
+    !containsMath &&
+    !containsMarkdownSyntax
   ) {
     return (
       <div
@@ -298,7 +359,10 @@ function RenderMarkdownComponent({
     )
   }
 
-  // Render the markdown content
+  // Render the markdown content live — Streamdown's streaming mode parses
+  // incrementally and defers the parse with useTransition, and its async code
+  // plugin shows code as plain text until the highlight settles, so headings,
+  // bold and code blocks all appear in real time while the model is speaking.
   return (
     <div
       dir="auto"
@@ -309,7 +373,8 @@ function RenderMarkdownComponent({
       )}
     >
       <Streamdown
-        animate={isAnimating ?? true}
+        mode={isStreaming ? 'streaming' : 'static'}
+        animate={isStreaming ? false : isAnimating}
         animationDuration={500}
         linkSafety={{
           enabled: false,
@@ -337,6 +402,7 @@ export const RenderMarkdown = memo(
     prevProps.components === nextProps.components &&
     prevProps.enableHtmlPreview === nextProps.enableHtmlPreview &&
     prevProps.allowRawHtml === nextProps.allowRawHtml &&
+    prevProps.displayMode === nextProps.displayMode &&
     // With HTML preview on, re-render on streaming→done to drop the loader.
     (!nextProps.enableHtmlPreview ||
       prevProps.isStreaming === nextProps.isStreaming)

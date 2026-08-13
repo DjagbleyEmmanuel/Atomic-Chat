@@ -8,7 +8,10 @@ import { Switch } from '@/components/ui/switch'
 import { Button } from '@/components/ui/button'
 import { Card, CardItem } from '@/containers/Card'
 import { useTranslation } from '@/i18n/react-i18next-compat'
-import { useGeneralSetting } from '@/hooks/useGeneralSetting'
+import {
+  type CodeHighlightCadence,
+  useGeneralSetting,
+} from '@/hooks/useGeneralSetting'
 import { useToolApproval } from '@/hooks/useToolApproval'
 import { useThreadNotifications } from '@/hooks/useThreadNotifications'
 import { useAppUpdater } from '@/hooks/useAppUpdater'
@@ -64,6 +67,10 @@ function General() {
     setPreloadModelOnStartup,
     reasoningBudget,
     setReasoningBudget,
+    codeLiveHighlight,
+    setCodeLiveHighlight,
+    codeHighlightCadence,
+    setCodeHighlightCadence,
   } = useGeneralSetting()
   const allowAllMCPPermissions = useToolApproval(
     (state) => state.allowAllMCPPermissions
@@ -426,6 +433,46 @@ function General() {
                     checked={notificationsGloballyEnabled}
                     onCheckedChange={setNotificationsGloballyEnabled}
                   />
+                }
+              />
+            </Card>
+
+            {/* Code Rendering & Streaming */}
+            <Card title={t('settings:general.codeRenderingTitle')}>
+              <CardItem
+                title={t('settings:general.liveCodeColors')}
+                description={t('settings:general.liveCodeColorsDesc')}
+                actions={
+                  <Switch
+                    checked={codeLiveHighlight}
+                    onCheckedChange={setCodeLiveHighlight}
+                  />
+                }
+              />
+              <CardItem
+                title={t('settings:general.liveColorCadence')}
+                description={t('settings:general.liveColorCadenceDesc')}
+                actions={
+                  <select
+                    className="border-input bg-background rounded-md border px-2 py-1 text-sm disabled:cursor-not-allowed disabled:opacity-50"
+                    value={codeHighlightCadence}
+                    disabled={!codeLiveHighlight}
+                    onChange={(e) =>
+                      setCodeHighlightCadence(
+                        e.target.value as CodeHighlightCadence
+                      )
+                    }
+                  >
+                    <option value="fast">
+                      {t('settings:general.liveColorCadenceFast')}
+                    </option>
+                    <option value="smooth">
+                      {t('settings:general.liveColorCadenceSmooth')}
+                    </option>
+                    <option value="relaxed">
+                      {t('settings:general.liveColorCadenceRelaxed')}
+                    </option>
+                  </select>
                 }
               />
             </Card>

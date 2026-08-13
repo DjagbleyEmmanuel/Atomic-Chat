@@ -1,6 +1,7 @@
-import { render } from '@testing-library/react'
+import { render, waitFor } from '@testing-library/react'
 import { describe, it, expect, vi } from 'vitest'
 import { RenderMarkdown } from '../RenderMarkdown'
+import { closeUnclosedCodeFence } from '@/lib/code-fence'
 
 vi.mock('@i18n/react-i18next-compat', () => ({
   useTranslation: () => ({
@@ -365,6 +366,78 @@ describe('RenderMarkdown', () => {
       // Should not treat < $2, So choose the $1 one.\n\n> as HTML tag
       expect(katexContainer).toBeNull()
     })
+  })
+
+  describe('closeUnclosedCodeFence', () => {
+    it('leaves balanced content untouched', () => {
+      const content = '```js\nconst x = 1\n```\n\n```\nconst y = 2\n```'
+      expect(closeUnclosedCodeFence(content)).toBe(content)
+    })
+
+    it('appends a closing fence for a single unclosed fence', () => {
+      const content = 'Here is the code:\n\n```js\nconst x = 1'
+      const result = closeUnclosedCodeFence(content)
+      expect(result).toBe('Here is the code:\n\n```js\nconst x = 1\n\n```')
+    })
+
+    it('matches the marker of the opened fence', () => {
+      const content = '~~~~js\nconst x = 1'
+      expect(closeUnclosedCodeFence(content)).toBe('~~~~js\nconst x = 1\n\n~~~~')
+    })
+
+    it('closes the last of multiple fences when one is missing', () => {
+      const content = '```js\nconst x = 1\n```\n\n```py\nprint(1)'
+      const result = closeUnclosedCodeFence(content)
+      expect(result.endsWith('\n\n```')).toBe(true)
+    })
+  })
+
+  it('renders markdown structure live while streaming', async () => {
+    const content = '## Heading\n\nThis **bold** text.'
+    render(<RenderMarkdown content={content} isStreaming />)
+    // Headings and bold resolve in real time instead of showing literal
+    // markdown markers that only disappear once generation completes.
+    const heading = await waitFor(() =>
+      document.querySelector('[data-streamdown="heading-2"]')
+    )
+    expect(heading?.textContent).toContain('Heading')
+    const strong = document.querySelector('[data-streamdown="strong"]')
+    expect(strong?.textContent).toContain('bold')
+    expect(document.body.textContent).not.toContain('## Heading')
+    expect(document.body.textContent).not.toContain('**bold**')
+  })
+
+  it('renders short markdown replies through the markdown pipeline (no literal asterisks)', async () => {
+    const { container, findByText } = render(
+      <RenderMarkdown content={'**Green**'} />
+    )
+    await findByText('Green')
+    const strong = container.querySelector('[data-streamdown="strong"]')
+    expect(strong).toBeTruthy()
+    expect(strong?.textContent).toBe('Green')
+    expect(container.textContent).not.toContain('**Green**')
+  })
+
+  it('keeps the plain-text fast path for short replies without markdown syntax', () => {
+    const { container } = render(<RenderMarkdown content={'Yes'} />)
+    const markdownContainer = container.querySelector('.markdown')
+    expect(markdownContainer?.textContent).toBe('Yes')
+    expect(markdownContainer?.textContent).not.toContain('*')
+  })
+
+  it('renders fenced code blocks live while streaming', async () => {
+    const content = 'Here is the page:\n\n```html\n<div>Hello</div>\n```'
+    const { container, findAllByText } = render(
+      <RenderMarkdown content={content} isStreaming />
+    )
+    // Prose is still shown, and the fenced code appears immediately (plain
+    // text first, then highlighted once the async pass settles).
+    expect(container.textContent).toContain('Here is the page:')
+    await findAllByText('Hello', { exact: false }, { timeout: 8000 })
+    expect(
+      container.querySelector('[data-streamdown="code-block"]')
+    ).toBeTruthy()
+    expect(container.textContent).toContain('<div>Hello</div>')
   })
 })
 

@@ -29,7 +29,7 @@
     ]
   },
   "bundle": {
-    "targets": ["appimage"],
+    "targets": ["deb"],
     "resources": [
       "resources/pre-install/**/*",
       "resources/LICENSE",

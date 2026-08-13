@@ -35,7 +35,7 @@ export const useTheme = create<ThemeState>()(
             await getServiceHub()
               .theme()
               .setTheme(activeTheme as ThemeMode)
-            set(() => ({ activeTheme, isDark: activeTheme === 'dark' }))
+            set(() => ({ activeTheme, isDark: activeTheme !== 'light' }))
           }
         },
         setIsDark: (isDark: boolean) => set(() => ({ isDark })),
@@ -45,7 +45,7 @@ export const useTheme = create<ThemeState>()(
       if (initialState.activeTheme === 'auto') {
         initialState.isDark = checkOSDarkMode()
       } else {
-        initialState.isDark = initialState.activeTheme === 'dark'
+        initialState.isDark = initialState.activeTheme !== 'light'
       }
 
       return initialState

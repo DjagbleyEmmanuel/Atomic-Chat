@@ -9,7 +9,7 @@ decision is reversed, add a new one that says which record it supersedes.
 2. Add one line to the right section of this index.
 3. Do **not** paste the record body into `AGENTS.md`.
 
-169 records, 2026-05-19 → 2026-08-05.
+176 records, 2026-05-19 → 2026-08-12.
 
 ---
 
@@ -213,8 +213,15 @@ decision is reversed, add a new one that says which record it supersedes.
 - **2026-05-22** — [Pin static WiX `upgradeCode` to legacy Jan UUID for in-place MSI upgrades](2026-05-22-pin-static-wix-upgradecode-to-legacy-jan-uuid-for-in-place-msi.md)
 - **2026-05-19** — [Product identity is "Atomic Chat"; new code stops carrying Jan branding](2026-05-19-product-identity-is-atomic-chat-new-code-stops-carrying-jan.md)
 
-## UI / UX (9)
+## UI / UX (13)
 
+- **2026-08-12** — [Keep the main thread responsive while the model generates](2026-08-12-keep-the-main-thread-responsive-while-model-generates.md)
+- **2026-08-12** — [Render code blocks in their own window frame and wrap long lines](2026-08-12-render-code-blocks-in-window-frames-and-wrap-long-lines.md)
+- **2026-08-12** — [Make per-tool cancel instant and hide cancel/retry on agent-run tools](2026-08-12-make-tool-cancels-instant-and-hide-actions-on-agent-tools.md)
+- **2026-08-11** — [Expose thread scroll presets and message render modes as interface settings](2026-08-11-thread-scroll-presets-and-message-render-modes.md)
+- **2026-08-11** — [Render markdown live during token streaming via Streamdown streaming mode](2026-08-11-render-markdown-live-during-token-streaming.md)
+- **2026-08-11** — [JS spell-check fallback because wry/WebKitGTK exposes no spell-check API](2026-08-11-js-spell-check-fallback-for-webkitgtk-linux.md)
+- **2026-08-11** — [Debounce Shiki code-block highlighting while tokens stream](2026-08-11-debounce-code-block-highlighting-while-streaming.md)
 - **2026-07-31** — [Disable the transparent Windows window to stop the softbuffer fatal panic](2026-07-31-disable-transparent-windows-window-to-stop-softbuffer-panic.md)
 - **2026-07-30** — [Reveal the Windows window after native setup](2026-07-30-reveal-windows-after-first-frontend-frame.md)
 - **2026-07-27** — [Replace advanced model settings with a focused context control](2026-07-27-replace-advanced-model-settings-with-a-focused-context-control.md)

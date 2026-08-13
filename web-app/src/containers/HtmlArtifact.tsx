@@ -99,8 +99,6 @@ function HtmlArtifactComponent({
   if (!artifactIdRef.current) artifactIdRef.current = createArtifactId()
   const versionRef = useRef(0)
 
-  const generating = streaming
-
   // Auto-scroll the HTML source ("Code" tab) to the bottom while it streams,
   // but let the user scroll up to read without being yanked back down. Mirrors
   // the stick-to-bottom behaviour used for the tool window / reasoning box.
@@ -110,9 +108,21 @@ function HtmlArtifactComponent({
     { enabled: streaming }
   )
 
-  // Do not hand an incomplete document to the iframe while generation is active.
+  const [codeIdle, setCodeIdle] = useState(false)
   useEffect(() => {
-    if (isPlatformTauri() || generating || !code) return
+    setCodeIdle(false)
+    const timer = setTimeout(() => setCodeIdle(true), 2000)
+    return () => clearTimeout(timer)
+  }, [code])
+
+  // Don't trust `streaming` alone; it can stay stuck true after a re-mount.
+  const docComplete = /<\/html>/i.test(code)
+  const generating = streaming && !docComplete && !codeIdle
+
+  // Web: blob preview is handled internally by the browser, so it's safe to
+  // refresh on every debounced change.
+  useEffect(() => {
+    if (isPlatformTauri()) return
     const timer = setTimeout(() => {
       const url = URL.createObjectURL(
         new Blob([buildPreviewDocument(code)], { type: 'text/html' })
@@ -123,7 +133,7 @@ function HtmlArtifactComponent({
       })
     }, 250)
     return () => clearTimeout(timer)
-  }, [code, generating])
+  }, [code])
 
   // Tauri: serve through the artifact:// protocol, but navigate the iframe only
   // once the stream has settled. Re-navigating a custom-scheme iframe on every

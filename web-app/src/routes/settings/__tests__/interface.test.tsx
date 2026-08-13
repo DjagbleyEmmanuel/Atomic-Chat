@@ -63,6 +63,12 @@ vi.mock('@/containers/AccentColorPicker', () => ({
   ),
 }))
 
+vi.mock('@/containers/ChatBackgroundPicker', () => ({
+  ChatBackgroundPicker: () => (
+    <div data-testid="chat-background-picker">Chat Background Picker</div>
+  ),
+}))
+
 vi.mock('@/hooks/useInterfaceSettings', () => ({
   useInterfaceSettings: () => ({
     resetInterface: vi.fn(),
@@ -132,6 +138,7 @@ describe('Interface Settings Route', () => {
 
     expect(screen.getByTestId('theme-switcher')).toBeInTheDocument()
     expect(screen.getByTestId('font-size-switcher')).toBeInTheDocument()
+    expect(screen.getByTestId('chat-background-picker')).toBeInTheDocument()
     expect(screen.queryByTestId('accent-color-picker')).not.toBeInTheDocument()
   })
 

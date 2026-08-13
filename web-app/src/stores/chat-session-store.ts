@@ -179,9 +179,13 @@ export const useChatSessions = create<ChatSessionState>((set, get) => ({
         // the master switch only suppresses notifications when explicitly OFF.
         const globallyEnabled =
           useThreadNotifications.getState().globallyEnabled !== false;
+        const threadMuted = useThreadNotifications
+          .getState()
+          .isThreadMuted(sessionId);
 
         if (
           globallyEnabled &&
+          !threadMuted &&
           hasMessages &&
           !hasPendingTools &&
           notFocusedHere

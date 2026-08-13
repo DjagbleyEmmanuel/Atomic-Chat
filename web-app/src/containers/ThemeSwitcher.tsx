@@ -22,6 +22,10 @@ export function ThemeSwitcher({
 
   const themeOptions = [
     { value: 'dark', label: t('common:dark') },
+    { value: 'midnight', label: t('common:midnight') },
+    { value: 'midnight-red', label: t('common:midnightRed') },
+    { value: 'midnight-emerald', label: t('common:midnightEmerald') },
+    { value: 'midnight-violet', label: t('common:midnightViolet') },
     { value: 'light', label: t('common:light') },
     { value: 'auto', label: t('common:system') },
   ]
@@ -32,7 +36,9 @@ export function ThemeSwitcher({
     return (
       <RadioGroup
         value={activeTheme}
-        onValueChange={(value) => setTheme(value as 'auto' | 'light' | 'dark')}
+        onValueChange={(value) =>
+          setTheme(value as AppTheme)
+        }
         className="grid grid-cols-1 gap-3"
       >
         {themeOptions.map((item) => (
@@ -71,7 +77,9 @@ export function ThemeSwitcher({
               'cursor-pointer my-0.5',
               activeTheme === item.value && 'bg-secondary-foreground/8'
             )}
-            onClick={() => setTheme(item.value as 'auto' | 'light' | 'dark')}
+            onClick={() =>
+              setTheme(item.value as AppTheme)
+            }
           >
             {item.label}
           </DropdownMenuItem>

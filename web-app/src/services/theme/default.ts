@@ -2,12 +2,33 @@
  * Default Theme Service - Generic implementation with minimal returns
  */
 
-import type { ThemeService, ThemeMode } from './types'
+import {
+  DARK_VARIANT_THEMES,
+  type ThemeService,
+  type ThemeMode,
+} from './types'
+
+const ALL_THEME_CLASSES: readonly string[] = [
+  'dark',
+  ...DARK_VARIANT_THEMES,
+]
 
 export class DefaultThemeService implements ThemeService {
   async setTheme(theme: ThemeMode): Promise<void> {
     console.log('setTheme called with theme:', theme)
-    // No-op - not implemented in default service
+
+    const root = document.documentElement
+    root.classList.remove(...ALL_THEME_CLASSES)
+
+    if (theme === 'dark') {
+      root.classList.add('dark')
+    } else if (
+      theme &&
+      (DARK_VARIANT_THEMES as readonly string[]).includes(theme)
+    ) {
+      // Dark variants layer on the `dark:` variants, so they co-apply `.dark`.
+      root.classList.add('dark', theme)
+    }
   }
 
   getCurrentWindow() {

@@ -155,6 +155,17 @@
     color: var(--shiki-dark, var(--foreground)) !important;
   }
 
+  /* Contain long code lines inside the block's window frame: wrap instead of
+   * horizontal scrolling, so no scrollbar sits below the code. The generic
+   * `pre { overflow-x: auto }` rule above would otherwise hit these blocks
+   * and pop a bottom scrollbar the moment one token stream grows past the
+   * container width. */
+  [data-streamdown="code-block-body"] {
+    overflow-x: hidden;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  }
+
   /* Tables: window frame with rounded corners */
   table {
     width: 100%;

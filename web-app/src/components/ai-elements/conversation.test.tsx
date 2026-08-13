@@ -10,9 +10,13 @@ vi.mock('use-stick-to-bottom', () => {
     ...props
   }: React.ComponentProps<'div'> & {
     initial?: string
-    resize?: string
+    resize?: string | Record<string, number>
   }) => (
-    <div data-initial={initial} data-resize={resize} {...props}>
+    <div
+      data-initial={initial}
+      data-resize={typeof resize === 'string' ? resize : 'spring'}
+      {...props}
+    >
       {children}
     </div>
   )
@@ -31,11 +35,21 @@ vi.mock('use-stick-to-bottom', () => {
 })
 
 describe('Conversation', () => {
-  it('does not restart smooth scrolling for every streaming resize', () => {
+  it('defaults to an instant resize so streaming token growth does not restart a fresh animation on every resize', () => {
     render(<Conversation>Message</Conversation>)
 
     const conversation = screen.getByRole('log')
-    expect(conversation).toHaveAttribute('data-initial', 'smooth')
+    expect(conversation).toHaveAttribute('data-initial', 'instant')
     expect(conversation).toHaveAttribute('data-resize', 'instant')
+  })
+
+  it('uses a spring resize for the smooth scroll preset', () => {
+    render(
+      <Conversation scrollBehavior="smooth">Message</Conversation>
+    )
+
+    const conversation = screen.getByRole('log')
+    expect(conversation).toHaveAttribute('data-initial', 'instant')
+    expect(conversation).toHaveAttribute('data-resize', 'spring')
   })
 })

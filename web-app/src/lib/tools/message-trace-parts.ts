@@ -91,6 +91,7 @@ export function buildTraceBlocks(
       tools.push({
         key: `${message.id}-${i}`,
         toolName,
+        toolCallId: 'toolCallId' in part ? part.toolCallId : undefined,
         state,
         presentation: presentTool({
           toolName,

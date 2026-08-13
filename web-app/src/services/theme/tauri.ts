@@ -10,7 +10,12 @@ import { DefaultThemeService } from './default'
 export class TauriThemeService extends DefaultThemeService {
   async setTheme(theme: ThemeMode): Promise<void> {
     try {
-      const tauriTheme = theme as Theme | null
+      // Manage HTML classes (dark, midnight) via the base service
+      await super.setTheme(theme)
+
+      // Map any dark variant to dark for Tauri's Theme API (it has no variants)
+      const tauriTheme: Theme | null =
+        theme === 'light' ? 'light' : theme == null ? null : 'dark'
 
       // Update all open windows, not just the current one
       const allWindows = await getAllWebviewWindows()

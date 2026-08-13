@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { useTheme, checkOSDarkMode } from '@/hooks/useTheme'
 import { isPlatformTauri } from '@/lib/platform/utils'
+import { DARK_VARIANT_THEMES } from '@/services/theme/types'
 
 /**
  * ThemeProvider ensures theme settings are applied on every page load
@@ -10,14 +11,27 @@ import { isPlatformTauri } from '@/lib/platform/utils'
 export function ThemeProvider() {
   const { activeTheme, isDark, setIsDark, setTheme } = useTheme()
 
-  // Apply dark class to root element
+  // Apply dark / midnight-variant classes to root element. Midnight variants
+  // build on the `dark:` variants, so they co-apply `.dark` and layer their
+  // own accent-hued class on top.
   useEffect(() => {
-    if (isDark) {
+    const isVariant = (DARK_VARIANT_THEMES as readonly string[]).includes(
+      activeTheme
+    )
+    if (isVariant) {
+      document.documentElement.classList.add('dark', activeTheme)
+    } else if (isDark) {
       document.documentElement.classList.add('dark')
+      document.documentElement.classList.remove(
+        ...(DARK_VARIANT_THEMES as readonly string[])
+      )
     } else {
-      document.documentElement.classList.remove('dark')
+      document.documentElement.classList.remove(
+        'dark',
+        ...(DARK_VARIANT_THEMES as readonly string[])
+      )
     }
-  }, [isDark])
+  }, [activeTheme, isDark])
 
   // Detect OS theme on mount and apply it
   useEffect(() => {

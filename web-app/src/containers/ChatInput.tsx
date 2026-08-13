@@ -1,5 +1,5 @@
 import { EMBEDDING_MODEL_ID } from '@/constants/models'
-import TextareaAutosize from 'react-textarea-autosize'
+import { SpellCheckTextarea } from '@/components/ai-elements/spell-check-textarea'
 import {
   cn,
   formatBytes,
@@ -7,6 +7,7 @@ import {
   isLlamacppProvider,
 } from '@/lib/utils'
 import { usePrompt } from '@/hooks/usePrompt'
+import { useReplyTo } from '@/hooks/useReplyTo'
 import { useThreads } from '@/hooks/useThreads'
 import {
   useCallback,
@@ -35,6 +36,7 @@ import {
   IconTool,
   IconCodeCircle2,
   IconPlayerStopFilled,
+  IconMessageReply,
   IconX,
   IconPaperclip,
   IconLoader2,
@@ -137,6 +139,14 @@ import {
 } from '@/hooks/useBackendMismatch'
 import type { AgentSkill } from '@/services/agent/skills'
 
+/** Prefix every non-empty line with `> ` so the snippet renders as a markdown blockquote. */
+function buildReplyQuote(snippet: string): string {
+  return snippet
+    .split('\n')
+    .map((line) => (line.trim() ? `> ${line}` : '>'))
+    .join('\n')
+}
+
 type ChatInputProps = {
   className?: string
   showSpeedToken?: boolean
@@ -151,6 +161,7 @@ type ChatInputProps = {
   ) => void
   onStop?: () => void
   chatStatus?: ChatStatus
+  threadId?: string
 }
 
 const ChatInput = memo(function ChatInput({
@@ -161,6 +172,7 @@ const ChatInput = memo(function ChatInput({
   onSubmit,
   onStop,
   chatStatus,
+  threadId,
 }: ChatInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const agentSkillTokenRef = useRef<HTMLSpanElement>(null)
@@ -176,6 +188,17 @@ const ChatInput = memo(function ChatInput({
   const prompt = usePrompt((state) => state.prompt)
   const setPrompt = usePrompt((state) => state.setPrompt)
   const currentThreadId = useThreads((state) => state.currentThreadId)
+  const replyTarget = useReplyTo((state) =>
+    threadId ? state.byThread[threadId] ?? null : null
+  )
+  const clearReply = useReplyTo((state) => state.clear)
+
+  // Focus the composer as soon as a reply is started so the user can type.
+  useEffect(() => {
+    if (replyTarget) {
+      textareaRef.current?.focus()
+    }
+  }, [replyTarget])
   const updateCurrentThreadModel = useThreads(
     (state) => state.updateCurrentThreadModel
   )
@@ -515,6 +538,17 @@ const ChatInput = memo(function ChatInput({
     }
   }, [currentThreadId, transferAttachments])
 
+  // Keep the composer bound to the active thread's draft: switching threads
+  // saves the in-flight text under the previous thread and restores the draft
+  // for the one being opened. Temporary/new chats have no persistent draft.
+  useEffect(() => {
+    const draftThreadId =
+      currentThreadId && currentThreadId !== TEMPORARY_CHAT_ID
+        ? currentThreadId
+        : undefined
+    usePrompt.getState().setActiveThread(draftThreadId)
+  }, [currentThreadId])
+
   const updateAttachmentProcessing = useCallback(
     (
       fileName: string,
@@ -664,14 +698,18 @@ const ChatInput = memo(function ChatInput({
           url: att.dataUrl!,
         }))
 
+      const replyQuote = replyTarget ? buildReplyQuote(replyTarget.snippet) : ''
+      const finalPrompt = replyQuote ? `${replyQuote}\n\n${prompt}` : prompt
+
       onSubmit(
-        prompt,
+        finalPrompt,
         files.length > 0 ? files : undefined,
         selectedAgentSkill?.name
       )
       setPrompt('')
       setSelectedAgentSkill(null)
       clearAttachmentsForThread(attachmentsKey)
+      if (replyTarget && threadId) clearReply(threadId)
     } else {
       // No onSubmit provided - create a new thread and navigate to it
       // Store the initial message in sessionStorage for the thread page to read
@@ -2415,6 +2453,28 @@ const ChatInput = memo(function ChatInput({
                   onActiveIndexChange={setAgentSkillActiveIndex}
                 />
               )}
+              {replyTarget && (
+                <div className="flex items-start gap-2 px-4 pt-3">
+                  <div className="flex-1 min-w-0 rounded-lg border border-border/70 bg-muted/40 px-3 py-2">
+                    <div className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
+                      <IconMessageReply size={12} className="shrink-0" />
+                      <span>{t('replyingTo')}</span>
+                    </div>
+                    <p className="mt-1 line-clamp-2 text-xs text-foreground/80 whitespace-pre-wrap break-words">
+                      {replyTarget.snippet}
+                    </p>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="shrink-0"
+                    onClick={() => threadId && clearReply(threadId)}
+                    title={t('cancel')}
+                  >
+                    <IconX size={14} />
+                  </Button>
+                </div>
+              )}
               <div className="relative min-w-0 w-full px-4 pt-3">
                 {selectedAgentSkill && (
                   <span
@@ -2425,7 +2485,7 @@ const ChatInput = memo(function ChatInput({
                     /{selectedAgentSkill.name}
                   </span>
                 )}
-                <TextareaAutosize
+                <SpellCheckTextarea
                   dir="auto"
                   ref={textareaRef}
                   minRows={2}
@@ -2433,6 +2493,7 @@ const ChatInput = memo(function ChatInput({
                   maxRows={10}
                   value={prompt}
                   data-testid={'chat-input'}
+                  spellCheckEnabled={spellCheckChatInput}
                   onChange={(e) => {
                     setPrompt(e.target.value)
                     updateAgentSkillSlashQuery(

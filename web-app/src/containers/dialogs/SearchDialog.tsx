@@ -20,6 +20,10 @@ import {
   filterThreadsBySidebarMode,
   isThreadInSidebarMode,
 } from '@/lib/sidebar-thread-mode'
+import {
+  useCrossThreadSearch,
+  type CrossThreadSearchMatch,
+} from '@/hooks/useCrossThreadSearch'
 
 const MAX_RECENT_SEARCHES = 5
 
@@ -41,16 +45,19 @@ export function SearchDialog({ open, onOpenChange, mode }: SearchDialogProps) {
   const threads = useThreads((state) => state.threads)
   const getFilteredThreads = useThreads((state) => state.getFilteredThreads)
   const agentThreads = useAgentMode((state) => state.agentThreads)
+  const crossThreadSearch = useCrossThreadSearch()
 
   // Focus input when dialog opens
   useEffect(() => {
     if (open) {
       setSearchQuery('')
+      crossThreadSearch.clear()
       setSelectedIndex(0)
       setTimeout(() => {
         inputRef.current?.focus()
       }, 0)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
 
   // Load recent searches from localStorage
@@ -85,6 +92,7 @@ export function SearchDialog({ open, onOpenChange, mode }: SearchDialogProps) {
 
   const handleClose = () => {
     setSearchQuery('')
+    crossThreadSearch.clear()
     onOpenChange(false)
   }
 
@@ -146,7 +154,10 @@ export function SearchDialog({ open, onOpenChange, mode }: SearchDialogProps) {
 
   // Calculate all selectable items for keyboard navigation
   const allItems = useMemo(() => {
-    const items: Array<{ type: 'new' | 'recent' | 'result'; id: string }> = []
+    const items: Array<
+      | { type: 'new' | 'recent' | 'result'; id: string }
+      | { type: 'message'; id: string; threadId: string }
+    > = []
 
     if (!searchQuery) {
       // Start new chat option
@@ -164,10 +175,14 @@ export function SearchDialog({ open, onOpenChange, mode }: SearchDialogProps) {
       searchResults.withoutProject.forEach((thread) => {
         items.push({ type: 'result', id: thread.id })
       })
+      // Message matches from cross-thread full-text search
+      crossThreadSearch.matches.forEach((match) => {
+        items.push({ type: 'message', id: match.messageId, threadId: match.threadId })
+      })
     }
 
     return items
-  }, [searchQuery, recentSearches, searchResults])
+  }, [searchQuery, recentSearches, searchResults, crossThreadSearch.matches])
 
   // Reset selected index when items change
   useEffect(() => {
@@ -197,6 +212,11 @@ export function SearchDialog({ open, onOpenChange, mode }: SearchDialogProps) {
       if (selectedItem) {
         if (selectedItem.type === 'new') {
           handleStartNewChat()
+        } else if (selectedItem.type === 'message') {
+          const match = crossThreadSearch.matches.find(
+            (m) => m.messageId === selectedItem.id
+          )
+          if (match) handleSelectMessage(match)
         } else {
           handleSelectThread(selectedItem.id)
         }
@@ -210,10 +230,20 @@ export function SearchDialog({ open, onOpenChange, mode }: SearchDialogProps) {
     navigate({ to: '/' })
   }
 
+  const handleSelectMessage = (match: CrossThreadSearchMatch) => {
+    handleClose()
+    navigate({
+      to: route.threadsDetail,
+      params: { threadId: match.threadId },
+      search: { messageId: match.messageId },
+    })
+  }
+
   const showStartNewChat = !searchQuery
   const hasResults =
     searchResults.withProject.length > 0 ||
-    searchResults.withoutProject.length > 0
+    searchResults.withoutProject.length > 0 ||
+    crossThreadSearch.matches.length > 0
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -245,7 +275,11 @@ export function SearchDialog({ open, onOpenChange, mode }: SearchDialogProps) {
             )}
             className="flex-1 h-12 px-3 bg-transparent placeholder:text-muted-foreground focus:outline-none"
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(e) => {
+              const value = e.target.value
+              setSearchQuery(value)
+              crossThreadSearch.setSearchQuery(value)
+            }}
             onKeyDown={handleKeyDown}
           />
         </div>
@@ -364,6 +398,42 @@ export function SearchDialog({ open, onOpenChange, mode }: SearchDialogProps) {
                   >
                     <IconMessage className="size-4 text-muted-foreground shrink-0" />
                     <span className="text-sm truncate">{thread.title}</span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+
+          {/* Full-text message matches across all threads */}
+          {searchQuery && crossThreadSearch.matches.length > 0 && (
+            <div className="p-1 border-t border-border/60">
+              <div className="px-3 pt-1.5 mb-1 text-xs font-medium text-muted-foreground">
+                {t('common:messageMatches')}
+              </div>
+              {crossThreadSearch.matches.map((match, index) => {
+                const itemIndex =
+                  searchResults.withProject.length +
+                  searchResults.withoutProject.length +
+                  index
+                return (
+                  <button
+                    key={match.messageId}
+                    data-index={itemIndex}
+                    onClick={() => handleSelectMessage(match)}
+                    className={cn(
+                      'w-full flex items-start gap-2 px-3 py-2 rounded-md text-left hover:bg-secondary/60 transition-colors cursor-pointer',
+                      selectedIndex === itemIndex && 'bg-secondary/50'
+                    )}
+                  >
+                    <IconMessage className="size-4 text-muted-foreground shrink-0 mt-0.5" />
+                    <div className="flex flex-col min-w-0">
+                      <span className="text-sm truncate">
+                        {match.threadTitle}
+                      </span>
+                      <span className="text-xs text-muted-foreground line-clamp-2 whitespace-pre-wrap">
+                        {match.snippet}
+                      </span>
+                    </div>
                   </button>
                 )
               })}
