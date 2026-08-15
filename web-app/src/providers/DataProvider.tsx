@@ -14,6 +14,7 @@ import { useAssistant, defaultAssistant } from '@/hooks/useAssistant'
 import { useNavigate } from '@tanstack/react-router'
 import { route } from '@/constants/routes'
 import { useThreads } from '@/hooks/useThreads'
+import { ensureProjectsLoaded } from '@/hooks/useThreadManagement'
 import { useLocalApiServer } from '@/hooks/useLocalApiServer'
 import { useAppState } from '@/hooks/useAppState'
 import { useAppUpdater } from '@/hooks/useAppUpdater'
@@ -26,7 +27,13 @@ import {
   SERVER_START_WATCHDOG_MS,
   withTimeout,
 } from '@/lib/utils'
-import { AppEvent, events, ModelEvent } from '@janhq/core'
+import {
+  AppEvent,
+  events,
+  ModelEvent,
+  type Assistant as CoreAssistant,
+} from '@janhq/core'
+import { migrateGlobalSamplingToAssistants } from '@/lib/samplingParams'
 import { toast } from 'sonner'
 import { SystemEvent } from '@/types/events'
 import {
@@ -203,7 +210,19 @@ export function DataProvider() {
                 }
               : a
           )
-          setAssistants(migrated)
+          const sampling = migrateGlobalSamplingToAssistants(migrated)
+          sampling.changed.forEach((assistant) => {
+            serviceHub
+              .assistants()
+              .createAssistant(assistant as unknown as CoreAssistant)
+              .catch((error) => {
+                console.warn(
+                  'Failed to persist migrated assistant sampling:',
+                  error
+                )
+              })
+          })
+          setAssistants(sampling.assistants)
           initializeWithLastUsed()
         }
       })
@@ -238,6 +257,12 @@ export function DataProvider() {
         setThreads(threads)
       })
   }, [serviceHub, setThreads])
+
+  // Single owner of the initial projects read. Sidebar consumers used to each
+  // issue their own `getProjects()` on mount.
+  useEffect(() => {
+    void ensureProjectsLoaded()
+  }, [])
 
   // Sync remote providers with backend when providers change
   const providers = useModelProvider.getState().providers

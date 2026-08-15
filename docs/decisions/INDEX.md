@@ -9,12 +9,14 @@ decision is reversed, add a new one that says which record it supersedes.
 2. Add one line to the right section of this index.
 3. Do **not** paste the record body into `AGENTS.md`.
 
-176 records, 2026-05-19 → 2026-08-12.
+207 records, 2026-05-19 → 2026-08-14.
 
 ---
 
 ## Load-bearing — read before touching platform / provider / agent code
 
+- **2026-08-13** — [Mirror and sign upstream llama.cpp releases in atomic-chat-conf](2026-08-13-mirror-and-sign-upstream-llama-cpp-in-atomic-chat-conf.md)
+- **2026-08-13** — [Add Windows ROCm to the upstream backend matrix](2026-08-13-add-windows-rocm-to-the-upstream-backend-matrix.md)
 - **2026-07-28** — [Ship dual llama providers on Windows and Linux](2026-07-28-ship-dual-llama-providers-on-windows-and-linux.md)
 - **2026-05-19** — [Product identity is "Atomic Chat"; new code stops carrying Jan branding](2026-05-19-product-identity-is-atomic-chat-new-code-stops-carrying-jan.md)
 - **2026-05-22** — [Windows ships only `llamacpp-upstream`, sourced from `ggml-org/llama.cpp`](2026-05-22-windows-ships-only-llamacpp-upstream-sourced-from-ggml-org.md)
@@ -122,8 +124,16 @@ decision is reversed, add a new one that says which record it supersedes.
 - **2026-06-02** — [Surface MLX KV-cache quantization (TurboQuant / uniform) as a provider setting](2026-06-02-surface-mlx-kv-cache-quantization-turboquant-uniform-as-a.md)
 - **2026-05-19** — [Use `AtomicBot-ai/mlx-vlm` as the MLX backend](2026-05-19-use-atomicbot-ai-mlx-vlm-as-the-mlx-backend.md)
 
-## llama.cpp providers & backend selection (41)
+## llama.cpp providers & backend selection (49)
 
+- **2026-08-14** — [Keep the engine version out of the `latest/` sentinel trap](2026-08-14-keep-the-engine-version-out-of-the-latest-sentinel-trap.md)
+- **2026-08-13** — [Mirror and sign upstream llama.cpp releases in atomic-chat-conf](2026-08-13-mirror-and-sign-upstream-llama-cpp-in-atomic-chat-conf.md)
+- **2026-08-13** — [Add Windows ROCm to the upstream backend matrix](2026-08-13-add-windows-rocm-to-the-upstream-backend-matrix.md)
+- **2026-08-13** — [Apply the detected backend tier at startup for `llamacpp-upstream`](2026-08-13-apply-the-detected-backend-tier-at-startup-for-upstream.md)
+- **2026-08-13** — [Generate the upstream offline baseline from the manifest](2026-08-13-generate-the-upstream-offline-baseline-from-the-manifest.md)
+- **2026-08-12** — [Update upstream llama.cpp at runtime on macOS too](2026-08-12-update-upstream-llama-cpp-at-runtime-on-macos-too.md)
+- **2026-08-12** — [List every runnable build in the engine version dropdown](2026-08-12-list-every-runnable-build-in-the-engine-version-dropdown.md)
+- **2026-08-12** — [Follow the atomic-chat-conf manifest tag for upstream llama.cpp](2026-08-12-follow-the-atomic-chat-conf-manifest-tag-for-upstream-llama-cpp.md)
 - **2026-08-05** — [Resolve TurboQuant engines from a dynamic stable-release index instead of a pinned conf revision](2026-08-05-resolve-turboquant-engines-from-a-dynamic-stable-release-index.md)
 - **2026-08-05** — [Expose version-gated reasoning preservation and direct llama-server arguments](2026-08-05-expose-version-gated-reasoning-preservation-and-direct-llama-server-arguments.md)
 - **2026-07-31** — [Reconcile the TurboQuant release tag automatically on app update](2026-07-31-reconcile-turboquant-release-tag-automatically-on-app-update.md)
@@ -166,8 +176,16 @@ decision is reversed, add a new one that says which record it supersedes.
 - **2026-05-19** — [Use `AtomicBot-ai/atomic-llama-cpp-turboquant` as the LLM backend](2026-05-19-use-atomicbot-ai-atomic-llama-cpp-turboquant-as-the-llm-backend.md)
 - **2026-05-19** — [Ship upstream `ggml-org/llama.cpp` as a second macOS provider, no fork](2026-05-19-ship-upstream-ggml-org-llama-cpp-as-a-second-macos-provider-no.md)
 
-## Models, Hub & downloads (15)
+## Models, Hub & downloads (23)
 
+- **2026-08-14** — [Build the Hub "Installed on this device" list from the provider registry](2026-08-14-build-the-hub-installed-filter-from-the-provider-registry.md)
+- **2026-08-14** — [Recommend our own Gemma 4 E2B build in onboarding](2026-08-14-recommend-our-own-gemma-4-e2b-build-in-onboarding.md)
+- **2026-08-14** — [Open the Hub recommendations with a promoted head ahead of the family grouping](2026-08-14-open-the-hub-recommendations-with-a-promoted-head.md)
+- **2026-08-14** — [Restrict the local-model scan to text-generation models](2026-08-14-restrict-the-local-model-scan-to-text-generation-models.md)
+- **2026-08-12** — [Gate Hub fuzzy search by term length and drop the Jan name filter](2026-08-12-gate-hub-fuzzy-search-by-term-length-and-drop-the-jan-name-filter.md)
+- **2026-08-07** — [Take Recommended capability badges from the staff-picks manifest](2026-08-07-take-recommended-capability-badges-from-the-staff-picks-manifest.md)
+- **2026-08-07** — [Let onboarding time out into the chat and recommend two GGUF models](2026-08-07-let-onboarding-time-out-into-the-chat-and-recommend-two-gguf.md)
+- **2026-08-06** — [Serve Hub staff picks from a separate manifest and rebuild /hub as a split view](2026-08-06-serve-hub-staff-picks-from-a-separate-manifest-and-split-view.md)
 - **2026-08-03** — [Repair mis-named MLX shards in place on load](2026-08-03-repair-mis-named-mlx-shards-in-place-on-load.md)
 - **2026-08-03** — [Store MLX weight shards under their Hub filenames](2026-08-03-store-mlx-weight-shards-under-their-hub-filenames.md)
 - **2026-07-31** — [Store model catalog snapshots in IndexedDB](2026-07-31-store-model-catalog-snapshots-in-indexeddb.md)
@@ -213,15 +231,25 @@ decision is reversed, add a new one that says which record it supersedes.
 - **2026-05-22** — [Pin static WiX `upgradeCode` to legacy Jan UUID for in-place MSI upgrades](2026-05-22-pin-static-wix-upgradecode-to-legacy-jan-uuid-for-in-place-msi.md)
 - **2026-05-19** — [Product identity is "Atomic Chat"; new code stops carrying Jan branding](2026-05-19-product-identity-is-atomic-chat-new-code-stops-carrying-jan.md)
 
-## UI / UX (13)
+## UI / UX (26)
 
+- **2026-08-14** — [Show the streaming code while an HTML artifact generates](2026-08-14-show-the-streaming-code-while-an-html-artifact-generates.md)
+- **2026-08-14** — [Collapse the engine log behind a toggle in the model-load toast](2026-08-14-collapse-the-engine-log-behind-a-toggle-in-the-model-load-toast.md)
+- **2026-08-13** — [Move sampling back onto each assistant (per-assistant sampler, popover stays the only editor)](2026-08-13-move-sampling-back-onto-each-assistant.md)
+- **2026-08-13** — [Revert the Settings and Model Providers UI rework; keep runtime engine updates](2026-08-13-revert-the-settings-and-model-providers-ui-rework-keep-runtime.md)
+- **2026-08-12** — [Split Model Providers into Local/Cloud tabs and hide engine settings](2026-08-12-split-model-providers-into-local-and-cloud-tabs-and-hide-engine-settings.md)
+- **2026-08-12** — [Auto-start a model found on disk instead of showing the onboarding picker](2026-08-12-auto-start-a-model-found-on-disk-instead-of-showing-the-picker.md)
+- **2026-08-12** — [Render reasoning as its own block outside the activity block](2026-08-12-render-reasoning-as-its-own-block-outside-the-activity-block.md)
 - **2026-08-12** — [Keep the main thread responsive while the model generates](2026-08-12-keep-the-main-thread-responsive-while-model-generates.md)
 - **2026-08-12** — [Render code blocks in their own window frame and wrap long lines](2026-08-12-render-code-blocks-in-window-frames-and-wrap-long-lines.md)
 - **2026-08-12** — [Make per-tool cancel instant and hide cancel/retry on agent-run tools](2026-08-12-make-tool-cancels-instant-and-hide-actions-on-agent-tools.md)
+- **2026-08-11** — [Own the settings chrome in a layout route and highlight the clicked provider optimistically](2026-08-11-own-the-settings-chrome-in-a-layout-route.md)
+- **2026-08-11** — [Split local and cloud providers in Settings; `active` means the cloud provider was added](2026-08-11-split-local-and-cloud-providers-in-settings.md)
 - **2026-08-11** — [Expose thread scroll presets and message render modes as interface settings](2026-08-11-thread-scroll-presets-and-message-render-modes.md)
 - **2026-08-11** — [Render markdown live during token streaming via Streamdown streaming mode](2026-08-11-render-markdown-live-during-token-streaming.md)
 - **2026-08-11** — [JS spell-check fallback because wry/WebKitGTK exposes no spell-check API](2026-08-11-js-spell-check-fallback-for-webkitgtk-linux.md)
 - **2026-08-11** — [Debounce Shiki code-block highlighting while tokens stream](2026-08-11-debounce-code-block-highlighting-while-streaming.md)
+- **2026-08-07** — [Keep sidebar and model-picker interactions off the I/O path](2026-08-07-keep-sidebar-and-model-picker-interactions-off-the-io-path.md)
 - **2026-07-31** — [Disable the transparent Windows window to stop the softbuffer fatal panic](2026-07-31-disable-transparent-windows-window-to-stop-softbuffer-panic.md)
 - **2026-07-30** — [Reveal the Windows window after native setup](2026-07-30-reveal-windows-after-first-frontend-frame.md)
 - **2026-07-27** — [Replace advanced model settings with a focused context control](2026-07-27-replace-advanced-model-settings-with-a-focused-context-control.md)

@@ -28,10 +28,18 @@ const immutableRevision = z.string().regex(/^[0-9a-f]{40}$/)
 const upstreamManifestSchema = z.object({
   tag_name: z.string().regex(/^b\d+$/),
   updated_at: z.iso.datetime(),
+  /// Points at our signed mirror. Absent for a tag we have not mirrored, which
+  /// is what makes the app fall back to the ggml-org CDN.
+  download_base: z.url().startsWith('https://').optional(),
   assets: z
     .array(
       z.object({
         name: z.string().regex(/\.(zip|tar\.gz)$/),
+        sha256: z
+          .string()
+          .regex(/^[0-9a-f]{64}$/)
+          .optional(),
+        size: z.number().int().positive().optional(),
       })
     )
     .min(1),
@@ -59,6 +67,32 @@ const recommendationSchema = z.object({
       description_key: z.string().startsWith('hub:'),
     })
   ),
+})
+
+/**
+ * Deliberately separate from `recommendationSchema`: `recommended.json` is
+ * frozen for shipped clients, and staff picks must never be validated by
+ * relaxing that contract.
+ */
+const staffPicksSchema = z.object({
+  schema_version: z.literal(1),
+  updated_at: z.iso.datetime(),
+  picks: z
+    .array(
+      z.object({
+        model_name: z.string().regex(/^[^/]+\/[^/]+$/),
+        title: nonEmptyString.optional(),
+        summary: nonEmptyString.optional(),
+        description_key: z.string().startsWith('hub:').optional(),
+        icon: nonEmptyString.optional(),
+        format: z.enum(['gguf', 'mlx']).optional(),
+        categories: z.array(nonEmptyString).optional(),
+        platforms: z.array(z.enum(['macos', 'windows', 'linux'])).optional(),
+        order: z.number().optional(),
+        active: z.boolean().optional(),
+      })
+    )
+    .min(1),
 })
 
 const providerRegistrySchema = z.object({
@@ -165,6 +199,11 @@ const liveContracts = [
     recommendationSchema,
   ],
   [
+    'staff picks',
+    'https://raw.githubusercontent.com/AtomicBot-ai/atomic-chat-conf/main/models/staff-picks.json',
+    staffPicksSchema,
+  ],
+  [
     'provider registry',
     'https://raw.githubusercontent.com/AtomicBot-ai/atomic-chat-conf/main/providers/registry.json',
     providerRegistrySchema,
@@ -188,11 +227,48 @@ describe('pinned external registry contracts', () => {
     ['upstream manifest', 'upstream-manifest', upstreamManifestSchema],
     ['TurboQuant manifest', 'turboquant-manifest', turboquantManifestSchema],
     ['recommended models', 'recommended-models', recommendationSchema],
+    ['staff picks', 'staff-picks', staffPicksSchema],
     ['provider registry', 'provider-registry', providerRegistrySchema],
     ['model catalog', 'catalog', catalogSchema],
     ['model catalog index', 'catalog-index', catalogIndexSchema],
   ] as const)('validates the %s fixture', (_label, name, schema) => {
     expect(() => schema.parse(fixture(name))).not.toThrow()
+  })
+
+  /**
+   * Shipped clients read `recommended.json` and reject a manifest whose
+   * `schema_version` they do not know. Staff picks exist precisely so that the
+   * Hub can evolve without touching that file, so the separation is asserted
+   * rather than left to reviewer discipline.
+   */
+  it('keeps the onboarding manifest independent of staff picks', () => {
+    const recommended = recommendationSchema.parse(fixture('recommended-models'))
+    expect(recommended.schema_version).toBe(1)
+    for (const entry of recommended.recommendations) {
+      expect(Object.keys(entry).sort()).toEqual([
+        'description_key',
+        'model_name',
+      ])
+    }
+
+    const setupScreen = readFileSync(
+      resolve(repositoryRoot, 'web-app', 'src', 'containers', 'SetupScreen.tsx'),
+      'utf8'
+    )
+    expect(setupScreen).toContain('useResolvedRecommendedModels')
+    expect(setupScreen).not.toMatch(/staff-?picks/i)
+
+    const recommendedLoader = readFileSync(
+      resolve(
+        repositoryRoot,
+        'web-app',
+        'src',
+        'services',
+        'recommended-models-registry.ts'
+      ),
+      'utf8'
+    )
+    expect(recommendedLoader).not.toMatch(/staff-?picks/i)
   })
 
   it('pins every fixture source to an immutable revision', () => {
@@ -288,6 +364,71 @@ describe.runIf(process.env.ATOMIC_TEST_LIVE_REGISTRIES === '1')(
           const response = await fetch(url, { headers: { Range: 'bytes=0-0' } })
           await response.arrayBuffer()
           if (!response.ok) missing.push(`${backend.id} -> ${url}`)
+        }
+
+        expect(missing).toEqual([])
+      },
+      120_000
+    )
+  }
+)
+
+/**
+ * The upstream provider's offline baseline is generated from the live manifest
+ * (`make sync-upstream-baseline`), and the extension's own test asserts that the
+ * generated module and this fixture stay byte-identical — so comparing the
+ * fixture against the live manifest is comparing the shipped baseline against
+ * it. A stale baseline is not a user-visible outage (the live manifest wins
+ * whenever the network is up), which is why this is opt-in rather than part of
+ * `verify-fast`: it is a reminder to regenerate, not a release blocker.
+ */
+describe.runIf(process.env.ATOMIC_TEST_LIVE_REGISTRIES === '1')(
+  'live upstream baseline freshness',
+  () => {
+    it(
+      'ships an offline baseline that still matches the live manifest',
+      async () => {
+        const live = upstreamManifestSchema.parse(
+          await (
+            await fetch(
+              'https://raw.githubusercontent.com/AtomicBot-ai/atomic-chat-conf/main/backends/manifest.json'
+            )
+          ).json()
+        )
+        const baseline = upstreamManifestSchema.parse(
+          fixture('upstream-manifest')
+        )
+
+        expect(baseline.tag_name).toBe(live.tag_name)
+        expect(baseline.assets.map(({ name }) => name).sort()).toEqual(
+          live.assets.map(({ name }) => name).sort()
+        )
+      },
+      30_000
+    )
+
+    it(
+      'serves every mirrored archive it advertises',
+      async () => {
+        const live = upstreamManifestSchema.parse(
+          await (
+            await fetch(
+              'https://raw.githubusercontent.com/AtomicBot-ai/atomic-chat-conf/main/backends/manifest.json'
+            )
+          ).json()
+        )
+        // Nothing mirrored yet means nothing to check: the app is on the
+        // ggml-org fallback, which the resolver contract covers.
+        if (!live.download_base) return
+
+        const missing: string[] = []
+        for (const asset of live.assets) {
+          if (!asset.sha256) continue
+          const url = `${live.download_base}/${live.tag_name}/${asset.name}`
+          // Ranged GET for the same reason as the TurboQuant check above.
+          const response = await fetch(url, { headers: { Range: 'bytes=0-0' } })
+          await response.arrayBuffer()
+          if (!response.ok) missing.push(`${asset.name} -> ${url}`)
         }
 
         expect(missing).toEqual([])

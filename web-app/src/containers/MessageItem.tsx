@@ -11,7 +11,12 @@ import { RenderMarkdown } from './RenderMarkdown'
 import { useInterfaceSettings } from '@/hooks/useInterfaceSettings'
 import { cn } from '@/lib/utils'
 import { twMerge } from 'tailwind-merge'
-import { ReasoningContent } from '@/components/ai-elements/reasoning'
+import {
+  Reasoning,
+  ReasoningContent,
+  ReasoningTrigger,
+} from '@/components/ai-elements/reasoning'
+import { Shimmer } from '@/components/ai-elements/shimmer'
 import { Tool } from '@/components/ai-elements/tools/tool'
 import { CopyButton } from './CopyButton'
 import { useModelProvider } from '@/hooks/useModelProvider'
@@ -55,6 +60,7 @@ type TextTraceBlock = Extract<TraceBlock, { kind: 'text' }>
 type FileTraceBlock = Extract<TraceBlock, { kind: 'file' }>
 type AudioTraceBlock = Extract<TraceBlock, { kind: 'audio' }>
 type ActivityTraceBlock = Extract<TraceBlock, { kind: 'activity' }>
+type ReasoningTraceBlock = Extract<TraceBlock, { kind: 'reasoning' }>
 
 export type MessageItemProps = {
   message: UIMessage
@@ -180,6 +186,19 @@ export const MessageItem = memo(
     const handleDelete = useCallback(() => {
       onDelete?.(message.id)
     }, [onDelete, message.id])
+
+    const getThinkingMessage = useCallback(
+      (thinking: boolean, duration?: number) => {
+        if (thinking) {
+          return <Shimmer duration={1}>{t('activity.thinking')}</Shimmer>
+        }
+        if (!duration) {
+          return <p>{t('activity.reasoned')}</p>
+        }
+        return <p>{t('activity.thoughtFor', { count: duration })}</p>
+      },
+      [t]
+    )
 
     // Get image URLs from file parts for the edit dialog
     const imageUrls = useMemo(() => {
@@ -432,7 +451,10 @@ export const MessageItem = memo(
                       : block.text
                   }
                   components={agentMarkdownComponents}
-                  isStreaming={isStreaming && isLastBlock}
+                  // The thread page reports `submitted` for the whole request, so
+                  // `status === 'streaming'` alone would leave HTML artifacts
+                  // thinking they are complete and re-render the iframe per token.
+                  isStreaming={(isStreaming || isRequestActive) && isLastBlock}
                   messageId={message.id}
                   isAnimating={isAnimating}
                   enableHtmlPreview
@@ -502,6 +524,35 @@ export const MessageItem = memo(
       )
     }
 
+    const renderReasoningBlock = (block: ReasoningTraceBlock) => {
+      const streaming = isRequestActive && block.streaming
+
+      return (
+        <Reasoning
+          key={block.key}
+          className="mb-3"
+          isStreaming={streaming}
+          defaultOpen={streaming}
+        >
+          <ReasoningTrigger getThinkingMessage={getThinkingMessage} />
+          <div
+            ref={streaming ? reasoningContainerRef : null}
+            onScroll={streaming ? onReasoningScroll : undefined}
+            className={twMerge(
+              'relative w-full overflow-auto',
+              streaming
+                ? 'max-h-32 opacity-70 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden'
+                : 'h-auto opacity-100'
+            )}
+          >
+            {block.items.map((item) => (
+              <ReasoningContent key={item.key}>{item.text}</ReasoningContent>
+            ))}
+          </div>
+        </Reasoning>
+      )
+    }
+
     const renderActivityBlock = (block: ActivityTraceBlock) => {
       const agentStatus = block.agentSummary?.status
       const active =
@@ -526,7 +577,7 @@ export const MessageItem = memo(
           durationLabel={t('activity.workedFor', {
             count: durationSeconds,
           })}
-          hasDetails={toolCount > 0 || block.reasoning.length > 0}
+          hasDetails={toolCount > 0}
         >
           {toolCount > 0 && (
             <ActivityDetail
@@ -567,26 +618,6 @@ export const MessageItem = memo(
               ))}
             </ActivityDetail>
           )}
-          {block.reasoning.length > 0 && (
-            <ActivityDetail label={t('activity.reasoned')}>
-              <div
-                ref={active ? reasoningContainerRef : null}
-                onScroll={active ? onReasoningScroll : undefined}
-                className={twMerge(
-                  'relative w-full overflow-auto',
-                  active
-                    ? 'max-h-32 opacity-70 [overflow-anchor:none] [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden'
-                    : 'h-auto opacity-100'
-                )}
-              >
-                {block.reasoning.map((reasoning) => (
-                  <ReasoningContent key={reasoning.key}>
-                    {reasoning.text}
-                  </ReasoningContent>
-                ))}
-              </div>
-            </ActivityDetail>
-          )}
           {block.agentSummary?.loops.map((loop, index) => (
             <div
               key={`${block.key}-loop-${index}`}
@@ -624,6 +655,8 @@ export const MessageItem = memo(
               return renderFileBlock(block)
             case 'audio':
               return renderAudioBlock(block)
+            case 'reasoning':
+              return renderReasoningBlock(block)
             case 'activity':
               return renderActivityBlock(block)
             default:

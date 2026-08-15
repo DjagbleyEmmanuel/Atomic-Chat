@@ -95,6 +95,7 @@ function HtmlArtifactComponent({
   const [progress, setProgress] = useState(0)
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const previewWrapRef = useRef<HTMLDivElement>(null)
+  const codeScrollRef = useRef<HTMLDivElement>(null)
   const artifactIdRef = useRef<string>('')
   if (!artifactIdRef.current) artifactIdRef.current = createArtifactId()
   const versionRef = useRef(0)
@@ -102,13 +103,15 @@ function HtmlArtifactComponent({
   // Auto-scroll the HTML source ("Code" tab) to the bottom while it streams,
   // but let the user scroll up to read without being yanked back down. Mirrors
   // the stick-to-bottom behaviour used for the tool window / reasoning box.
-  const codeScrollRef = useRef<HTMLDivElement>(null)
   const { handleScroll: handleCodeScroll } = useAutoScrollToBottom(
     codeScrollRef,
     { enabled: streaming }
   )
 
+  // The iframe cannot show a half-written document, so surface the live code
+  // instead while it streams in, then hand the viewer back to the preview.
   const [codeIdle, setCodeIdle] = useState(false)
+  const wasGeneratingRef = useRef(false)
   useEffect(() => {
     setCodeIdle(false)
     const timer = setTimeout(() => setCodeIdle(true), 2000)
@@ -118,6 +121,47 @@ function HtmlArtifactComponent({
   // Don't trust `streaming` alone; it can stay stuck true after a re-mount.
   const docComplete = /<\/html>/i.test(code)
   const generating = streaming && !docComplete && !codeIdle
+
+  // Pin the code pane to the tail whenever fresh tokens arrive, unless the
+  // reader has scrolled away from the bottom (tracked by `followCodeRef`).
+  const followCodeRef = useRef(true)
+  const followCodeTail = useCallback(() => {
+    const scroller = codeScrollRef.current
+    if (!scroller || !followCodeRef.current) return
+    scroller.scrollTop = scroller.scrollHeight
+  }, [])
+
+  useEffect(() => {
+    if (!generating) return
+    const scroller = codeScrollRef.current
+    if (!scroller) return
+
+    followCodeRef.current = true
+    followCodeTail()
+
+    const onScroll = () => {
+      followCodeRef.current =
+        scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48
+    }
+    scroller.addEventListener('scroll', onScroll)
+    return () => scroller.removeEventListener('scroll', onScroll)
+  }, [generating, followCodeTail])
+
+  useEffect(() => {
+    if (generating) followCodeTail()
+  }, [code, generating, followCodeTail])
+
+  useEffect(() => {
+    if (generating) {
+      wasGeneratingRef.current = true
+      setTab('code')
+      return
+    }
+    if (wasGeneratingRef.current) {
+      wasGeneratingRef.current = false
+      setTab('preview')
+    }
+  }, [generating])
 
   // Web: blob preview is handled internally by the browser, so it's safe to
   // refresh on every debounced change.
@@ -368,6 +412,7 @@ function HtmlArtifactComponent({
 
       <div
         ref={previewWrapRef}
+        data-artifact-pane="preview"
         className={cn(
           'relative',
           fill && 'min-h-0 flex-1',
@@ -403,17 +448,27 @@ function HtmlArtifactComponent({
       </div>
 
       <div
+        data-artifact-pane="code"
         className={cn(
+          'flex-col',
           fill && 'min-h-0 flex-1',
-          tab === 'code' ? 'block' : 'hidden'
+          tab === 'code' ? 'flex' : 'hidden'
         )}
       >
+        {generating && (
+          <div className="flex shrink-0 items-center gap-3 border-border border-b bg-muted/40 px-3 py-1.5 text-muted-foreground text-xs">
+            <span className="truncate">{t('workspacePreview.generating')}</span>
+            <span className="ml-auto shrink-0 tabular-nums">
+              {progressPct}%
+            </span>
+          </div>
+        )}
         <div
           ref={codeScrollRef}
           onScroll={handleCodeScroll}
           className={cn(
             'overflow-y-auto overflow-x-hidden',
-            fill ? 'h-full' : 'max-h-[440px]'
+            fill ? 'min-h-0 flex-1' : 'max-h-[440px]'
           )}
         >
           <CodeBlock

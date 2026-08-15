@@ -245,7 +245,7 @@ export const MlxModelDownloadAction = memo(
             variant="outline"
             size="sm"
             onClick={handleDownloadMlxModel}
-            className={cn(isDownloading && 'hidden')}
+            className={cn('font-semibold', isDownloading && 'hidden')}
           >
             {t('hub:download')}
           </Button>

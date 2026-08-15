@@ -5,6 +5,7 @@ import { useModelLoad } from '@/hooks/useModelLoad'
 import { useModelProvider } from '@/hooks/useModelProvider'
 import { useThreads } from '@/hooks/useThreads'
 import { localStorageKey } from '@/constants/localStorage'
+import { showModelLoadErrorToast } from '@/containers/ModelLoadErrorToast'
 import i18n from '@/i18n/setup'
 import type { ServiceHub } from '@/services'
 import {
@@ -208,6 +209,21 @@ function autoStartKey(providerName: string, modelId: string): string {
   return `${providerName}::${modelId}`
 }
 
+// A user-initiated switch (dropdown pick / send) already drives the engines to
+// the requested target, and it changes the selection the moment it starts. The
+// ChatInput auto-start effect reacts to that same change, so without this marker
+// it re-probes every engine and enqueues a second switch for the identical
+// target — which, being enqueued later, supersedes the explicit one and
+// downgrades its error reporting to the silent auto-start path.
+let pendingExplicitSwitch: string | null = null
+
+export function isExplicitSwitchPending(
+  providerName: string,
+  modelId: string
+): boolean {
+  return pendingExplicitSwitch === autoStartKey(providerName, modelId)
+}
+
 function clearAutoStartFailure(providerName: string, modelId: string): void {
   autoStartFailures.delete(autoStartKey(providerName, modelId))
 }
@@ -235,6 +251,7 @@ export function shouldAttemptAutoStart(
   providerName: string,
   modelId: string
 ): boolean {
+  if (isExplicitSwitchPending(providerName, modelId)) return false
   const prev = autoStartFailures.get(autoStartKey(providerName, modelId))
   if (!prev) return true
   if (prev.terminal) return false
@@ -350,6 +367,12 @@ export async function switchToModel(params: {
   const mySeq = ++switchSeq
   const prior = activeSwitchPromise
 
+  const isExplicit = !params.isAutoStart
+  const explicitKey = autoStartKey(params.providerName, params.modelId)
+  if (isExplicit) {
+    pendingExplicitSwitch = explicitKey
+  }
+
   const run = async (): Promise<void> => {
     // Supersession: another switch was requested after this one while we were
     // waiting our turn. That later request is the user's real intent, so drop
@@ -405,6 +428,38 @@ export async function switchToModel(params: {
     if (activeSwitchPromise === chained) {
       activeSwitchPromise = null
     }
+    // A newer explicit switch owns the marker from here on.
+    if (isExplicit && pendingExplicitSwitch === explicitKey) {
+      pendingExplicitSwitch = null
+    }
+  }
+}
+
+// The engine needs a beat to settle before the proxy is pointed at it, but the
+// previous blind 500ms sleep charged the full budget to every single switch.
+// Wait the short floor, then return as soon as the engine reports the model.
+const ENGINE_SETTLE_FLOOR_MS = 100
+const ENGINE_SETTLE_BUDGET_MS = 500
+const ENGINE_SETTLE_POLL_MS = 50
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function settleAfterLocalStart(
+  serviceHub: ServiceHub,
+  providerName: string,
+  modelId: string
+): Promise<void> {
+  const deadline = Date.now() + ENGINE_SETTLE_BUDGET_MS
+  await sleep(ENGINE_SETTLE_FLOOR_MS)
+
+  for (;;) {
+    const active = await serviceHub
+      .models()
+      .getActiveModels(providerName)
+      .catch(() => [] as string[])
+    if (active?.includes(modelId)) return
+    if (Date.now() >= deadline) return
+    await sleep(ENGINE_SETTLE_POLL_MS)
   }
 }
 
@@ -521,7 +576,7 @@ async function doSwitchToModel(params: {
         model: modelConfig,
       })
       console.log('[switchToModel] Local model started:', modelId)
-      await new Promise((resolve) => setTimeout(resolve, 500))
+      await settleAfterLocalStart(serviceHub, providerName, modelId)
     } else {
       // 4b. Cloud branch — register the provider so the proxy can route
       //     requests for `modelId` to provider.base_url.
@@ -691,6 +746,49 @@ function toErrorObject(error: unknown): ErrorObject {
   return { message: String(error ?? 'Unknown error') }
 }
 
+/** Longest reason we keep inline before it counts as a log, not a sentence. */
+const MAX_SUMMARY_LENGTH = 200
+/** The tail holds the crash; anything earlier is startup noise. */
+const MAX_DETAILS_LENGTH = 20_000
+
+/** `formatLoadError` appends the engine error code as a ` [CODE]` suffix. */
+function stripErrorCodeSuffix(message: string): string {
+  return message.replace(/\s*\[[A-Z0-9_]+\]\s*$/, '')
+}
+
+function clampDetails(details: string): string {
+  if (details.length <= MAX_DETAILS_LENGTH) return details
+  return `…\n${details.slice(details.length - MAX_DETAILS_LENGTH)}`
+}
+
+/**
+ * The llama.cpp extensions hand us `"<one-line reason>\n<raw engine output>"`
+ * (see `formatLoadError`), which the toast used to print verbatim — a screenful
+ * of GGML backtrace hiding the sentence that mattered. Split it back apart so
+ * the toast can show the reason and hide the log behind a toggle.
+ */
+export function splitModelLoadError(err: ErrorObject): {
+  summary: string
+  details?: string
+} {
+  const raw = stripErrorCodeSuffix((err.message ?? '').trim()).trim()
+  const newlineAt = raw.indexOf('\n')
+  const head = (newlineAt === -1 ? raw : raw.slice(0, newlineAt)).trim()
+  const tail = newlineAt === -1 ? '' : raw.slice(newlineAt + 1).trim()
+  const details = err.details?.trim() || tail || undefined
+
+  if (head.length <= MAX_SUMMARY_LENGTH) {
+    return { summary: head, details: details && clampDetails(details) }
+  }
+
+  // One unbroken wall of text: keep a readable opening and demote the rest.
+  const cut = head.lastIndexOf(' ', MAX_SUMMARY_LENGTH)
+  return {
+    summary: `${head.slice(0, cut > 0 ? cut : MAX_SUMMARY_LENGTH).trim()}…`,
+    details: clampDetails(details ? `${head}\n\n${details}` : head),
+  }
+}
+
 function isOutOfMemoryError(err: ErrorObject): boolean {
   if (err.code && OOM_CODES.has(err.code)) return true
   const haystack = `${err.message ?? ''} ${err.details ?? ''}`.toLowerCase()
@@ -840,12 +938,13 @@ function reportModelLoadError(
     return
   }
 
-  toast.error(t('model-errors:modelLoadFailedTitle'), {
-    id: 'model-load-error',
+  const { summary, details } = splitModelLoadError(err)
+  showModelLoadErrorToast({
+    title: t('model-errors:modelLoadFailedTitle'),
     description: t('model-errors:modelLoadFailedDescription', {
-      message: err.message,
-    }),
+      message: summary,
+    }).trim(),
+    details,
     duration: 10000,
-    closeButton: true,
   })
 }

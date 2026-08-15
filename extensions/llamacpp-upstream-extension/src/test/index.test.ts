@@ -12,9 +12,11 @@ import {
   readGgufMetadata,
   removeOldBackendVersions,
   unloadLlamaModel,
+  verifyBackendBinary,
 } from '../../../../src-tauri/plugins/tauri-plugin-llamacpp-upstream/guest-js/index'
 import {
   getBackendDir,
+  getLocalInstalledBackends,
   isBackendInstalled,
   listSupportedBackends,
 } from '../backend'
@@ -33,12 +35,25 @@ vi.mock('@tauri-apps/plugin-log', () => ({
 }))
 
 // Mock backend functions
-vi.mock('../backend', () => ({
-  isBackendInstalled: vi.fn(),
-  getBackendExePath: vi.fn(),
-  listSupportedBackends: vi.fn(),
-  getBackendDir: vi.fn(),
-}))
+vi.mock('../backend', async () => {
+  // Pure helpers the tested logic reasons *with* rather than *about*: the
+  // family predicate the release-tag reconciliation depends on, and the option
+  // assembly `configureBackends` builds its dropdown from. Stubbing these would
+  // make the tests assert against a mock instead of the real rules.
+  const { isConcreteOfGpuFamily, friendlyBackendLabel, mergeBackendOptions } =
+    await vi.importActual<typeof import('../backend')>('../backend')
+
+  return {
+    isBackendInstalled: vi.fn(),
+    getBackendExePath: vi.fn(),
+    listSupportedBackends: vi.fn(),
+    getBackendDir: vi.fn(),
+    getLocalInstalledBackends: vi.fn(),
+    isConcreteOfGpuFamily,
+    friendlyBackendLabel,
+    mergeBackendOptions,
+  }
+})
 
 vi.mock('../hardware', () => ({
   getSystemInfo: vi.fn(),
@@ -64,6 +79,7 @@ vi.mock(
       readGgufMetadata: vi.fn(),
       removeOldBackendVersions: vi.fn(),
       unloadLlamaModel: vi.fn(),
+      verifyBackendBinary: vi.fn(),
     }
   }
 )
@@ -238,6 +254,71 @@ describe('llamacpp_extension', () => {
         backend: 'linux-vulkan-x64',
       })
       expect(listSupportedBackends).not.toHaveBeenCalled()
+    })
+
+    /// The Windows counterpart of the Linux case above: here ggml-org *does*
+    /// publish a HIP archive, so a ROCm-capable AMD card outranks Vulkan.
+    it('prefers ROCm over Vulkan on a ROCm-capable AMD Windows host', async () => {
+      vi.mocked(getSystemInfo).mockResolvedValue({
+        os_type: 'windows',
+        os_name: 'Windows',
+        total_memory: 32 * 1024,
+        cpu: { arch: 'x86_64', extensions: [] },
+        gpus: [{ ...discreteGpu, vendor: 'AMD', nvidia_info: undefined }],
+      } as any)
+      vi.mocked(getSupportedFeaturesFromRust).mockResolvedValue({
+        cuda11: false,
+        cuda12: false,
+        cuda13: false,
+        rocm: true,
+        vulkan: true,
+      } as any)
+      vi.mocked(listSupportedBackends).mockResolvedValue([
+        { version: 'b10405', backend: 'win-cpu-x64', order: 0 },
+        { version: 'b10405', backend: 'win-rocm-7.14-x64', order: 0 },
+        { version: 'b10405', backend: 'win-vulkan-x64', order: 0 },
+      ])
+      vi.spyOn(extension as any, 'tierEnumeratesDevices').mockResolvedValue(
+        'works'
+      )
+
+      await expect(extension['detectIdealBackendType']()).resolves.toEqual({
+        kind: 'gpu',
+        backend: 'win-rocm-7.14-x64',
+      })
+    })
+
+    /// An AMD card the generated PCI table does not cover: the Rust gate
+    /// reports `rocm: false` and the host must land on Vulkan, not on a HIP
+    /// build compiled for a different gfx target.
+    it('falls back to Vulkan when the AMD card is outside the ROCm table', async () => {
+      vi.mocked(getSystemInfo).mockResolvedValue({
+        os_type: 'windows',
+        os_name: 'Windows',
+        total_memory: 32 * 1024,
+        cpu: { arch: 'x86_64', extensions: [] },
+        gpus: [{ ...discreteGpu, vendor: 'AMD', nvidia_info: undefined }],
+      } as any)
+      vi.mocked(getSupportedFeaturesFromRust).mockResolvedValue({
+        cuda11: false,
+        cuda12: false,
+        cuda13: false,
+        rocm: false,
+        vulkan: true,
+      } as any)
+      vi.mocked(listSupportedBackends).mockResolvedValue([
+        { version: 'b10405', backend: 'win-cpu-x64', order: 0 },
+        { version: 'b10405', backend: 'win-rocm-7.14-x64', order: 0 },
+        { version: 'b10405', backend: 'win-vulkan-x64', order: 0 },
+      ])
+      vi.spyOn(extension as any, 'tierEnumeratesDevices').mockResolvedValue(
+        'works'
+      )
+
+      await expect(extension['detectIdealBackendType']()).resolves.toEqual({
+        kind: 'gpu',
+        backend: 'win-vulkan-x64',
+      })
     })
 
     it('keeps an integrated-only Vulkan host on CPU', async () => {
@@ -1275,6 +1356,75 @@ describe('llamacpp_extension', () => {
     })
   })
 
+  describe('configureBackends', () => {
+    // Mirrors `settings.json`: `version_backend` ships with an empty options
+    // list, so the list this method assembles is the only thing standing
+    // between the stored value and core's `options[0]` fallback.
+    const settingsSchema = [
+      {
+        key: 'version_backend',
+        title: 'Version & Backend',
+        controllerType: 'dropdown',
+        controllerProps: { value: 'none', options: [], recommended: '' },
+      },
+    ]
+
+    // The guest-js bridge is mocked with `importActual`, so the release lookup
+    // and the migration probe reach the real `@tauri-apps/api/core` and have to
+    // be stubbed at the Tauri bridge.
+    afterEach(() => {
+      delete (window as any).__TAURI_INTERNALS__
+    })
+
+    it('offers the saved release even when neither the manifest nor the disk has it', async () => {
+      ;(window as any).__TAURI_INTERNALS__ = {
+        invoke: vi.fn().mockResolvedValue(null),
+      }
+      vi.stubGlobal('IS_MAC', true)
+      vi.stubGlobal('IS_WINDOWS', false)
+      vi.stubGlobal('IS_LINUX', false)
+      vi.stubGlobal('SETTINGS', settingsSchema)
+
+      const saved = 'b10344/macos-arm64'
+      extension['config'] = { version_backend: saved } as any
+      extension['tryInstallBundledBackend'] = vi.fn().mockResolvedValue(null)
+      // The manifest advertises the newest tag only, and the saved build's
+      // directory is gone — pruned by the update that installed b10405.
+      vi.mocked(listSupportedBackends).mockResolvedValue([
+        { version: 'b10405', backend: 'macos-arm64' },
+      ] as any)
+      vi.mocked(getLocalInstalledBackends).mockResolvedValue([])
+      vi.mocked(isBackendInstalled).mockResolvedValue(false)
+      vi.mocked(mapOldBackendToNew).mockImplementation(async (b: string) => b)
+      extension['determineBestBackend'] = vi
+        .fn()
+        .mockResolvedValue('b10405/macos-arm64')
+      extension['getStoredBackendType'] = vi.fn().mockReturnValue('macos-arm64')
+      extension['setStoredBackendType'] = vi.fn()
+      extension['getSetting'] = vi.fn().mockResolvedValue(saved)
+      extension['getSettings'] = vi.fn().mockResolvedValue([])
+      extension['updateSettings'] = vi.fn().mockResolvedValue(undefined)
+      const registerSettings = vi.fn()
+      extension['registerSettings'] = registerSettings
+
+      await extension.configureBackends()
+
+      const registered = (
+        registerSettings.mock.calls.at(-1)?.[0] as any[]
+      )?.find((s) => s.key === 'version_backend')
+      const offered = registered.controllerProps.options.map(
+        (o: any) => o.value
+      )
+
+      // Dropping the saved value from the list hands it to core's fallback,
+      // which replaces it with `options[0]` — the `latest/` sentinel that
+      // `reconcileBackendReleaseTag` cannot act on, leaving the provider with
+      // no version check at all.
+      expect(offered).toContain(saved)
+      expect(offered).toContain('latest/macos-arm64')
+    })
+  })
+
   describe('backend replacement', () => {
     const RECOMMENDED = 'b10205/win-cuda-13.3-x64'
 
@@ -1327,44 +1477,178 @@ describe('llamacpp_extension', () => {
       delete (window as any).dispatchEvent
     })
 
-    describe('enforcePinnedBackendVersion', () => {
-      it('moves the selected backend type to the validated release', async () => {
+    describe('reconcileBackendReleaseTag', () => {
+      beforeEach(() => {
+        vi.mocked(mapOldBackendToNew).mockImplementation(async (b: string) => b)
+      })
+
+      it('moves the selected backend type onto the newest manifest release', async () => {
         extension['config'] = {
           version_backend: 'b9937/win-cuda-13.3-x64',
         } as any
+        extension.checkBackendForUpdates = vi.fn().mockResolvedValue({
+          updateNeeded: true,
+          newVersion: 'b10344',
+          targetBackend: 'b10344/win-cuda-13.3-x64',
+        })
         extension.downloadRecommendedBackend = vi
           .fn()
           .mockResolvedValue(undefined)
 
-        await extension['enforcePinnedBackendVersion']()
+        await extension['reconcileBackendReleaseTag']()
 
         expect(extension.downloadRecommendedBackend).toHaveBeenCalledWith(
-          'b10205/win-cuda-13.3-x64'
+          'b10344/win-cuda-13.3-x64'
         )
       })
 
-      it('leaves the validated release alone', async () => {
+      it('leaves the newest release alone', async () => {
         extension['config'] = { version_backend: RECOMMENDED } as any
+        extension.checkBackendForUpdates = vi
+          .fn()
+          .mockResolvedValue({ updateNeeded: false, newVersion: '0' })
         extension.downloadRecommendedBackend = vi
           .fn()
           .mockResolvedValue(undefined)
 
-        await extension['enforcePinnedBackendVersion']()
+        await extension['reconcileBackendReleaseTag']()
 
         expect(extension.downloadRecommendedBackend).not.toHaveBeenCalled()
       })
 
-      it('keeps the working backend when the pinned download fails', async () => {
+      it('refuses to cross backend families', async () => {
+        extension['config'] = {
+          version_backend: 'b9937/win-vulkan-x64',
+        } as any
+        extension.checkBackendForUpdates = vi.fn().mockResolvedValue({
+          updateNeeded: true,
+          newVersion: 'b10344',
+          targetBackend: 'b10344/win-cpu-x64',
+        })
+        extension.downloadRecommendedBackend = vi
+          .fn()
+          .mockResolvedValue(undefined)
+
+        await extension['reconcileBackendReleaseTag']()
+
+        expect(extension.downloadRecommendedBackend).not.toHaveBeenCalled()
+      })
+
+      it('bumps the tag on macOS, where the family never changes', async () => {
+        extension['config'] = {
+          version_backend: 'b10205/macos-arm64',
+        } as any
+        extension.checkBackendForUpdates = vi.fn().mockResolvedValue({
+          updateNeeded: true,
+          newVersion: 'b10344',
+          targetBackend: 'b10344/macos-arm64',
+        })
+        extension.downloadRecommendedBackend = vi
+          .fn()
+          .mockResolvedValue(undefined)
+
+        await extension['reconcileBackendReleaseTag']()
+
+        expect(extension.downloadRecommendedBackend).toHaveBeenCalledWith(
+          'b10344/macos-arm64'
+        )
+      })
+
+      it('resolves a sentinel parked in the config instead of skipping it', async () => {
+        // A `latest/<variant>` value here is not a fresh install: it is what
+        // core's `registerSettings()` leaves behind when the stored concrete
+        // tag falls out of the options list. Skipping it used to switch off
+        // automatic engine updates for the rest of the installation's life.
+        extension['config'] = {
+          version_backend: 'latest/macos-arm64',
+        } as any
+        extension.checkBackendForUpdates = vi.fn()
+        extension.downloadRecommendedBackend = vi
+          .fn()
+          .mockResolvedValue(undefined)
+
+        await extension['reconcileBackendReleaseTag']()
+
+        expect(extension.downloadRecommendedBackend).toHaveBeenCalledWith(
+          'latest/macos-arm64'
+        )
+        expect(extension.checkBackendForUpdates).not.toHaveBeenCalled()
+      })
+
+      it('keeps the working backend when the download fails', async () => {
         const current = 'b9937/win-vulkan-x64'
         extension['config'] = { version_backend: current } as any
+        extension.checkBackendForUpdates = vi.fn().mockResolvedValue({
+          updateNeeded: true,
+          newVersion: 'b10344',
+          targetBackend: 'b10344/win-vulkan-x64',
+        })
         extension.downloadRecommendedBackend = vi
           .fn()
           .mockRejectedValue(new Error('asset unavailable'))
 
         await expect(
-          extension['enforcePinnedBackendVersion']()
+          extension['reconcileBackendReleaseTag']()
         ).resolves.toBeUndefined()
         expect(extension['config'].version_backend).toBe(current)
+      })
+    })
+
+    describe('checkForEngineUpdate', () => {
+      beforeEach(() => {
+        vi.mocked(mapOldBackendToNew).mockImplementation(async (b: string) => b)
+        extension['configureBackendsPromise'] = null
+      })
+
+      it('reports the newest release of the backend type in use', async () => {
+        extension['config'] = {
+          version_backend: 'b10205/win-cuda-13.3-x64',
+        } as any
+        extension.checkBackendForUpdates = vi.fn().mockResolvedValue({
+          updateNeeded: true,
+          newVersion: 'b10344',
+          targetBackend: 'b10344/win-cuda-13.3-x64',
+        })
+
+        await expect(extension.checkForEngineUpdate()).resolves.toEqual({
+          updateAvailable: true,
+          targetBackend: 'b10344/win-cuda-13.3-x64',
+        })
+        // The session manifest cache is exactly what hides a release published
+        // while the app was open, so the check must bypass it.
+        expect(extension.checkBackendForUpdates).toHaveBeenCalledWith({
+          force: true,
+        })
+      })
+
+      it('reports no update when the catalog has nothing newer', async () => {
+        extension['config'] = {
+          version_backend: 'b10344/win-cpu-x64',
+        } as any
+        extension.checkBackendForUpdates = vi
+          .fn()
+          .mockResolvedValue({ updateNeeded: false, newVersion: '0' })
+
+        await expect(extension.checkForEngineUpdate()).resolves.toEqual({
+          updateAvailable: false,
+          targetBackend: null,
+        })
+      })
+
+      it('never crosses backend families', async () => {
+        extension['config'] = {
+          version_backend: 'b10205/win-vulkan-x64',
+        } as any
+        extension.checkBackendForUpdates = vi.fn().mockResolvedValue({
+          updateNeeded: true,
+          newVersion: 'b10344',
+          targetBackend: 'b10344/win-cuda-13.3-x64',
+        })
+
+        await expect(extension.checkForEngineUpdate()).resolves.toEqual({
+          updateAvailable: false,
+          targetBackend: null,
+        })
       })
     })
 
@@ -1408,6 +1692,64 @@ describe('llamacpp_extension', () => {
         expect(extension['ensureBackendOption']).toHaveBeenCalledWith(
           RECOMMENDED
         )
+      })
+    })
+
+    describe('launch gate for a downloaded macOS build', () => {
+      const TARGET_DIR = '/path/to/jan/llamacpp-upstream/backends/b10344/macos-arm64'
+      const CURRENT = 'b10205/macos-arm64'
+
+      const gate = () =>
+        extension['gateDownloadedBackendOnLaunch'](
+          'b10344',
+          'macos-arm64',
+          TARGET_DIR
+        )
+
+      beforeEach(() => {
+        vi.stubGlobal('IS_MAC', true)
+        extension['config'] = { version_backend: CURRENT } as any
+        vi.mocked(fs.rm).mockResolvedValue(undefined)
+      })
+
+      afterEach(() => {
+        vi.stubGlobal('IS_MAC', false)
+      })
+
+      it('accepts a build that reports the tag it was downloaded for', async () => {
+        vi.mocked(verifyBackendBinary).mockResolvedValue(true)
+
+        await expect(gate()).resolves.toBeUndefined()
+        expect(fs.rm).not.toHaveBeenCalled()
+      })
+
+      it('refuses a build that comes up as a different one, and keeps the current selection', async () => {
+        vi.mocked(verifyBackendBinary).mockResolvedValue(false)
+
+        await expect(gate()).rejects.toThrow(/failed its launch check/)
+        // Left on disk it would be adopted unchecked by the next attempt,
+        // which short-circuits on an already-installed target.
+        expect(fs.rm).toHaveBeenCalledWith(TARGET_DIR)
+        expect(extension['config'].version_backend).toBe(CURRENT)
+      })
+
+      it('refuses a build that cannot be executed at all', async () => {
+        vi.mocked(verifyBackendBinary).mockRejectedValue(
+          new Error('No llama-server binary under ' + TARGET_DIR)
+        )
+
+        await expect(gate()).rejects.toThrow(/No llama-server binary/)
+        expect(fs.rm).toHaveBeenCalledWith(TARGET_DIR)
+        expect(extension['config'].version_backend).toBe(CURRENT)
+      })
+
+      it('does not gate elsewhere, where a CUDA build only starts once cudart is merged', async () => {
+        vi.stubGlobal('IS_MAC', false)
+        vi.mocked(verifyBackendBinary).mockResolvedValue(false)
+
+        await expect(gate()).resolves.toBeUndefined()
+        expect(verifyBackendBinary).not.toHaveBeenCalled()
+        expect(fs.rm).not.toHaveBeenCalled()
       })
     })
 
