@@ -60,6 +60,45 @@ To run again, just `yarn dev` (no `make dev`), as long as you have not changed d
 
 ---
 
+## Build prerequisites (native core)
+
+Since the core migration the runtime is a **native binary, not a repo artifact**.
+`src-tauri/resources/bin/` is gitignored, so a fresh clone has no core and no
+sidecars. Fetch them before building or running:
+
+```bash
+yarn download:core   # atomic-chat-core + atomic-chat-app-core, version pinned in package.json → atomicCore
+yarn download:bin    # bun, uv, cloudflared, sqlite-vec
+```
+
+`yarn dev` (→ `dev:tauri`) runs `download:core` for you, and so does
+`make dev` / `make build` and the `build:tauri:*` scripts. What does **not** run
+either step is a bare `yarn tauri build` — so after a fresh clone, run the two
+commands above (or `make dev`) once first. Note that `download:bin` is only
+implied by the `build:tauri:*` targets; a plain `yarn dev` fetches the core but
+still expects the sidecars to be present.
+
+Skipping them is not a build warning; it is a runtime failure, because the app
+spawns the core from its resource directory:
+
+```
+This build has no Atomic Chat core to start.
+expected <resource_dir>/resources/bin/atomic-chat-app-core
+```
+
+Anything that talks to the core fails the same way — including the engine
+update, whose backend download is handed to the core rather than fetched by the
+frontend. If "a new engine version is available" is reported but applying it
+errors, check the core is present before suspecting the updater.
+
+Verify a download landed (both binaries are ~109 MB):
+
+```bash
+src-tauri/resources/bin/atomic-chat-app-core --version   # must match atomicCore.version
+```
+
+---
+
 ## What to edit where
 
 | Task | Where the code is |
@@ -75,6 +114,8 @@ After changes in **web-app** no restart is needed — hot reload kicks in. After
 ## If something goes wrong
 
 - **"The service is no longer running"** — usually means the process has already exited (the window was closed or Ctrl+C was pressed). Just run `yarn dev` again.
+- **"This build has no Atomic Chat core to start"** — the native core was never downloaded into `src-tauri/resources/bin/`. See [Build prerequisites](#build-prerequisites-native-core). A 0-byte file there is a `make` placeholder, not a real download: delete it and re-run `yarn download:core`.
+- **Engine update fails right after "new version available"** — same cause; the core is what performs the download.
 - **The window does not open / hangs** — make sure port 1420 is free (`lsof -i :1420`), kill old processes and run `yarn dev` again.
 - **After switching branches or pulling** — if needed, run `make dev` once (full install and build), then go back to just `yarn dev`.
 

@@ -18,10 +18,9 @@ lives behind a link — follow the link when the task needs it.
 
 Cross-platform desktop/mobile app (Tauri + React) that runs LLMs locally and
 exposes an OpenAI-compatible API at `http://localhost:1337/v1`. Three inference
-backends sit behind that one facade; callers never need to know which is serving.
-
-Targets: macOS (Universal), Windows x64, Linux (AppImage), iOS, Android.
-Apple Silicon is first-class.
+backends sit behind that one facade; callers never need to know which is
+serving. Targets: macOS (Universal), Windows x64, Linux (AppImage), iOS,
+Android. Apple Silicon is first-class.
 
 **Product name is Atomic Chat.** Hard fork of [Jan](https://github.com/janhq/jan);
 much of the tree still carries `jan*` / `@janhq/*` names — see §4.
@@ -142,22 +141,26 @@ make test     # full suite: lint, downloads, generated icons, sidecars, CLI, tes
 yarn lint     # eslint in @janhq/web-app
 ```
 
-Mobile builds use `--features mobile`. Per-OS runtime data paths — including
-the three legacy Windows APPDATA folders — are documented in `DEVELOP.md`.
-Do not invent new data paths.
+The native core and its sidecars are **build-time downloads, never committed**
+(`src-tauri/resources/bin/` is gitignored). `make dev` / `make build` fetch them
+but a bare `yarn tauri build` does not: after a fresh clone run `yarn
+download:core` + `yarn download:bin` first, or the app fails at *runtime* with
+"no Atomic Chat core to start", not at build time (DEVELOP.md § *Build
+prerequisites*). Mobile builds use `--features mobile`. Per-OS runtime data
+paths, incl. the three legacy Windows APPDATA folders, are in `DEVELOP.md`; do
+not invent new ones.
 
 ---
 
 ## 6. Rules
 
-These are additional to the user's global engineering rules and override
-defaults on conflict.
+These extend the user's global engineering rules and override them on conflict.
 
 1. **Do only what was asked.** No opportunistic refactors, no "while I'm here"
    cleanups. Tempting improvement → propose it, don't ship it.
 2. **Don't fabricate backend behaviour.** Unsure about an `mlx-vlm` or
    `atomic-llama-cpp-turboquant` flag? Read that repo's `README.md` / `MTP.md` /
-   `NEXTN.md` / `docs/speculative.md`. Both are checked out locally.
+   `NEXTN.md` / `docs/speculative.md`; both are checked out locally.
 3. **OpenAI-compat is a contract.** `http://localhost:1337/v1` must stay
    OpenAI-compatible — OpenCode, Codex, Hermes and others depend on it. Adding
    non-standard fields is fine; breaking standard ones is not.
@@ -165,18 +168,17 @@ defaults on conflict.
    For focused iteration, TS/JS uses lint + tests in the affected workspace;
    Rust uses `cargo check` and `cargo clippy` in `src-tauri/`.
 5. **Never commit unless explicitly asked.**
-6. **No new top-level folders, config files or runtime dependencies** without
-   the user's explicit "ok" (name + reason first).
+6. **No new top-level folders, config files or runtime dependencies** without the
+   user's explicit "ok" (name + reason first).
 7. **No destructive commands** — `rm -rf`, `git push --force`, `cargo clean
 --release`, deleting user data folders — without explicit confirmation.
 8. **Record non-trivial decisions** as a new file in `docs/decisions/`
-   (architecture, backend selection, perf trade-off, security default, schema
-   or migration). Same session, before you finish. See §7.
-9. **Everything written in the repo is English** — code, comments, commit
-   messages, docs, ADRs, plans, scripts and their output. Only two exceptions:
-   UI translations under `web-app/src/locales/` (and each language's own name
-   in the language switcher), and non-English test data that a test exists to
-   exercise.
+   (architecture, backend selection, perf trade-off, security default, schema or
+   migration). Same session, before you finish. See §7.
+9. **Everything written in the repo is English** — code, comments, commits, docs,
+   ADRs, plans, scripts and their output. Exceptions: UI translations under
+   `web-app/src/locales/` (and each language's own name in the switcher), and
+   non-English test data a test exists to exercise.
 
 ---
 
@@ -191,8 +193,7 @@ on every task. Hard limits:
   `docs/decisions/` (template: `_TEMPLATE.md`), indexed one line per record in
   `docs/decisions/INDEX.md`. Never inline a record here.
 - **At most 10 ADRs may be referenced from this file**, and only ones that
-  change how you write code today — the standing platform/provider policies.
-  Everything else is reachable via the index.
+  change how you write code today. Everything else is reachable via the index.
 - **No duplication.** If a fact already lives in `README.md`, `DEVELOP.md`,
   `CONTRIBUTING.md` or an ADR, link to it instead of restating it. When they
   disagree, the linked doc wins and this file gets fixed.
