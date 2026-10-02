@@ -28,6 +28,8 @@
   "unstar": "Batal Bintangi",
   "deleteAll": "Hapus Semua",
   "star": "Bintangi",
+  "openInNewWindow": "Buka di jendela baru",
+  "openInNewWindowFailed": "Tidak dapat membuka obrolan ini di jendela baru",
   "rename": "Ubah Nama",
   "delete": "Hapus",
   "copied": "Tersalin!",
@@ -242,9 +244,6 @@
     },
     "deleteThread": {
       "description": "Apakah Anda yakin ingin menghapus thread ini? Tindakan ini tidak dapat dibatalkan."
-    },
-    "editMessage": {
-      "title": "Edit Pesan"
     },
     "messageMetadata": {
       "title": "Metadata Pesan"

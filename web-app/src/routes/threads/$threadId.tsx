@@ -49,7 +49,28 @@ import {
   deriveThreadTitle,
   threadMessageText,
 } from '@/lib/thread-title'
-import { ttftBegin, ttftMark, ttftPreBegin } from '@/lib/ttft-timing'
+import { rebuildEditedContent, rebuildEditedParts } from '@/lib/message-edit'
+import {
+  ttftBegin,
+  ttftMark,
+  ttftPreBegin,
+  ttftSnapshot,
+} from '@/lib/ttft-timing'
+import {
+  agentOutcome,
+  agentResponseShape,
+  attachmentTelemetry,
+  beginChatTurn,
+  captureChatRequest,
+  captureChatResponse,
+  contextTelemetry,
+  currentChatTurn,
+  responseShapeFromMessage,
+  type AttachmentTelemetry,
+  type ChatOutcome,
+  type ChatTurnSource,
+} from '@/lib/chat-telemetry'
+import { classifyChatFailure, lengthBucket } from '@/lib/telemetry'
 import {
   ThreadMessage,
   MessageStatus,
@@ -105,7 +126,6 @@ import { Shimmer } from '@/components/ai-elements/shimmer'
 import { useAgentMode } from '@/hooks/useAgentMode'
 import { AgentWorkspaceLayout } from '@/containers/AgentWorkspaceLayout'
 import { useArtifactStore } from '@/stores/artifact-store'
-import posthog from 'posthog-js'
 import { useAgentRun } from '@/hooks/useAgentRun'
 import { readAgentSkillName } from '@/lib/agent-skill-selection'
 import {
@@ -326,6 +346,84 @@ function ThreadDetail() {
   )
   const autoTitleRef = useRef(false)
 
+  // What the in-flight turn was started by, and what was attached to it, so
+  // `chat_response_received` can be attributed back to the send that caused it.
+  // Set on every send path; the response arrives long after those locals are
+  // gone, hence a ref rather than threading it through the AI SDK.
+  const turnContextRef = useRef<{
+    source: ChatTurnSource
+    attachments: AttachmentTelemetry
+  }>({ source: 'chat', attachments: attachmentTelemetry([]) })
+
+  /**
+   * A retry reuses the previous turn's prompt and attachments, so only the
+   * source changes. Regenerate and edit previously emitted nothing at all,
+   * which left the send count — the funnel's denominator — short.
+   */
+  const captureRetryRequest = useCallback(
+    (source: 'regenerate' | 'edit') => {
+      turnContextRef.current = { ...turnContextRef.current, source }
+      captureChatRequest({
+        ...turnContextRef.current.attachments,
+        turn_id: beginChatTurn(threadId),
+        thread_id: threadId,
+        source,
+        model_id: useModelProvider.getState().selectedModel?.id,
+        provider: useModelProvider.getState().selectedProvider,
+        turn_index: chatMessagesRef.current.length,
+      })
+    },
+    [threadId]
+  )
+
+  /**
+   * Emit the single terminal event for a chat turn. Deduped inside
+   * `captureChatResponse` (onFinish fires more than once per message and can
+   * race the error path), so callers may fire optimistically.
+   */
+  const captureTurnOutcome = useCallback(
+    (
+      outcome: ChatOutcome,
+      message?: Parameters<typeof responseShapeFromMessage>[0],
+      error?: unknown
+    ) => {
+      const shape = responseShapeFromMessage(
+        message,
+        useAppState.getState().ragToolNames,
+        useAppState.getState().mcpToolNames
+      )
+      const meta = (message?.metadata ?? {}) as Record<string, unknown>
+      const ctxLen =
+        (useModelProvider.getState().selectedModel?.settings?.ctx_len
+          ?.controller_props?.value as number) ?? null
+      const { source, attachments } = turnContextRef.current
+
+      captureChatResponse({
+        ...shape,
+        ...attachments,
+        ...contextTelemetry(shape.tokens_total as number | null, ctxLen),
+        ...ttftSnapshot(),
+        turn_id: currentChatTurn(threadId),
+        thread_id: threadId,
+        source,
+        outcome,
+        error,
+        model_id:
+          (meta.modelId as string | undefined) ??
+          useModelProvider.getState().selectedModel?.id ??
+          null,
+        provider:
+          (meta.providerId as string | undefined) ??
+          useModelProvider.getState().selectedProvider ??
+          null,
+        turn_index: chatMessagesRef.current.length,
+        ctx_overflow: outcome.startsWith('truncated'),
+        ctx_auto_increased: outcome === 'truncated_continued',
+      })
+    },
+    [threadId]
+  )
+
   // Use the AI SDK chat hook
   const {
     messages: chatMessages,
@@ -342,13 +440,30 @@ function ThreadDetail() {
     sessionId: threadId,
     sessionTitle: thread?.title,
     systemMessage,
-    experimental_throttle: 50,
+    experimental_throttle: 16,
+    // The AI SDK's own error hook was never registered — failures only ever
+    // surfaced through the reactive `error` value, so a failed turn produced no
+    // telemetry at all. A user-initiated stop can surface here as an abort
+    // error and race `onFinish`; whichever lands first wins the dedup, so it
+    // must not report a cancellation as a failure.
+    onError: (err) => {
+      captureTurnOutcome(
+        classifyChatFailure(err) === 'aborted' ? 'aborted' : 'error',
+        undefined,
+        err
+      )
+    },
     onFinish: ({ message, isAbort }) => {
       const msgMeta = message.metadata as Record<string, unknown> | undefined
       const finishReason = msgMeta?.finishReason as string | undefined
 
       if (isAbort) {
         setIsChatRequestActive(false)
+        // Stop during an auto-continue never reaches the non-abort clear
+        // below, and a stale placeholder would flip the indicator row to
+        // "Growing the Mind..." on every later send in this thread.
+        setPendingContinueMessage(null)
+        captureTurnOutcome('aborted', message)
       }
 
       // Context limit hit: send partial content as prefill so the model continues
@@ -358,8 +473,7 @@ function ThreadDetail() {
         let willContinue = false
         const selectedModelState = useModelProvider.getState().selectedModel
         const usage = msgMeta?.usage as
-          | { inputTokens?: number; outputTokens?: number }
-          | undefined
+          { inputTokens?: number; outputTokens?: number } | undefined
         const totalTokens =
           (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0)
         const ctxLen =
@@ -398,6 +512,19 @@ function ThreadDetail() {
         if (!willContinue) {
           setIsChatRequestActive(false)
         }
+        // A continuation is a second model call, so this event closes the
+        // first one; `captureChatResponse` releases the turn id and the
+        // continuation's own finish gets a fresh one. `finishReason: 'length'`
+        // without a context hit is just max_output_tokens — an ordinary
+        // completion, not a truncation.
+        captureTurnOutcome(
+          willContinue
+            ? 'truncated_continued'
+            : isContextLimit
+              ? 'truncated_stopped'
+              : 'success',
+          message
+        )
         return
       }
 
@@ -405,6 +532,9 @@ function ThreadDetail() {
 
       if (!isAbort && sessionData.tools.length === 0) {
         setIsChatRequestActive(false)
+        // Terminal only when no tool calls are queued: with tools, onFinish
+        // fires once per step and the turn continues after they resolve.
+        captureTurnOutcome('success', message)
       }
 
       // Persist assistant message to backend (skip if aborted).
@@ -720,6 +850,23 @@ function ThreadDetail() {
       const run = useAgentRun.getState().getRun(threadId)
       if (event.type === 'turn_finished') {
         persistAgentRun(run)
+        const shape = agentResponseShape(
+          run,
+          useAppState.getState().ragToolNames,
+          useAppState.getState().mcpToolNames
+        )
+        captureChatResponse({
+          ...shape,
+          ...turnContextRef.current.attachments,
+          turn_id: currentChatTurn(threadId),
+          thread_id: threadId,
+          source: turnContextRef.current.source,
+          outcome: agentOutcome(event.reason),
+          error: run.trace.error,
+          model_id: useModelProvider.getState().selectedModel?.id ?? null,
+          provider: useModelProvider.getState().selectedProvider ?? null,
+          turn_index: chatMessagesRef.current.length,
+        })
         return
       }
       if (!run.runId) return
@@ -735,7 +882,10 @@ function ThreadDetail() {
       files?: InitialMessageFile[],
       documentsFromPayload?: Attachment[],
       agentSkillName?: string,
-      persistUserMessage = true
+      persistUserMessage = true,
+      // Distinguishes a fresh send from a retry of the same prompt, so the
+      // funnel does not read regenerations as new conversations.
+      source: ChatTurnSource = 'agent'
     ) => {
       if (!isLlamacppProvider(selectedProvider)) {
         toast.error(t('chat:agentErrors.providerUnavailableTitle'), {
@@ -844,13 +994,19 @@ function ThreadDetail() {
 
       const runId = generateId()
       useAgentRun.getState().startRun(threadId, runId)
-      posthog.capture('chat_request_sent', {
-        source: 'agent',
+      const agentAttachments = attachmentTelemetry(combinedAttachments)
+      turnContextRef.current = { source, attachments: agentAttachments }
+      captureChatRequest({
+        ...agentAttachments,
+        turn_id: beginChatTurn(threadId),
         thread_id: threadId,
+        source,
         model_id: selectedModel.id,
         provider: selectedProvider,
-        has_attachments: ipcAttachments.length > 0,
-        attachment_count: ipcAttachments.length,
+        turn_index: chatMessagesRef.current.length,
+        prompt_len_bucket: lengthBucket(text.length),
+        is_agent_mode: true,
+        agent_skill: agentSkillName ?? null,
       })
 
       try {
@@ -1091,13 +1247,30 @@ function ThreadDetail() {
       })
       console.log('[processAndSendMessage] sendMessage called successfully')
 
-      posthog.capture('chat_request_sent', {
-        source: 'chat',
+      const chatAttachments = attachmentTelemetry(processedAttachments)
+      turnContextRef.current = { source: 'chat', attachments: chatAttachments }
+      const ragToolNames = useAppState.getState().ragToolNames
+      const mcpToolNames = useAppState.getState().mcpToolNames
+      captureChatRequest({
+        ...chatAttachments,
+        // Only the configured context length is known at send time; how full
+        // the window actually was comes from real `usage` on the response.
+        ...contextTelemetry(
+          null,
+          (selectedModel?.settings?.ctx_len?.controller_props
+            ?.value as number) ?? null
+        ),
+        turn_id: beginChatTurn(threadId),
         thread_id: threadId,
+        source: 'chat',
         model_id: selectedModel?.id,
         provider: selectedProvider,
-        has_attachments: processedAttachments.length > 0,
-        attachment_count: processedAttachments.length,
+        turn_index: chatMessagesRef.current.length,
+        prompt_len_bucket: lengthBucket(text.length),
+        is_agent_mode: false,
+        tools_enabled_count: ragToolNames.size + mcpToolNames.size,
+        has_rag: ragToolNames.size > 0,
+        has_mcp: mcpToolNames.size > 0,
       })
 
       // Clear attachments after sending
@@ -1228,7 +1401,8 @@ function ThreadDetail() {
           agentFiles,
           agentDocuments,
           agentSkillName,
-          false
+          false,
+          'regenerate'
         )
         return
       }
@@ -1272,9 +1446,17 @@ function ThreadDetail() {
       // Call the AI SDK regenerate function - it will handle truncating the UI messages
       // and generating a new response from the selected message
       setIsChatRequestActive(true)
+      captureRetryRequest('regenerate')
       regenerate(messageId ? { messageId } : undefined)
     },
-    [deleteMessage, processAndRunAgent, regenerate, setChatMessages, threadId]
+    [
+      captureRetryRequest,
+      deleteMessage,
+      processAndRunAgent,
+      regenerate,
+      setChatMessages,
+      threadId,
+    ]
   )
 
   // Handle edit message - updates the message and regenerates from it
@@ -1293,20 +1475,13 @@ function ThreadDetail() {
           useAgentMode.getState().isAgentMode(threadId)
         ) === 'agent-ipc'
 
-      // Update the message content
+      // Update the message content. Attachments are kept for every thread, not
+      // just Agent ones: images live only in `content`, so dropping them here
+      // destroys them permanently (audio and documents survive in `metadata`,
+      // which is preserved below).
       const updatedMessage = {
         ...originalMessage,
-        content: [
-          {
-            type: ContentType.Text,
-            text: { value: newText, annotations: [] },
-          },
-          ...(isAgentThread
-            ? originalMessage.content.filter(
-                (content) => content.type !== ContentType.Text
-              )
-            : []),
-        ],
+        content: rebuildEditedContent(originalMessage.content, newText),
         metadata: isAgentThread
           ? {
               ...(originalMessage.metadata ?? {}),
@@ -1321,12 +1496,7 @@ function ThreadDetail() {
         if (msg.id === messageId) {
           return {
             ...msg,
-            parts: [
-              { type: 'text' as const, text: newText },
-              ...(isAgentThread
-                ? msg.parts.filter((part) => part.type === 'file')
-                : []),
-            ],
+            parts: rebuildEditedParts(msg.parts, newText),
           }
         }
         return msg
@@ -1349,6 +1519,7 @@ function ThreadDetail() {
 
       // Regenerate from the edited message
       setIsChatRequestActive(true)
+      captureRetryRequest('edit')
       regenerate({ messageId })
     },
     [
@@ -1356,6 +1527,7 @@ function ThreadDetail() {
       updateMessage,
       deleteMessage,
       chatMessages,
+      captureRetryRequest,
       handleRegenerate,
       setChatMessages,
       regenerate,
@@ -1992,6 +2164,10 @@ function ThreadDetail() {
                       isFirstMessage={false}
                       isLastMessage={true}
                       status={status}
+                      // The placeholder is a frozen snapshot: its activity must
+                      // read "Worked for Xs", not add a second live "Working"
+                      // shimmer under "Growing the Mind...".
+                      requestActive={false}
                       reasoningContainerRef={reasoningContainerRef}
                       onRegenerate={handleRegenerate}
                       onEdit={agentModeActive ? undefined : handleEditMessage}
@@ -2005,12 +2181,15 @@ function ThreadDetail() {
                   {(inputStatus === CHAT_STATUS.SUBMITTED ||
                     isAutoIncreasingContext) && (
                     <div className="flex flex-row items-center gap-2">
-                      {(pendingContinueMessage || isAutoIncreasingContext) && (
+                      {/* One indicator at a time: the context-growth shimmer
+                      replaces the generic "Working" progress, never joins it. */}
+                      {pendingContinueMessage || isAutoIncreasingContext ? (
                         <Shimmer duration={1}>Growing the Mind...</Shimmer>
-                      )}
-                      {inputStatus === CHAT_STATUS.SUBMITTED &&
+                      ) : (
+                        inputStatus === CHAT_STATUS.SUBMITTED &&
                         !agentModeActive &&
-                        !hasActiveAssistantMessage && <PromptProgress />}
+                        !hasActiveAssistantMessage && <PromptProgress />
+                      )}
                     </div>
                   )}
                   {(error || contextLimitError) &&

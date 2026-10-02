@@ -28,6 +28,8 @@
   "unstar": "Désélectionner",
   "deleteAll": "Tout supprimer",
   "star": "Étoile",
+  "openInNewWindow": "Ouvrir dans une nouvelle fenêtre",
+  "openInNewWindowFailed": "Impossible d'ouvrir cette discussion dans une nouvelle fenêtre",
   "rename": "Renommer",
   "delete": "Supprimer",
   "copied": "Copié!",
@@ -242,9 +244,6 @@
     },
     "deleteThread": {
       "description": "Êtes-vous sûr de vouloir supprimer cette discussion ? Cette action ne peut pas être annulée."
-    },
-    "editMessage": {
-      "title": "Modifier le message"
     },
     "messageMetadata": {
       "title": "Métadonnées du message"

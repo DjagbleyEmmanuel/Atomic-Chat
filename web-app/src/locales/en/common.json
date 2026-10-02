@@ -90,6 +90,8 @@
   "unstar": "Unstar",
   "deleteAll": "Delete All",
   "star": "Star",
+  "openInNewWindow": "Open in new window",
+  "openInNewWindowFailed": "Couldn't open this chat in a new window",
   "rename": "Rename",
   "delete": "Delete",
   "copied": "Copied!",
@@ -328,9 +330,6 @@
     },
     "deleteThread": {
       "description": "Are you sure you want to delete this thread? This action cannot be undone."
-    },
-    "editMessage": {
-      "title": "Edit Message"
     },
     "messageMetadata": {
       "title": "Message Metadata"

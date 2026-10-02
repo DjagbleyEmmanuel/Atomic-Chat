@@ -28,6 +28,8 @@
   "unstar": "取消收藏",
   "deleteAll": "全部删除",
   "star": "收藏",
+  "openInNewWindow": "在新窗口中打开",
+  "openInNewWindowFailed": "无法在新窗口中打开此聊天",
   "rename": "重命名",
   "delete": "删除",
   "copied": "已复制！",
@@ -297,9 +299,6 @@
     },
     "deleteThread": {
       "description": "您确定要删除此对话吗？此操作无法撤销。"
-    },
-    "editMessage": {
-      "title": "编辑消息"
     },
     "messageMetadata": {
       "title": "消息元数据"

@@ -652,7 +652,10 @@ const ChatInput = memo(function ChatInput({
 
   const handleSendMessage = async (prompt: string) => {
     if (!selectedModel) {
-      setMessage('Please select a model to start chatting.')
+      // Model preloading is off by default, so "nothing selected yet" is the
+      // normal state on every launch and this hint is now routine rather than
+      // an edge case — it has to be translated like the rest of the UI.
+      setMessage(t('chat:selectModelToChat'))
       return
     }
     if (!prompt.trim()) {
@@ -978,6 +981,18 @@ const ChatInput = memo(function ChatInput({
     if (chatStatus !== 'submitted' && textareaRef.current) {
       // Small delay to ensure UI has updated
       setTimeout(() => {
+        // Never yank the caret out of another field the user is typing in —
+        // an inline message editor open in the transcript, for instance.
+        const active = document.activeElement
+        if (
+          active &&
+          active !== textareaRef.current &&
+          (active.tagName === 'TEXTAREA' ||
+            active.tagName === 'INPUT' ||
+            (active as HTMLElement).isContentEditable)
+        ) {
+          return
+        }
         textareaRef.current?.focus()
       }, 10)
     }

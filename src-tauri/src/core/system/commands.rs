@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tauri_plugin_llamacpp::cleanup_llama_processes;
 
@@ -613,12 +613,80 @@ pub struct CliInstallStatus {
     pub path: Option<String>,
 }
 
-/// Check if the `jan` CLI binary is accessible on PATH.
+/// Name of the CLI command as it is installed on the user's PATH.
+pub const CLI_COMMAND_NAME: &str = "atomic-chat-cli";
+
+/// Name the CLI shipped under before the Atomic Chat rebrand. Older builds
+/// installed it as plain `jan`, which collides with the unrelated Jan.ai CLI.
+const LEGACY_CLI_COMMAND_NAME: &str = "jan";
+
+/// Marker string embedded in every Atomic Chat CLI build. Used to confirm that a
+/// leftover `jan` binary on PATH was written by us before we remove it — a `jan`
+/// belonging to the actual Jan.ai app must never be touched.
+const CLI_OWNERSHIP_MARKER: &[u8] = b"Atomic Chat";
+
+/// Return true when `path` is a binary we shipped (contains [`CLI_OWNERSHIP_MARKER`]).
+fn is_our_cli_binary(path: &std::path::Path) -> bool {
+    use std::io::Read;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    // Scan in chunks with an overlap so a marker straddling a chunk boundary
+    // is still found, without loading the whole binary into memory.
+    let overlap = CLI_OWNERSHIP_MARKER.len() - 1;
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut carry: Vec<u8> = Vec::with_capacity(overlap);
+    loop {
+        let read = match file.read(&mut buf[..]) {
+            Ok(0) => return false,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        let mut window = std::mem::take(&mut carry);
+        window.extend_from_slice(&buf[..read]);
+        if window
+            .windows(CLI_OWNERSHIP_MARKER.len())
+            .any(|w| w == CLI_OWNERSHIP_MARKER)
+        {
+            return true;
+        }
+        let keep = window.len().saturating_sub(overlap);
+        carry = window[keep..].to_vec();
+    }
+}
+
+/// Remove a legacy `jan` binary left behind by pre-rebrand installs, but only if
+/// we can prove we wrote it. A foreign `jan` (i.e. Jan.ai's own CLI) is left alone.
+fn remove_legacy_cli_binary(dir: &std::path::Path) {
+    let name = if cfg!(windows) {
+        "jan.exe"
+    } else {
+        LEGACY_CLI_COMMAND_NAME
+    };
+    let legacy = dir.join(name);
+    if !legacy.exists() {
+        return;
+    }
+    if !is_our_cli_binary(&legacy) {
+        log::info!(
+            "Leaving {} alone — not an Atomic Chat binary",
+            legacy.display()
+        );
+        return;
+    }
+    match std::fs::remove_file(&legacy) {
+        Ok(()) => log::info!("Removed legacy Atomic Chat CLI at {}", legacy.display()),
+        Err(e) => log::warn!("Could not remove {}: {}", legacy.display(), e),
+    }
+}
+
+/// Check if the `atomic-chat-cli` binary is accessible on PATH.
 #[tauri::command]
 pub async fn check_jan_cli_installed() -> CliInstallStatus {
     let which_cmd = if cfg!(windows) { "where" } else { "which" };
     let mut cmd = std::process::Command::new(which_cmd);
-    cmd.arg("jan");
+    cmd.arg(CLI_COMMAND_NAME);
 
     #[cfg(windows)]
     {
@@ -669,7 +737,11 @@ pub fn install_jan_cli_sync<R: Runtime>(
     } else {
         "jan-cli"
     };
-    let dest_bin_name = if cfg!(windows) { "jan.exe" } else { "jan" };
+    let dest_bin_name = if cfg!(windows) {
+        "atomic-chat-cli.exe"
+    } else {
+        CLI_COMMAND_NAME
+    };
     let resource_bin_dir = app_handle
         .path()
         .resource_dir()
@@ -679,22 +751,18 @@ pub fn install_jan_cli_sync<R: Runtime>(
     let dest = resource_bin_dir.join(dest_bin_name);
 
     if !bundled.exists() && !dest.exists() {
-        return Err("Jan CLI binary not bundled with this version of Jan.".to_string());
+        return Err("Atomic Chat CLI binary not bundled with this version of the app.".to_string());
     }
 
     #[cfg(windows)]
     {
         if bundled.exists() {
             if let Err(e) = std::fs::rename(&bundled, &dest) {
-                log::warn!("Could not rename jan-cli.exe to jan.exe: {}", e);
+                log::warn!("Could not rename jan-cli.exe to atomic-chat-cli.exe: {}", e);
             }
         }
-        if dest.exists() {
-            let alias = resource_bin_dir.join("atomic-chat-cli.exe");
-            if let Err(e) = std::fs::copy(&dest, &alias) {
-                log::warn!("Could not copy jan.exe to atomic-chat-cli.exe: {}", e);
-            }
-        }
+        // Older builds put `jan.exe` on PATH here; drop it so it stops shadowing Jan.ai.
+        remove_legacy_cli_binary(&resource_bin_dir);
         add_to_path_windows(&resource_bin_dir)?;
         return Ok(CliInstallStatus {
             installed: true,
@@ -708,12 +776,21 @@ pub fn install_jan_cli_sync<R: Runtime>(
         std::fs::create_dir_all(&install_dir).map_err(|e| e.to_string())?;
         let dest = install_dir.join(dest_bin_name);
 
-        std::fs::copy(&bundled, &dest)
-            .map_err(|e| format!("Failed to copy jan to {}: {}", dest.display(), e))?;
+        std::fs::copy(&bundled, &dest).map_err(|e| {
+            format!(
+                "Failed to copy {} to {}: {}",
+                CLI_COMMAND_NAME,
+                dest.display(),
+                e
+            )
+        })?;
 
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| e.to_string())?;
+
+        // Older builds installed this binary as plain `jan` in the same directory.
+        remove_legacy_cli_binary(&install_dir);
 
         Ok(CliInstallStatus {
             installed: true,
@@ -722,7 +799,7 @@ pub fn install_jan_cli_sync<R: Runtime>(
     }
 }
 
-/// Copy the bundled `jan` binary to the system PATH (Tauri command wrapper).
+/// Copy the bundled `atomic-chat-cli` binary to the system PATH (Tauri command wrapper).
 #[tauri::command]
 pub async fn install_jan_cli<R: Runtime>(
     app_handle: AppHandle<R>,
@@ -730,31 +807,37 @@ pub async fn install_jan_cli<R: Runtime>(
     install_jan_cli_sync(&app_handle)
 }
 
-/// Remove the installed `jan` CLI binary.
+/// Remove the installed `atomic-chat-cli` binary (plus any legacy `jan` we wrote).
 #[tauri::command]
 pub fn uninstall_jan_cli() -> Result<(), String> {
     #[cfg(windows)]
     {
         let bin_dir = jan_cli_bin_dir_windows()?;
-        for name in ["jan.exe", "atomic-chat-cli.exe"] {
-            let path = bin_dir.join(name);
-            if path.exists() {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    log::warn!("Could not remove {}: {}", path.display(), e);
-                }
+        let path = bin_dir.join("atomic-chat-cli.exe");
+        if path.exists() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                log::warn!("Could not remove {}: {}", path.display(), e);
             }
         }
+        remove_legacy_cli_binary(&bin_dir);
         remove_from_path_windows(&bin_dir)?;
         return Ok(());
     }
 
     #[cfg(unix)]
     {
-        let dest = jan_cli_install_dir()?.join("jan");
+        let install_dir = jan_cli_install_dir()?;
+        let dest = install_dir.join(CLI_COMMAND_NAME);
         if dest.exists() {
-            std::fs::remove_file(&dest)
-                .map_err(|e| format!("Failed to remove Jan CLI from {}: {}", dest.display(), e))?;
+            std::fs::remove_file(&dest).map_err(|e| {
+                format!(
+                    "Failed to remove the Atomic Chat CLI from {}: {}",
+                    dest.display(),
+                    e
+                )
+            })?;
         }
+        remove_legacy_cli_binary(&install_dir);
         Ok(())
     }
 }
@@ -1729,6 +1812,15 @@ fn agent_install_spec(
             let (p, a) = npm("@earendil-works/pi-coding-agent");
             Ok((p, a, "npm", "https://github.com/earendil-works/pi"))
         }
+        "dsh" => {
+            let (p, a) = npm("@deepseek-ai/dsh");
+            Ok((
+                p,
+                a,
+                "npm",
+                "https://github.com/deepseek-ai/deepseek-harness",
+            ))
+        }
         "kilo" => {
             let (p, a) = npm("@kilocode/cli");
             Ok((p, a, "npm", "https://kilo.ai/docs"))
@@ -1779,6 +1871,39 @@ fn agent_install_spec(
             };
             let prereq = if cfg!(windows) { "powershell" } else { "curl" };
             Ok((program, args, prereq, "https://block.github.io/goose/"))
+        }
+        "atomic-agent" => {
+            // Atomic Agent ships as a Node SEA binary through its own bootstrap
+            // script (NOT npm): the shell script drops the CLI plus its support
+            // assets into `~/.local/bin`, the PowerShell one into
+            // `%LOCALAPPDATA%\atomic-agent`, and both add that directory to the
+            // user PATH. Neither prompts, so there is no wizard to skip — the
+            // config is written by `configure_atomic_agent` either way.
+            let (program, args): (String, Vec<String>) = if cfg!(windows) {
+                (
+                    "powershell".to_string(),
+                    vec![
+                        "-NoProfile".to_string(),
+                        "-Command".to_string(),
+                        "irm https://atomicagent.io/install.ps1 | iex".to_string(),
+                    ],
+                )
+            } else {
+                (
+                    "sh".to_string(),
+                    vec![
+                        "-c".to_string(),
+                        "curl -fsSL https://atomicagent.io/install | sh".to_string(),
+                    ],
+                )
+            };
+            let prereq = if cfg!(windows) { "powershell" } else { "curl" };
+            Ok((
+                program,
+                args,
+                prereq,
+                "https://github.com/AtomicBot-ai/atomic-agent",
+            ))
         }
         "hermes" => {
             // `--skip-setup`/`-SkipSetup` skips the post-install interactive
@@ -3365,6 +3490,28 @@ fn write_marked_env_to_shell(
     Ok(())
 }
 
+/// Environment variables Copilot CLI reads for BYOK.
+///
+/// Shared by `configure_copilot`, which persists them to the user's shell rc,
+/// and by `atomic-chat-cli launch`, which must also set them directly on the
+/// spawned child: a freshly written rc file is not live in a process that is
+/// already running.
+pub fn copilot_env_vars(
+    api_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut env_vars: Vec<(String, String)> = Vec::with_capacity(5);
+    env_vars.push(("COPILOT_PROVIDER_BASE_URL".to_string(), api_url.to_string()));
+    env_vars.push(("COPILOT_PROVIDER_TYPE".to_string(), "openai".to_string()));
+    env_vars.push(("COPILOT_MODEL".to_string(), model.to_string()));
+    env_vars.push(("COPILOT_OFFLINE".to_string(), "true".to_string()));
+    if let Some(key) = api_key.filter(|k| !k.is_empty()) {
+        env_vars.push(("COPILOT_PROVIDER_API_KEY".to_string(), key.to_string()));
+    }
+    env_vars
+}
+
 /// Configure GitHub Copilot CLI to use the local Atomic Chat server via its BYOK
 /// environment variables. Copilot has no provider config file — it reads these
 /// from the environment at launch — so we persist them to the user's shell rc
@@ -3376,14 +3523,7 @@ pub fn configure_copilot(
     model: String,
     api_key: Option<String>,
 ) -> Result<(), String> {
-    let mut env_vars: Vec<(String, String)> = Vec::with_capacity(5);
-    env_vars.push(("COPILOT_PROVIDER_BASE_URL".to_string(), api_url.clone()));
-    env_vars.push(("COPILOT_PROVIDER_TYPE".to_string(), "openai".to_string()));
-    env_vars.push(("COPILOT_MODEL".to_string(), model.clone()));
-    env_vars.push(("COPILOT_OFFLINE".to_string(), "true".to_string()));
-    if let Some(key) = api_key.as_deref().filter(|k| !k.is_empty()) {
-        env_vars.push(("COPILOT_PROVIDER_API_KEY".to_string(), key.to_string()));
-    }
+    let env_vars = copilot_env_vars(&api_url, &model, api_key.as_deref());
 
     const MARKER: &str = "# Atomic Chat - Copilot CLI Config";
 
@@ -3510,6 +3650,449 @@ pub fn configure_pi(api_url: String, model: String, api_key: Option<String>) -> 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// DeepSeek Harness (`dsh`)
+// ---------------------------------------------------------------------------
+
+/// The harness plugin namespace that owns hand-declared provider routes. It is
+/// mounted dormant by the shipped base bundle — zero routes until a `llm-pi-ai:`
+/// section supplies profiles, at which point they register live with no
+/// restart, so writing the file is the whole integration.
+const DSH_SECTION: &str = "llm-pi-ai";
+/// Our route id. It doubles as the stem of the credential reference below, and
+/// as the settings key the harness' own Models page addresses, so it must stay
+/// a lowercase-leading POSIX-identifier-safe word.
+const DSH_ROUTE_ID: &str = "atomic";
+/// Credential *reference* (an env var name, never the secret). The harness'
+/// Models page derives `<ROUTE>_API_KEY` for routes it creates, so matching
+/// that derivation keeps our route editable — and deletable — from inside dsh.
+const DSH_KEY_ENV: &str = "ATOMIC_API_KEY";
+/// A route the pi-ai catalog does not ship falls back to `defaultContextWindow`
+/// 262144 / `defaultMaxTokens` 32768, a wild over-claim for a local model that
+/// surfaces as a mid-turn provider rejection. Declare something sane instead.
+const DSH_CONTEXT_WINDOW: u64 = 65536;
+const DSH_MAX_TOKENS: u64 = 8192;
+
+fn ykey(s: &str) -> serde_yaml::Value {
+    serde_yaml::Value::String(s.to_string())
+}
+
+/// Borrow `parent[key]` as a mapping, creating it when absent.
+///
+/// A bare `llm-pi-ai:` (or `providers:`) with nothing under it parses to
+/// `Value::Null`, which is a hole to fill rather than data to protect — those
+/// are healed. Anything else non-mapping is real user content and errors out.
+/// The JSON siblings clobber in this position (`if !x.is_object() { *x = {} }`);
+/// we deliberately do not, because `settings.yaml` is shared with every other
+/// harness plugin and a silent overwrite would delete config we do not own.
+fn dsh_child_mapping<'a>(
+    parent: &'a mut serde_yaml::Mapping,
+    key: &str,
+    label: &str,
+) -> Result<&'a mut serde_yaml::Mapping, String> {
+    let k = ykey(key);
+    let vacant = match parent.get(&k) {
+        None => true,
+        Some(v) => v.is_null(),
+    };
+    if vacant {
+        parent.insert(
+            k.clone(),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        );
+    }
+    parent
+        .get_mut(&k)
+        .and_then(|v| v.as_mapping_mut())
+        .ok_or_else(|| {
+            format!(
+                "`{}` in {} is not a mapping. Fix or remove it and try again.",
+                label, "settings.yaml"
+            )
+        })
+}
+
+/// Build the `llm-pi-ai.providers.atomic` route node.
+///
+/// dsh refuses a hand-declared route unless `api`, `baseURL` and a NON-EMPTY
+/// `models` list are all present, and it refuses the *whole* section when one
+/// route is invalid — which is why the caller validates before we get here.
+///
+/// `apiKeyEnv` names an env var; it is never the secret. dsh fails requests with
+/// MISSING_CREDENTIAL when the field is present but resolves to nothing, so the
+/// keyless path omits the field rather than writing an empty string, leaving a
+/// plainly unauthenticated route.
+fn dsh_route_node(api_url: &str, model: &str, with_key: bool) -> serde_yaml::Value {
+    use serde_yaml::{Mapping, Value};
+
+    let mut model_entry = Mapping::new();
+    model_entry.insert(ykey("id"), Value::String(model.to_string()));
+    model_entry.insert(ykey("contextWindow"), Value::from(DSH_CONTEXT_WINDOW));
+    model_entry.insert(ykey("maxTokens"), Value::from(DSH_MAX_TOKENS));
+
+    let mut route = Mapping::new();
+    route.insert(
+        ykey("displayName"),
+        Value::String("Atomic Chat".to_string()),
+    );
+    route.insert(ykey("api"), Value::String("openai-completions".to_string()));
+    route.insert(ykey("baseURL"), Value::String(api_url.to_string()));
+    if with_key {
+        route.insert(ykey("apiKeyEnv"), Value::String(DSH_KEY_ENV.to_string()));
+    }
+    route.insert(
+        ykey("models"),
+        Value::Sequence(vec![Value::Mapping(model_entry)]),
+    );
+    Value::Mapping(route)
+}
+
+/// Upsert our route into an already-parsed `settings.yaml` tree. Pure: no IO,
+/// no environment.
+///
+/// Everything outside `llm-pi-ai.providers.atomic` is preserved — other plugin
+/// sections, other keys inside the section, other provider routes — including
+/// relative order, since `serde_yaml::Mapping` is insertion-ordered and
+/// `insert` on an existing key keeps its position.
+///
+/// The route is replaced WHOLESALE, never deep-merged: a merge would let a
+/// stale `apiKeyEnv` from an earlier keyed run survive into a keyless run and
+/// break every request with MISSING_CREDENTIAL.
+fn apply_dsh_provider(
+    root: &mut serde_yaml::Value,
+    api_url: &str,
+    model: &str,
+    with_key: bool,
+) -> Result<(), String> {
+    use serde_yaml::{Mapping, Value};
+
+    // An invalid route does not merely fail to help: dsh rejects the entire
+    // `llm-pi-ai` section, taking the user's other providers down with it. So
+    // refuse to write one, before touching the tree.
+    if api_url.trim().is_empty() {
+        return Err("No local server URL. Start the local API server and try again.".to_string());
+    }
+    if model.trim().is_empty() {
+        return Err(
+            "No model selected. DeepSeek Harness rejects a provider with an empty model \
+             list, which would also disable any other provider configured in that section."
+                .to_string(),
+        );
+    }
+
+    // An empty, whitespace-only, or comment-only document parses to Null rather
+    // than erroring (unlike serde_json, which rejects ""), so one heal covers
+    // all three.
+    if root.is_null() {
+        *root = Value::Mapping(Mapping::new());
+    }
+    let root_map = root
+        .as_mapping_mut()
+        .ok_or_else(|| "settings.yaml top level is not a YAML mapping".to_string())?;
+
+    let section = dsh_child_mapping(root_map, DSH_SECTION, DSH_SECTION)?;
+    let providers = dsh_child_mapping(section, "providers", &format!("{}.providers", DSH_SECTION))?;
+    providers.insert(ykey(DSH_ROUTE_ID), dsh_route_node(api_url, model, with_key));
+    Ok(())
+}
+
+/// Resolve dsh's home from a `DSH_HOME` value and the user's home directory.
+/// Pure half of {@link dsh_home_dir}.
+fn dsh_home_from(dsh_home_env: Option<&str>, user_home: &Path) -> PathBuf {
+    match dsh_home_env.map(str::trim).filter(|v| !v.is_empty()) {
+        // A `DSH_HOME="~/dev/dsh"` written with quotes in an rc file is never
+        // tilde-expanded by the shell, so a literal `~` can reach us.
+        Some("~") => user_home.to_path_buf(),
+        Some(v) if v.starts_with("~/") || v.starts_with("~\\") => user_home.join(&v[2..]),
+        Some(v) => PathBuf::from(v),
+        None => user_home.join(".dsh"),
+    }
+}
+
+/// Read `DSH_HOME` from the user's login shell.
+///
+/// An `export DSH_HOME=...` in `~/.zshrc` is invisible to a Finder/Dock-launched
+/// app (which inherits launchd's environment) but very visible to the `dsh` we
+/// spawn through a terminal. Without this probe we would cheerfully write
+/// `~/.dsh/settings.yaml` while dsh reads somewhere else entirely. Same problem
+/// and same fix as {@link login_shell_path}, including the cache — the probe
+/// spawns an interactive login shell and is far too slow to repeat.
+#[cfg(not(windows))]
+fn login_shell_dsh_home() -> Option<String> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+            let out = std::process::Command::new(shell)
+                .args(["-lic", "printf '__DSHHOME__%s__DSHEND__' \"$DSH_HOME\""])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let s = String::from_utf8_lossy(&out.stdout);
+            let start = s.find("__DSHHOME__")? + "__DSHHOME__".len();
+            let end = s[start..].find("__DSHEND__")? + start;
+            let value = s[start..end].trim().to_string();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value)
+            }
+        })
+        .clone()
+}
+
+#[cfg(windows)]
+fn login_shell_dsh_home() -> Option<String> {
+    None
+}
+
+/// Resolve dsh's home directory: `$DSH_HOME` when set, else `~/.dsh`.
+fn dsh_home_dir() -> Result<PathBuf, String> {
+    let from_env = std::env::var("DSH_HOME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(login_shell_dsh_home);
+    let home = agent_home_dir()?;
+    Ok(dsh_home_from(from_env.as_deref(), Path::new(&home)))
+}
+
+/// Write `bytes` to `path` via a temp sibling and a rename, so a crash or a full
+/// disk cannot leave a truncated file behind.
+///
+/// The existing `configure_*` commands use a plain `std::fs::write`, which is
+/// tolerable for a config file we are the sole author of. `settings.yaml` is
+/// shared with every other harness plugin, so a half-written file destroys
+/// configuration we do not own. Symlinks are resolved first: renaming onto a
+/// link would replace it with a regular file and silently detach a dotfile
+/// managed by stow/chezmoi.
+fn dsh_write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let stem = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("atomic");
+    let tmp = target.with_file_name(format!(".{}.atomic-tmp-{}", stem, std::process::id()));
+
+    let result = (|| -> Result<(), String> {
+        let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        file.write_all(bytes).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &target).map_err(|e| e.to_string())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|e| format!("Failed to write {}: {}", target.display(), e))
+}
+
+/// Restrict a credential-bearing file to its owner. Best-effort: a permissions
+/// failure must not fail the configure.
+#[cfg(unix)]
+fn dsh_restrict_to_owner(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn dsh_restrict_to_owner(_path: &Path) {}
+
+/// Reject a value no dotenv line can carry.
+///
+/// An unquoted dotenv value ends at whitespace or `#`; a newline would inject a
+/// second assignment outright. The message names the variable and never the
+/// value, so a rejected key cannot leak through an error toast or the log.
+fn dsh_validate_env_value(name: &str, value: &str) -> Result<(), String> {
+    if value.contains(['\n', '\r', '#', '"', '\'']) || value.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "{} contains characters that cannot be stored in a .env file",
+            name
+        ));
+    }
+    Ok(())
+}
+
+/// Upsert — or, with an empty `vars`, remove — an Atomic-Chat-managed block in a
+/// dotenv file, preserving every line outside it. `#` starts a comment in dotenv
+/// too, so the markers are inert to any reader.
+///
+/// Deliberately not `write_marked_env_to_shell`: that one emits shell
+/// `export K='V'` syntax, uses a different single-line marker scheme, and always
+/// appends a fresh block — it cannot express "remove the block and write
+/// nothing", which is exactly what the keyless path needs.
+fn dsh_write_managed_env(path: &Path, vars: &[(&str, &str)]) -> Result<(), String> {
+    for (name, value) in vars {
+        dsh_validate_env_value(name, value)?;
+    }
+
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if vars.is_empty() {
+                // Nothing to clear; do not create the file just to leave it empty.
+                return Ok(());
+            }
+            String::new()
+        }
+        Err(e) => return Err(format!("Failed to read {}: {}", path.display(), e)),
+    };
+
+    // The shared stripper removes every block we ever wrote, so reruns cannot
+    // accumulate duplicates.
+    let kept = strip_atomic_managed_block(&existing);
+    let kept = kept.trim_end();
+
+    let out = if vars.is_empty() {
+        if kept.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", kept)
+        }
+    } else {
+        let body: String = vars
+            .iter()
+            .map(|(name, value)| format!("{}={}\n", name, value))
+            .collect();
+        let block = format!("{}\n{}{}\n", ATOMIC_MANAGED_BEGIN, body, ATOMIC_MANAGED_END);
+        if kept.is_empty() {
+            block
+        } else {
+            format!("{}\n\n{}", kept, block)
+        }
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+    dsh_write_atomically(path, out.as_bytes())?;
+    dsh_restrict_to_owner(path);
+    Ok(())
+}
+
+/// Filesystem half of {@link configure_dsh}, taking an explicit dsh home so it
+/// is testable.
+fn configure_dsh_at(
+    home: &Path,
+    api_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    let key = api_key.map(str::trim).filter(|k| !k.is_empty());
+
+    // Validate the credential before writing settings.yaml, so an unusable key
+    // cannot leave a route pointing at a reference we then failed to store.
+    if let Some(k) = key {
+        dsh_validate_env_value(DSH_KEY_ENV, k)?;
+    }
+
+    let settings_path = home.join("settings.yaml");
+
+    // Parse before creating anything, so a malformed file leaves no debris.
+    let text = match std::fs::read_to_string(&settings_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(format!(
+                "{} is not valid UTF-8. Fix or remove the file and try again.",
+                settings_path.display()
+            ))
+        }
+        Err(e) => return Err(format!("Failed to read {}: {}", settings_path.display(), e)),
+    };
+    let mut root: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| {
+        format!(
+            "Could not parse {}: {}. Fix or remove the file and try again.",
+            settings_path.display(),
+            e
+        )
+    })?;
+
+    apply_dsh_provider(&mut root, api_url, model, key.is_some())?;
+
+    let mut serialized = serde_yaml::to_string(&root)
+        .map_err(|e| format!("Failed to serialize {}: {}", settings_path.display(), e))?;
+    if !serialized.ends_with('\n') {
+        serialized.push('\n');
+    }
+
+    std::fs::create_dir_all(home)
+        .map_err(|e| format!("Failed to create {}: {}", home.display(), e))?;
+
+    // The round trip below drops comments and expands anchors, so keep one copy
+    // of whatever the user had before we first touched it. Only ever written
+    // once, so a later run cannot overwrite the true pre-Atomic state.
+    if !text.is_empty() {
+        let backup = home.join("settings.yaml.atomic-backup");
+        if !backup.exists() {
+            let _ = std::fs::write(&backup, &text);
+        }
+    }
+
+    dsh_write_atomically(&settings_path, serialized.as_bytes())?;
+
+    // The secret itself never enters settings.yaml. dsh resolves the reference
+    // from, in order: the inherited environment, `$DSH_HOME/.credentials.yaml`,
+    // the invoking directory's `.env`, then `$DSH_HOME/.env` — we write the
+    // last, lowest-precedence layer, so anything the user sets deliberately
+    // (including through dsh's own Models page) still wins.
+    let env_path = home.join(".env");
+    match key {
+        Some(k) => dsh_write_managed_env(&env_path, &[(DSH_KEY_ENV, k)])?,
+        // Keyless: the route carries no `apiKeyEnv`, so a leftover value would
+        // be a secret outliving its use. Clear it.
+        None => dsh_write_managed_env(&env_path, &[])?,
+    }
+
+    log::info!(
+        "DeepSeek Harness configured: baseURL={}, model={}, home={}, key={}",
+        api_url,
+        model,
+        home.display(),
+        if key.is_some() { "yes" } else { "no" }
+    );
+    Ok(())
+}
+
+/// Point DeepSeek Harness (`dsh`) at the local Atomic Chat server by upserting
+/// the `llm-pi-ai.providers.atomic` route in `$DSH_HOME/settings.yaml`
+/// (default `~/.dsh`). dsh re-reads that document live, so no restart is needed.
+///
+/// NOTE: the parse/re-serialize round trip drops YAML comments and expands
+/// anchors and aliases — the same trade `configure_zed` makes for JSONC, which
+/// is why the previous contents are backed up alongside on the first write.
+#[tauri::command]
+pub fn configure_dsh(
+    api_url: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    let home = dsh_home_dir()?;
+    configure_dsh_at(&home, &api_url, &model, api_key.as_deref())
+}
+
+/// Environment variables Goose reads for BYOK. See `copilot_env_vars` for why
+/// this is shared with the CLI.
+pub fn goose_env_vars(api_url: &str, model: &str, api_key: Option<&str>) -> Vec<(String, String)> {
+    let key_val = api_key.filter(|k| !k.is_empty()).unwrap_or("atomic");
+
+    let mut env_vars: Vec<(String, String)> = Vec::with_capacity(5);
+    env_vars.push(("GOOSE_PROVIDER".to_string(), "openai".to_string()));
+    env_vars.push(("GOOSE_MODEL".to_string(), model.to_string()));
+    env_vars.push(("OPENAI_HOST".to_string(), api_url.to_string()));
+    env_vars.push((
+        "OPENAI_BASE_PATH".to_string(),
+        "v1/chat/completions".to_string(),
+    ));
+    env_vars.push(("OPENAI_API_KEY".to_string(), key_val.to_string()));
+    env_vars
+}
+
 /// Configure Goose via its BYOK environment variables. Goose has no provider
 /// config file we patch here — it reads `GOOSE_PROVIDER` / `GOOSE_MODEL` plus
 /// the OpenAI host vars from the environment — so we persist them to the user's
@@ -3522,20 +4105,7 @@ pub fn configure_goose(
     model: String,
     api_key: Option<String>,
 ) -> Result<(), String> {
-    let key_val = api_key
-        .as_deref()
-        .filter(|k| !k.is_empty())
-        .unwrap_or("atomic");
-
-    let mut env_vars: Vec<(String, String)> = Vec::with_capacity(5);
-    env_vars.push(("GOOSE_PROVIDER".to_string(), "openai".to_string()));
-    env_vars.push(("GOOSE_MODEL".to_string(), model.clone()));
-    env_vars.push(("OPENAI_HOST".to_string(), api_url.clone()));
-    env_vars.push((
-        "OPENAI_BASE_PATH".to_string(),
-        "v1/chat/completions".to_string(),
-    ));
-    env_vars.push(("OPENAI_API_KEY".to_string(), key_val.to_string()));
+    let env_vars = goose_env_vars(&api_url, &model, api_key.as_deref());
 
     const MARKER: &str = "# Atomic Chat - Goose Config";
 
@@ -3578,6 +4148,24 @@ pub fn configure_goose(
     Ok(())
 }
 
+/// Environment variables OpenHands reads for BYOK. See `copilot_env_vars` for
+/// why this is shared with the CLI.
+pub fn openhands_env_vars(
+    api_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Vec<(String, String)> {
+    let key_val = api_key.filter(|k| !k.is_empty()).unwrap_or("atomic");
+
+    let mut env_vars: Vec<(String, String)> = Vec::with_capacity(3);
+    // The litellm `openai/` prefix is required for a custom OpenAI-compatible
+    // base_url.
+    env_vars.push(("LLM_MODEL".to_string(), format!("openai/{}", model)));
+    env_vars.push(("LLM_BASE_URL".to_string(), api_url.to_string()));
+    env_vars.push(("LLM_API_KEY".to_string(), key_val.to_string()));
+    env_vars
+}
+
 /// Configure OpenHands via its BYOK environment variables. The CLI reads env
 /// overrides only when launched with `--override-with-envs`, using `LLM_API_KEY`
 /// / `LLM_BASE_URL` / `LLM_MODEL`. We persist them to the user's shell rc
@@ -3590,15 +4178,7 @@ pub fn configure_openhands(
     model: String,
     api_key: Option<String>,
 ) -> Result<(), String> {
-    let key_val = api_key
-        .as_deref()
-        .filter(|k| !k.is_empty())
-        .unwrap_or("atomic");
-
-    let mut env_vars: Vec<(String, String)> = Vec::with_capacity(3);
-    env_vars.push(("LLM_MODEL".to_string(), format!("openai/{}", model)));
-    env_vars.push(("LLM_BASE_URL".to_string(), api_url.clone()));
-    env_vars.push(("LLM_API_KEY".to_string(), key_val.to_string()));
+    let env_vars = openhands_env_vars(&api_url, &model, api_key.as_deref());
 
     const MARKER: &str = "# Atomic Chat - OpenHands Config";
 
@@ -3732,25 +4312,31 @@ fn poolside_standalone_base_url(api_url: &str) -> String {
 /// `POOLSIDE_STANDALONE_*` from the environment at launch — so we persist them
 /// to the user's shell rc (Windows: `setx`). The auto-opened terminal also
 /// passes them inline so the session works without re-sourcing the rc file.
+/// Environment variables Poolside reads in standalone mode. See
+/// `copilot_env_vars` for why this is shared with the CLI.
+pub fn poolside_env_vars(
+    api_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Vec<(String, String)> {
+    let key_val = api_key.filter(|k| !k.is_empty()).unwrap_or("atomic");
+    let standalone_base = poolside_standalone_base_url(api_url);
+
+    let mut env_vars: Vec<(String, String)> = Vec::with_capacity(3);
+    env_vars.push(("POOLSIDE_STANDALONE_BASE_URL".to_string(), standalone_base));
+    env_vars.push(("POOLSIDE_API_KEY".to_string(), key_val.to_string()));
+    env_vars.push(("POOLSIDE_STANDALONE_MODEL".to_string(), model.to_string()));
+    env_vars
+}
+
 #[tauri::command]
 pub fn configure_poolside(
     api_url: String,
     model: String,
     api_key: Option<String>,
 ) -> Result<(), String> {
-    let key_val = api_key
-        .as_deref()
-        .filter(|k| !k.is_empty())
-        .unwrap_or("atomic");
     let standalone_base = poolside_standalone_base_url(&api_url);
-
-    let mut env_vars: Vec<(String, String)> = Vec::with_capacity(3);
-    env_vars.push((
-        "POOLSIDE_STANDALONE_BASE_URL".to_string(),
-        standalone_base.clone(),
-    ));
-    env_vars.push(("POOLSIDE_API_KEY".to_string(), key_val.to_string()));
-    env_vars.push(("POOLSIDE_STANDALONE_MODEL".to_string(), model.clone()));
+    let env_vars = poolside_env_vars(&api_url, &model, api_key.as_deref());
 
     const MARKER: &str = "# Atomic Chat - Poolside Config";
 
@@ -3866,6 +4452,326 @@ pub fn configure_cline(
     }
 
     log::info!("Cline configured: baseUrl={}, model={}", api_url, model);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Atomic Agent integration
+// ---------------------------------------------------------------------------
+
+/// Provider id written into Atomic Agent's `llm.providers` registry. Must match
+/// its `PROVIDER_ID_RE` (`^[a-z][a-z0-9-]{0,31}$`, `src/config/llm-config.ts`).
+const ATOMIC_AGENT_PROVIDER_ID: &str = "atomic-chat";
+
+/// The `llama-server` provider Atomic Agent synthesises for itself when the
+/// config file carries no `llm` block (`parseUserLlmFileConfig`'s defaults in
+/// `src/config/config-schema.ts`). `llm.activeEmbeddingProvider` must name an
+/// entry that exists in `llm.providers`, so this is both what we seed a new
+/// block with and the only target we ever repair a dangling one to — pointing
+/// embeddings at Atomic Chat instead would silently repoint the agent's memory
+/// recall, which is not what Run asked for.
+const ATOMIC_AGENT_LOCAL_PROVIDER_ID: &str = "local-llama";
+
+/// Fallback for `localModels.url`, matching `USER_CONFIG_DEFAULTS` in
+/// Atomic Agent's `src/config/config-schema.ts`.
+const ATOMIC_AGENT_DEFAULT_LLAMA_URL: &str = "http://127.0.0.1:8080";
+
+/// Fallback for `localModels.managed.port`, from the same defaults. Used only
+/// when the config selects `mode: "managed"` without naming a port.
+const ATOMIC_AGENT_DEFAULT_MANAGED_PORT: u64 = 19_091;
+
+/// Fallback for `localModels.embeddings.port`, from the same defaults. The
+/// agent derives `localModels.embeddings.url` from it when the file names a
+/// port but no url (`config-schema.ts`'s `embeddingsDaemon`).
+const ATOMIC_AGENT_DEFAULT_EMBEDDINGS_PORT: u64 = 19_092;
+
+/// Per-request timeout seeded on our provider entry. Atomic Agent's
+/// OpenAI-compatible provider otherwise defaults to 600_000 ms
+/// (`src/llm/provider/openai/openai-provider.ts`), so a wedged local turn would
+/// hang for ten minutes before failing. Any value already on our entry wins.
+const ATOMIC_AGENT_REQUEST_TIMEOUT_MS: u64 = 300_000;
+
+/// Resolve Atomic Agent's state directory, mirroring `loadConfig()` in its
+/// `src/config/load-config.ts`: an explicit `ATOMIC_AGENT_STATE_DIR` wins, else
+/// `~/.atomic-agent` on every platform (the agent expands `~` through Node's
+/// `os.homedir()`, which is `%USERPROFILE%` on Windows).
+///
+/// The Windows registry read comes first for the same reason as Hermes': a
+/// User-scope variable set after this process started is invisible to
+/// `std::env::var`, which only sees the block snapshotted at app startup — see
+/// `docs/decisions/2026-07-01-fix-hermes-agent-config-on-windows-writing-to-the-wrong-file.md`.
+fn resolve_atomic_agent_state_dir() -> Result<PathBuf, String> {
+    if let Some(dir) =
+        read_windows_user_env("ATOMIC_AGENT_STATE_DIR").filter(|s| !s.trim().is_empty())
+    {
+        return Ok(PathBuf::from(dir.trim()));
+    }
+    if let Ok(dir) = std::env::var("ATOMIC_AGENT_STATE_DIR") {
+        if !dir.trim().is_empty() {
+            return Ok(PathBuf::from(dir.trim()));
+        }
+    }
+    Ok(PathBuf::from(agent_home_dir()?).join(".atomic-agent"))
+}
+
+/// The `llama-server` entry Atomic Agent would synthesise for itself, built
+/// from the same inputs its parser uses (`parseUserLlmFileConfig`'s defaults in
+/// `src/config/config-schema.ts`). The URL is mode-aware: under
+/// `localModels.mode: "managed"` the agent ignores `localModels.url` and talks
+/// to the daemon it runs on `localModels.managed.port`.
+///
+/// `url` carries chat, `baseUrl` carries embeddings — see
+/// `atomic_agent_embedding_base_url` for why the two can differ and why
+/// omitting the second would move a working embeddings setup.
+fn atomic_agent_local_llama_entry(
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    let local_models = root.get("localModels");
+    let managed = local_models.and_then(|v| v.get("managed"));
+    let url = if local_models
+        .and_then(|v| v.get("mode"))
+        .and_then(|v| v.as_str())
+        == Some("managed")
+    {
+        let port = managed
+            .and_then(|v| v.get("port"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(ATOMIC_AGENT_DEFAULT_MANAGED_PORT);
+        format!("http://127.0.0.1:{}", port)
+    } else {
+        local_models
+            .and_then(|v| v.get("url"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(ATOMIC_AGENT_DEFAULT_LLAMA_URL)
+            .to_string()
+    };
+
+    serde_json::json!({
+        "id": ATOMIC_AGENT_LOCAL_PROVIDER_ID,
+        "kind": "llama-server",
+        "baseUrl": atomic_agent_embedding_base_url(root, &url),
+        "url": url,
+    })
+}
+
+/// Where the agent would look for embeddings if we were not writing an `llm`
+/// block at all — the no-block branch of `resolveEmbeddingLlmConfig`
+/// (`src/memory/embeddings/embedding-provider-registry.ts`), which reads
+/// `embeddings.enabled ? embeddings.url : localModels.url`. `chat_url` is the
+/// mode-aware URL already computed for this entry, because `localModels.url`
+/// is itself resolved to the managed daemon before that branch sees it
+/// (`src/config/load-config.ts`).
+///
+/// Seeding this matters because the embedding path resolves a provider entry
+/// as `baseUrl ?? url`: without it, creating the `llm` block would silently
+/// repoint embeddings at the chat daemon for everyone running the embeddings
+/// daemon. The agent's own synthesised entry sets `baseUrl` unconditionally to
+/// the embeddings daemon URL, but copying that literally would point a default
+/// install at a port with nothing listening — the branch that governs the
+/// files we convert is the no-`llm`-block one, so that is the one we mirror.
+fn atomic_agent_embedding_base_url(
+    root: &serde_json::Map<String, serde_json::Value>,
+    chat_url: &str,
+) -> String {
+    let embeddings = root.get("localModels").and_then(|v| v.get("embeddings"));
+    let enabled = embeddings
+        .and_then(|v| v.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !enabled {
+        return chat_url.to_string();
+    }
+    embeddings
+        .and_then(|v| v.get("url"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let port = embeddings
+                .and_then(|v| v.get("port"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(ATOMIC_AGENT_DEFAULT_EMBEDDINGS_PORT);
+            format!("http://127.0.0.1:{}", port)
+        })
+}
+
+/// Upsert the Atomic Chat provider into an Atomic Agent `config.json` payload.
+///
+/// Split out from the command so the merge is unit-testable without touching a
+/// real state directory. Everything outside `llm` is left byte-for-byte alone;
+/// inside `llm`, only our own provider entry and `activeTextProvider` are
+/// rewritten (plus `activeEmbeddingProvider` when it is absent or dangling,
+/// which the agent would otherwise refuse to load). Unknown keys survive
+/// because Atomic Agent's parser carries unknown top-level keys through
+/// verbatim.
+fn atomic_agent_patch_config(
+    mut root: serde_json::Value,
+    api_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    // The agent's `parseOptionalString` rejects `""` outright rather than
+    // treating it as absent, so an empty model would take the whole file down
+    // at its next start. Both callers already guarantee a model; failing here
+    // makes that the writer's own contract instead of an inherited one.
+    if model.trim().is_empty() {
+        return Err("Atomic Agent needs a model: none is running.".to_string());
+    }
+
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| "config.json is not a JSON object".to_string())?;
+
+    // Read before the `llm` block is borrowed mutably; never written back.
+    let local_llama = atomic_agent_local_llama_entry(obj);
+
+    let llm = obj.entry("llm").or_insert_with(|| serde_json::json!({}));
+    if !llm.is_object() {
+        *llm = serde_json::json!({});
+    }
+    let llm = llm.as_object_mut().unwrap();
+
+    // Read before `llm.providers` is borrowed mutably below.
+    let current_embedding = llm
+        .get("activeEmbeddingProvider")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    // Embeddings drive memory recall, not chat, so a working selection is left
+    // alone. A missing or dangling one is repaired rather than carried forward,
+    // because Atomic Agent rejects the whole file when
+    // `activeEmbeddingProvider` names a provider that is not in the list.
+    let repair_embedding = {
+        let providers = llm
+            .entry("providers")
+            .or_insert_with(|| serde_json::json!([]));
+        if !providers.is_array() {
+            *providers = serde_json::json!([]);
+        }
+        let providers = providers.as_array_mut().unwrap();
+
+        // A brand-new block needs the agent's own default entry alongside ours,
+        // so `activeEmbeddingProvider` has something valid to point at.
+        if providers.is_empty() {
+            providers.push(local_llama.clone());
+        }
+
+        let existing = providers
+            .iter()
+            .position(|p| p.get("id").and_then(|v| v.as_str()) == Some(ATOMIC_AGENT_PROVIDER_ID));
+
+        // Atomic Chat usually runs without auth, but the entry is stored as an
+        // `openai-compatible` provider and most such clients reject an empty key.
+        let key_val = api_key
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .unwrap_or("atomic");
+
+        // A timeout the user tuned on our entry is theirs; we only fill the gap.
+        let timeout = existing
+            .and_then(|i| providers[i].get("requestTimeoutMs").cloned())
+            .filter(|v| v.is_number())
+            .unwrap_or_else(|| serde_json::json!(ATOMIC_AGENT_REQUEST_TIMEOUT_MS));
+
+        let entry = serde_json::json!({
+            "id": ATOMIC_AGENT_PROVIDER_ID,
+            "kind": "openai-compatible",
+            "baseUrl": api_url,
+            "apiKey": key_val,
+            "defaultChatModel": model.trim(),
+            "supportsTools": true,
+            "requestTimeoutMs": timeout,
+        });
+        match existing {
+            Some(i) => providers[i] = entry,
+            None => providers.push(entry),
+        }
+
+        let repair = !current_embedding
+            .as_deref()
+            .is_some_and(|id| atomic_agent_lists(providers, id));
+        // The repair target is always `local-llama` — the agent's own default,
+        // seeded here when the file does not carry it. Falling back to our own
+        // id would quietly hand memory recall to Atomic Chat, which is not what
+        // Run asked for.
+        if repair && !atomic_agent_lists(providers, ATOMIC_AGENT_LOCAL_PROVIDER_ID) {
+            providers.push(local_llama);
+        }
+        repair
+    };
+
+    // Pressing Run is an explicit "use this", so the text provider is switched
+    // outright — same contract as OpenCode's `model` key.
+    llm.insert(
+        "activeTextProvider".to_string(),
+        serde_json::json!(ATOMIC_AGENT_PROVIDER_ID),
+    );
+    if repair_embedding {
+        llm.insert(
+            "activeEmbeddingProvider".to_string(),
+            serde_json::json!(ATOMIC_AGENT_LOCAL_PROVIDER_ID),
+        );
+    }
+
+    Ok(root)
+}
+
+/// Whether `providers` already carries an entry with this id.
+fn atomic_agent_lists(providers: &[serde_json::Value], id: &str) -> bool {
+    providers
+        .iter()
+        .any(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))
+}
+
+/// Configure Atomic Agent by upserting an `atomic-chat` provider in its user
+/// config (`<state dir>/config.json`, default `~/.atomic-agent/config.json`)
+/// and selecting it as the active text provider.
+///
+/// The file is the agent's own trust surface, so the write is a merge, never a
+/// replacement: other providers, keys and blocks are preserved, and the
+/// `version` field is deliberately not stamped — the agent fills it (and every
+/// missing block) with its own defaults on the next start.
+#[tauri::command]
+pub fn configure_atomic_agent(
+    api_url: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    let state_dir = resolve_atomic_agent_state_dir()?;
+    let path = state_dir.join("config.json");
+
+    let root: serde_json::Value = if path.exists() {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        if text.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&text).map_err(|e| {
+                format!(
+                    "Could not parse {}: {}. Fix or remove the file and try again.",
+                    path.display(),
+                    e
+                )
+            })?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    let patched = atomic_agent_patch_config(root, &api_url, &model, api_key.as_deref())?;
+
+    std::fs::create_dir_all(&state_dir)
+        .map_err(|e| format!("Failed to create {}: {}", state_dir.display(), e))?;
+    let pretty = serde_json::to_string_pretty(&patched).map_err(|e| e.to_string())?;
+    std::fs::write(&path, pretty + "\n")
+        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+
+    log::info!(
+        "Atomic Agent configured: baseUrl={}, model={}",
+        api_url,
+        model
+    );
     Ok(())
 }
 
@@ -4104,6 +5010,70 @@ pub fn migrate_macos_autostart_launchagent<R: Runtime>(
 mod tests {
     use super::*;
 
+    /// A file in a throwaway directory that is removed when the guard drops,
+    /// so repeated test runs don't pile up directories under `target/`.
+    struct TempFile(std::path::PathBuf);
+
+    impl std::ops::Deref for TempFile {
+        type Target = std::path::Path;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    fn temp_file(name: &str, contents: &[u8]) -> TempFile {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("cli-marker-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(name);
+        std::fs::write(&path, contents).expect("write temp file");
+        TempFile(path)
+    }
+
+    /// `remove_legacy_cli_binary` deletes files on the user's PATH, so the
+    /// ownership check must only ever accept binaries we shipped.
+    #[test]
+    fn is_our_cli_binary_detects_marker() {
+        let mut ours = vec![0u8; 700_000];
+        ours.extend_from_slice(CLI_OWNERSHIP_MARKER);
+        ours.extend_from_slice(&[0u8; 1024]);
+        assert!(is_our_cli_binary(&temp_file("ours", &ours)));
+    }
+
+    /// A foreign `jan` binary (i.e. Jan.ai's own CLI) must never be claimed.
+    #[test]
+    fn is_our_cli_binary_rejects_foreign_binary() {
+        let foreign = b"\x7fELF some other cli named jan, definitely not ours".to_vec();
+        assert!(!is_our_cli_binary(&temp_file("foreign", &foreign)));
+    }
+
+    /// The marker must still be found when it straddles a read-chunk boundary.
+    #[test]
+    fn is_our_cli_binary_finds_marker_across_chunk_boundary() {
+        // Chunks are 256 KiB; land the marker a few bytes before the boundary.
+        let mut bytes = vec![0u8; 256 * 1024 - 4];
+        bytes.extend_from_slice(CLI_OWNERSHIP_MARKER);
+        bytes.extend_from_slice(&[0u8; 64]);
+        assert!(is_our_cli_binary(&temp_file("split", &bytes)));
+    }
+
+    #[test]
+    fn is_our_cli_binary_rejects_missing_file() {
+        assert!(!is_our_cli_binary(std::path::Path::new(
+            "/nonexistent/atomic-chat-cli"
+        )));
+    }
+
     /// Regression test for the SIGABRT after MCP tool-call replies: delivering
     /// a desktop notification must be safe from a tokio runtime worker thread.
     /// The plugin's own `notify` command called blocking `show()` (zbus
@@ -4157,5 +5127,531 @@ mod tests {
                 "{variable} must be preserved"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dsh_tests {
+    use super::*;
+
+    const URL: &str = "http://127.0.0.1:1337/v1";
+
+    fn parse(text: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(text).expect("fixture must be valid YAML")
+    }
+
+    /// `llm-pi-ai.providers.atomic` as a mapping, or panic.
+    fn route(root: &serde_yaml::Value) -> &serde_yaml::Mapping {
+        root.get(DSH_SECTION)
+            .and_then(|s| s.get("providers"))
+            .and_then(|p| p.get(DSH_ROUTE_ID))
+            .and_then(|r| r.as_mapping())
+            .expect("the atomic route must exist")
+    }
+
+    #[test]
+    fn empty_document_becomes_a_complete_section() {
+        let mut root = parse("");
+        apply_dsh_provider(&mut root, URL, "qwen3-4b", false).unwrap();
+
+        let r = route(&root);
+        assert_eq!(r.get("api").unwrap().as_str(), Some("openai-completions"));
+        assert_eq!(r.get("baseURL").unwrap().as_str(), Some(URL));
+        assert_eq!(r.get("displayName").unwrap().as_str(), Some("Atomic Chat"));
+
+        // A hand-declared route is refused by dsh without a non-empty model list.
+        let models = r.get("models").unwrap().as_sequence().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].get("id").unwrap().as_str(), Some("qwen3-4b"));
+        assert_eq!(
+            models[0].get("contextWindow").unwrap().as_u64(),
+            Some(DSH_CONTEXT_WINDOW)
+        );
+        assert_eq!(
+            models[0].get("maxTokens").unwrap().as_u64(),
+            Some(DSH_MAX_TOKENS)
+        );
+    }
+
+    #[test]
+    fn preserves_other_plugin_sections() {
+        let mut root =
+            parse("web-app:\n  port: 3080\nsession-persistence-jsonl:\n  root: /tmp/x\n");
+        apply_dsh_provider(&mut root, URL, "m", false).unwrap();
+
+        assert_eq!(
+            root.get("web-app").unwrap().get("port").unwrap().as_u64(),
+            Some(3080)
+        );
+        assert_eq!(
+            root.get("session-persistence-jsonl")
+                .unwrap()
+                .get("root")
+                .unwrap()
+                .as_str(),
+            Some("/tmp/x")
+        );
+    }
+
+    #[test]
+    fn preserves_sibling_routes_and_other_section_keys() {
+        let mut root = parse(
+            "llm-pi-ai:\n  \
+             defaultInput: [text]\n  \
+             providers:\n    \
+             openai:\n      apiKeyEnv: OPENAI_API_KEY\n    \
+             mygateway:\n      baseURL: https://gw.example/v1\n",
+        );
+        apply_dsh_provider(&mut root, URL, "m", false).unwrap();
+
+        let providers = root.get(DSH_SECTION).unwrap().get("providers").unwrap();
+        assert_eq!(
+            providers
+                .get("openai")
+                .unwrap()
+                .get("apiKeyEnv")
+                .unwrap()
+                .as_str(),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(
+            providers
+                .get("mygateway")
+                .unwrap()
+                .get("baseURL")
+                .unwrap()
+                .as_str(),
+            Some("https://gw.example/v1")
+        );
+        // A key beside `providers` inside our own section survives too.
+        assert!(root.get(DSH_SECTION).unwrap().get("defaultInput").is_some());
+    }
+
+    /// The headline regression: the route is replaced wholesale, never merged.
+    /// A surviving `apiKeyEnv` would point at a variable the keyless path never
+    /// sets, and dsh fails every request with MISSING_CREDENTIAL rather than
+    /// falling back to an unauthenticated call.
+    #[test]
+    fn rewrites_the_route_wholesale_dropping_stale_fields() {
+        let mut root = parse(
+            "llm-pi-ai:\n  providers:\n    atomic:\n      \
+             apiKeyEnv: ATOMIC_API_KEY\n      \
+             baseURL: http://127.0.0.1:9999/v1\n      \
+             leftoverJunk: true\n",
+        );
+        apply_dsh_provider(&mut root, URL, "m", false).unwrap();
+
+        let r = route(&root);
+        assert!(
+            r.get("apiKeyEnv").is_none(),
+            "stale credential reference must be gone"
+        );
+        assert!(r.get("leftoverJunk").is_none(), "stale fields must be gone");
+        assert_eq!(r.get("baseURL").unwrap().as_str(), Some(URL));
+    }
+
+    #[test]
+    fn api_key_env_tracks_whether_a_key_exists() {
+        let mut keyed = parse("");
+        apply_dsh_provider(&mut keyed, URL, "m", true).unwrap();
+        assert_eq!(
+            route(&keyed).get("apiKeyEnv").unwrap().as_str(),
+            Some(DSH_KEY_ENV)
+        );
+
+        let mut keyless = parse("");
+        apply_dsh_provider(&mut keyless, URL, "m", false).unwrap();
+        assert!(route(&keyless).get("apiKeyEnv").is_none());
+    }
+
+    #[test]
+    fn bare_section_and_providers_keys_are_healed() {
+        // Both parse to Null, which is a hole to fill rather than data to protect.
+        for fixture in ["llm-pi-ai:\n", "llm-pi-ai:\n  providers:\n"] {
+            let mut root = parse(fixture);
+            apply_dsh_provider(&mut root, URL, "m", false).unwrap();
+            assert_eq!(route(&root).get("baseURL").unwrap().as_str(), Some(URL));
+        }
+    }
+
+    #[test]
+    fn refuses_to_overwrite_a_non_mapping_section() {
+        for fixture in [
+            "llm-pi-ai: some-scalar\n",
+            "llm-pi-ai:\n  providers: [a, b]\n",
+        ] {
+            let mut root = parse(fixture);
+            let before = root.clone();
+            assert!(apply_dsh_provider(&mut root, URL, "m", false).is_err());
+            assert_eq!(root, before, "a refused write must not mutate the tree");
+        }
+    }
+
+    #[test]
+    fn refuses_a_non_mapping_root() {
+        let mut root = parse("- a\n- b\n");
+        assert!(apply_dsh_provider(&mut root, URL, "m", false).is_err());
+    }
+
+    /// An invalid route makes dsh reject the whole `llm-pi-ai` section, so this
+    /// must fail loudly instead of writing something the user's other providers
+    /// would go down with.
+    #[test]
+    fn refuses_an_empty_model_or_url() {
+        let mut root = parse("");
+        let before = root.clone();
+        assert!(apply_dsh_provider(&mut root, URL, "   ", false).is_err());
+        assert!(apply_dsh_provider(&mut root, "", "m", false).is_err());
+        assert_eq!(root, before);
+    }
+
+    /// Model ids are quoted by serde_yaml rather than concatenated in, so an id
+    /// that looks like another YAML type still round-trips as a string.
+    #[test]
+    fn model_ids_that_look_like_other_types_round_trip() {
+        for id in ["yes", "no", "7", "1.0", "null", "on"] {
+            let mut root = parse("");
+            apply_dsh_provider(&mut root, URL, id, false).unwrap();
+            let reparsed = parse(&serde_yaml::to_string(&root).unwrap());
+            let models = route(&reparsed)
+                .get("models")
+                .unwrap()
+                .as_sequence()
+                .unwrap();
+            assert_eq!(models[0].get("id").unwrap().as_str(), Some(id));
+        }
+    }
+
+    #[test]
+    fn is_idempotent() {
+        let fixture = "other:\n  a: 1\nllm-pi-ai:\n  providers:\n    openai: {}\n";
+        let mut once = parse(fixture);
+        apply_dsh_provider(&mut once, URL, "m", true).unwrap();
+        let mut twice = once.clone();
+        apply_dsh_provider(&mut twice, URL, "m", true).unwrap();
+        assert_eq!(
+            serde_yaml::to_string(&once).unwrap(),
+            serde_yaml::to_string(&twice).unwrap()
+        );
+    }
+
+    #[test]
+    fn dsh_home_falls_back_and_expands_tilde() {
+        let home = Path::new("/Users/tester");
+        assert_eq!(
+            dsh_home_from(None, home),
+            PathBuf::from("/Users/tester/.dsh")
+        );
+        assert_eq!(
+            dsh_home_from(Some("   "), home),
+            PathBuf::from("/Users/tester/.dsh")
+        );
+        assert_eq!(
+            dsh_home_from(Some("/opt/dsh"), home),
+            PathBuf::from("/opt/dsh")
+        );
+        // A quoted `DSH_HOME="~/dev/dsh"` in an rc file reaches us unexpanded.
+        assert_eq!(
+            dsh_home_from(Some("~/dev/dsh"), home),
+            PathBuf::from("/Users/tester/dev/dsh")
+        );
+        assert_eq!(
+            dsh_home_from(Some("~"), home),
+            PathBuf::from("/Users/tester")
+        );
+    }
+
+    #[test]
+    fn rejects_credentials_a_dotenv_line_cannot_carry() {
+        assert!(dsh_validate_env_value(DSH_KEY_ENV, "sk-plain-value").is_ok());
+        for bad in ["has space", "two\nlines", "hash#comment", "quo'te"] {
+            let err = dsh_validate_env_value(DSH_KEY_ENV, bad).unwrap_err();
+            assert!(err.contains(DSH_KEY_ENV));
+            assert!(!err.contains(bad), "the error must never echo the value");
+        }
+    }
+}
+
+#[cfg(test)]
+mod atomic_agent_tests {
+    use super::*;
+
+    const URL: &str = "http://127.0.0.1:1337/v1";
+
+    fn patch(input: serde_json::Value) -> serde_json::Value {
+        atomic_agent_patch_config(input, URL, "qwen3-4b", Some("")).expect("merge must succeed")
+    }
+
+    fn provider<'a>(root: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+        root["llm"]["providers"]
+            .as_array()
+            .expect("providers must be an array")
+            .iter()
+            .find(|p| p["id"] == id)
+            .unwrap_or_else(|| panic!("no provider {id}"))
+    }
+
+    /// A fresh install has no `config.json` at all. The block we create has to
+    /// validate on its own — including `activeEmbeddingProvider`, which the
+    /// agent rejects when it names a provider that is not in the list.
+    #[test]
+    fn seeds_a_self_consistent_block_from_nothing() {
+        let out = patch(serde_json::json!({}));
+        assert_eq!(out["llm"]["activeTextProvider"], ATOMIC_AGENT_PROVIDER_ID);
+        assert_eq!(
+            out["llm"]["activeEmbeddingProvider"],
+            ATOMIC_AGENT_LOCAL_PROVIDER_ID
+        );
+
+        let ours = provider(&out, ATOMIC_AGENT_PROVIDER_ID);
+        assert_eq!(ours["kind"], "openai-compatible");
+        assert_eq!(ours["baseUrl"], URL);
+        assert_eq!(ours["defaultChatModel"], "qwen3-4b");
+        // An empty server key must not reach the file: the OpenAI-compatible
+        // transport sends it as a bearer token.
+        assert_eq!(ours["apiKey"], "atomic");
+        assert_eq!(
+            ours["requestTimeoutMs"],
+            serde_json::json!(ATOMIC_AGENT_REQUEST_TIMEOUT_MS)
+        );
+
+        // The seeded llama-server entry follows the user's own local URL.
+        let local = provider(&out, ATOMIC_AGENT_LOCAL_PROVIDER_ID);
+        assert_eq!(local["kind"], "llama-server");
+        assert_eq!(local["url"], ATOMIC_AGENT_DEFAULT_LLAMA_URL);
+    }
+
+    #[test]
+    fn seeded_llama_entry_follows_local_models_url() {
+        let out = patch(serde_json::json!({
+            "localModels": { "url": "http://127.0.0.1:9999" }
+        }));
+        assert_eq!(
+            provider(&out, ATOMIC_AGENT_LOCAL_PROVIDER_ID)["url"],
+            "http://127.0.0.1:9999"
+        );
+    }
+
+    /// Under `mode: "managed"` the agent ignores `localModels.url` and talks to
+    /// the daemon on `managed.port`, so the seeded entry has to as well.
+    #[test]
+    fn seeded_llama_entry_is_managed_mode_aware() {
+        let out = patch(serde_json::json!({
+            "localModels": { "url": "http://127.0.0.1:9999", "mode": "managed",
+                             "managed": { "port": 20002 } }
+        }));
+        assert_eq!(
+            provider(&out, ATOMIC_AGENT_LOCAL_PROVIDER_ID)["url"],
+            "http://127.0.0.1:20002"
+        );
+
+        // `managed` without an explicit port falls back to the agent's default.
+        let out = patch(serde_json::json!({
+            "localModels": { "url": "http://127.0.0.1:9999", "mode": "managed" }
+        }));
+        assert_eq!(
+            provider(&out, ATOMIC_AGENT_LOCAL_PROVIDER_ID)["url"],
+            format!("http://127.0.0.1:{ATOMIC_AGENT_DEFAULT_MANAGED_PORT}")
+        );
+    }
+
+    /// Chat and embeddings are two different daemons. The embedding path
+    /// resolves a provider entry as `baseUrl ?? url`
+    /// (`src/memory/embeddings/embedding-provider-registry.ts`), so an entry
+    /// carrying only `url` would send embeddings to the chat server the moment
+    /// we create the `llm` block. `baseUrl` therefore mirrors the branch the
+    /// agent uses for a file with no `llm` block at all:
+    /// `embeddings.enabled ? embeddings.url : localModels.url`.
+    #[test]
+    fn seeded_llama_entry_keeps_embeddings_on_the_embeddings_daemon() {
+        let base_url = |local_models: serde_json::Value| {
+            patch(serde_json::json!({ "localModels": local_models }))["llm"]["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == ATOMIC_AGENT_LOCAL_PROVIDER_ID)
+                .expect("local-llama must be seeded")["baseUrl"]
+                .as_str()
+                .expect("baseUrl must be written")
+                .to_string()
+        };
+
+        // Daemon off: embeddings ride the chat URL, exactly as today.
+        assert_eq!(
+            base_url(serde_json::json!({})),
+            ATOMIC_AGENT_DEFAULT_LLAMA_URL
+        );
+        assert_eq!(
+            base_url(serde_json::json!({ "url": "http://127.0.0.1:9000" })),
+            "http://127.0.0.1:9000"
+        );
+        assert_eq!(
+            base_url(serde_json::json!({ "mode": "managed", "managed": { "port": 20001 } })),
+            "http://127.0.0.1:20001"
+        );
+
+        // Daemon on: embeddings stay on the daemon, in either mode.
+        assert_eq!(
+            base_url(serde_json::json!({
+                "embeddings": { "enabled": true, "url": "http://127.0.0.1:19092" }
+            })),
+            "http://127.0.0.1:19092"
+        );
+        assert_eq!(
+            base_url(serde_json::json!({
+                "mode": "managed",
+                "embeddings": { "enabled": true, "url": "http://127.0.0.1:19092" }
+            })),
+            "http://127.0.0.1:19092"
+        );
+        // A port with no url: the agent derives the url from it, so we do too.
+        assert_eq!(
+            base_url(serde_json::json!({
+                "embeddings": { "enabled": true, "port": 20500 }
+            })),
+            "http://127.0.0.1:20500"
+        );
+        assert_eq!(
+            base_url(serde_json::json!({ "embeddings": { "enabled": true } })),
+            format!("http://127.0.0.1:{ATOMIC_AGENT_DEFAULT_EMBEDDINGS_PORT}")
+        );
+    }
+
+    /// The model is validated trimmed, so it has to be stored trimmed as well —
+    /// otherwise `" qwen "` reaches the file and the agent asks the server for
+    /// a model no server has.
+    #[test]
+    fn writes_the_model_trimmed() {
+        let out = atomic_agent_patch_config(serde_json::json!({}), URL, "  qwen3-4b\n", None)
+            .expect("merge must succeed");
+        assert_eq!(
+            provider(&out, ATOMIC_AGENT_PROVIDER_ID)["defaultChatModel"],
+            "qwen3-4b"
+        );
+    }
+
+    /// The file is the agent's trust surface: everything we did not come for
+    /// survives verbatim, including blocks this build has never heard of.
+    #[test]
+    fn preserves_other_blocks_and_providers() {
+        let out = patch(serde_json::json!({
+            "version": 44,
+            "agent": { "approvalLevel": 3 },
+            "somethingNewer": { "keep": true },
+            "llm": {
+                "activeTextProvider": "openrouter",
+                "activeEmbeddingProvider": "openrouter",
+                "toolTransport": "grammar",
+                "providers": [
+                    { "id": "openrouter", "kind": "openrouter", "apiKey": "sk-user" }
+                ]
+            }
+        }));
+        assert_eq!(out["version"], 44);
+        assert_eq!(out["agent"]["approvalLevel"], 3);
+        assert_eq!(out["somethingNewer"]["keep"], true);
+        // The user's own provider and their tool transport are untouched…
+        assert_eq!(provider(&out, "openrouter")["apiKey"], "sk-user");
+        assert_eq!(out["llm"]["toolTransport"], "grammar");
+        // …and embeddings stay where they were: Run selects a chat provider.
+        assert_eq!(out["llm"]["activeEmbeddingProvider"], "openrouter");
+        // …but the text provider switches, because that is what Run means.
+        assert_eq!(out["llm"]["activeTextProvider"], ATOMIC_AGENT_PROVIDER_ID);
+    }
+
+    /// Re-running Run must not multiply entries, and must not clobber a
+    /// timeout the user tuned on our own provider.
+    #[test]
+    fn upsert_is_idempotent_and_keeps_a_tuned_timeout() {
+        let first = patch(serde_json::json!({}));
+        let mut tuned = first.clone();
+        tuned["llm"]["providers"][1]["requestTimeoutMs"] = serde_json::json!(60_000);
+
+        let out = atomic_agent_patch_config(tuned, URL, "gemma-4-12b", Some("sk-local"))
+            .expect("merge must succeed");
+        let providers = out["llm"]["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 2, "one entry per provider id");
+
+        let ours = provider(&out, ATOMIC_AGENT_PROVIDER_ID);
+        assert_eq!(ours["requestTimeoutMs"], serde_json::json!(60_000));
+        assert_eq!(ours["defaultChatModel"], "gemma-4-12b");
+        assert_eq!(ours["apiKey"], "sk-local");
+    }
+
+    /// A dangling or absent `activeEmbeddingProvider` would make the agent
+    /// reject the whole file, so it is repaired rather than carried forward —
+    /// and the repair lands on the agent's own `local-llama` default, seeding
+    /// that entry when the file does not already carry it. Repairing toward
+    /// `atomic-chat` would hand memory recall to Atomic Chat, which is exactly
+    /// what this writer refuses to do.
+    #[test]
+    fn repairs_a_dangling_embedding_provider_to_local_llama() {
+        for llm in [
+            serde_json::json!({
+                "activeEmbeddingProvider": "deleted-provider",
+                "providers": [{ "id": "groq", "kind": "openai-compatible" }]
+            }),
+            // Absent entirely, with a non-empty provider list — so the
+            // empty-array seed above never fires.
+            serde_json::json!({
+                "providers": [{ "id": "groq", "kind": "openai-compatible" }]
+            }),
+        ] {
+            let out = patch(serde_json::json!({ "llm": llm }));
+            assert_eq!(
+                out["llm"]["activeEmbeddingProvider"],
+                ATOMIC_AGENT_LOCAL_PROVIDER_ID
+            );
+            assert_eq!(
+                provider(&out, ATOMIC_AGENT_LOCAL_PROVIDER_ID)["kind"],
+                "llama-server",
+                "the repair target has to be listed, not just named"
+            );
+        }
+    }
+
+    /// An embedding provider the user actually has is theirs; Run selects a
+    /// chat provider and nothing else.
+    #[test]
+    fn leaves_a_working_embedding_selection_alone() {
+        let out = patch(serde_json::json!({
+            "llm": {
+                "activeEmbeddingProvider": "groq",
+                "providers": [{ "id": "groq", "kind": "openai-compatible" }]
+            }
+        }));
+        assert_eq!(out["llm"]["activeEmbeddingProvider"], "groq");
+        assert!(
+            out["llm"]["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["id"] != ATOMIC_AGENT_LOCAL_PROVIDER_ID),
+            "no reason to seed local-llama when the selection already works"
+        );
+    }
+
+    /// `toolTransport` is deliberately not written: the agent defaults an
+    /// absent one to `"auto"` itself, so writing it would only add a key.
+    #[test]
+    fn never_writes_tool_transport() {
+        let out = patch(serde_json::json!({}));
+        assert!(out["llm"].get("toolTransport").is_none());
+
+        let out = patch(serde_json::json!({ "llm": { "toolTransport": "grammar" } }));
+        assert_eq!(out["llm"]["toolTransport"], "grammar");
+    }
+
+    /// The agent's `parseOptionalString` rejects `""` rather than treating it
+    /// as absent, so an empty model would take the whole file down at its next
+    /// start. Fail before writing instead.
+    #[test]
+    fn refuses_to_write_an_empty_model() {
+        assert!(atomic_agent_patch_config(serde_json::json!({}), URL, "  ", None).is_err());
+    }
+
+    #[test]
+    fn rejects_a_config_file_that_is_not_an_object() {
+        assert!(atomic_agent_patch_config(serde_json::json!([]), URL, "m", None).is_err());
     }
 }

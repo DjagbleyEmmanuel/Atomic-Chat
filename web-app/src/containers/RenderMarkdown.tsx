@@ -10,11 +10,7 @@ import {
 import { cn, disableIndentedCodeBlockPlugin } from '@/lib/utils'
 import { closeUnclosedCodeFence } from '@/lib/code-fence'
 import { ttftEnabled, ttftMark, ttftReport } from '@/lib/ttft-timing'
-import { CodeBlock } from '@/components/ai-elements/code-block'
-import {
-  type BundledLanguage,
-  bundledLanguagesInfo,
-} from 'shiki'
+import { resolveCodeBlockFileName } from '@/lib/codeBlockFilename'
 // import 'katex/dist/katex.min.css'
 import {
   defaultRehypePlugins,
@@ -30,7 +26,7 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import { MermaidError } from '@/components/MermaidError'
-import { ArtifactTrigger } from './ArtifactPanel'
+import { ArtifactStreamingProvider, ArtifactTrigger } from './ArtifactPanel'
 import type { MessageDisplayMode } from '@/hooks/useInterfaceSettings'
 
 interface MarkdownProps {
@@ -60,12 +56,6 @@ const REHYPE_PLUGINS_WITH_RAW_HTML = [
 ]
 const STREAMDOWN_PLUGINS = { code, mermaid, cjk }
 const STREAMDOWN_CONTROLS = { mermaid: { fullscreen: false } }
-
-// Shiki resolves language ids and aliases; unknown langs make codeToHtml throw,
-// so only highlight when the fence's info string maps to a real bundled lang.
-const SHIKI_LANG_IDS = new Set<string>(
-  bundledLanguagesInfo.flatMap((info) => [info.id, ...(info.aliases ?? [])])
-)
 
 /** Pick a fence longer than any backtick run inside the code. */
 function makeFence(source: string): string {
@@ -206,10 +196,13 @@ function RenderMarkdownComponent({
   }, [messageId])
 
   useEffect(() => {
-    if (content.length > 0 && !thetaMarked.current && ttftEnabled()) {
+    // The mark is unconditional so `ttft_render_ms` (how long the UI lags
+    // behind the first token) reaches analytics in shipped builds; only the
+    // developer console table stays behind the dev gate.
+    if (content.length > 0 && !thetaMarked.current) {
       thetaMarked.current = true
       ttftMark('thetaFirstRender')
-      ttftReport('first-visible-render')
+      if (ttftEnabled()) ttftReport('first-visible-render')
     }
   }, [content, messageId])
 
@@ -278,31 +271,34 @@ function RenderMarkdownComponent({
       const codeText = extractCodeText(children)
 
       if (HTML_LANGUAGES.has(language)) {
-        // Show the code highlighted inline (Shiki) AND keep the artifact
-        // preview trigger, so HTML never appears as plain white text in chat.
-        return (
-          <div className="my-2 space-y-2">
-            <CodeBlock
-              code={codeText}
-              language={
-                SHIKI_LANG_IDS.has(language)
-                  ? (language as BundledLanguage)
-                  : 'html'
-              }
-            />
-            <ArtifactTrigger code={codeText} streaming={!!isStreaming} />
-          </div>
-        )
+        // `streaming` arrives through context: keeping it out of this closure
+        // is what lets `CodeRenderer` keep one identity for the whole message.
+        return <ArtifactTrigger code={codeText} />
       }
 
       // Delegate every other code block (incl. mermaid) to streamdown.
+      //
+      // The fence is rebuilt from the language alone, which drops the info
+      // string — and with it the filename the model gave the file. Recover it
+      // from the hast node before delegating and publish it on a wrapper, so
+      // the download handler can save `styles.css` instead of `file.css`
+      // (issue #255).
+      const fileName = resolveCodeBlockFileName({
+        meta: (node?.data as { meta?: string } | undefined)?.meta,
+        code: codeText,
+        language,
+      })
       const fence = makeFence(codeText)
       const reconstructed = `${fence}${match?.[1] ?? ''}\n${codeText}\n${fence}`
-      return <Streamdown {...delegateProps}>{reconstructed}</Streamdown>
+      return (
+        <div data-code-filename={fileName ?? undefined}>
+          <Streamdown {...delegateProps}>{reconstructed}</Streamdown>
+        </div>
+      )
     }
 
     return { code: CodeRenderer, ...(components ?? {}) }
-  }, [enableHtmlPreview, components, delegateProps, isStreaming])
+  }, [enableHtmlPreview, components, delegateProps])
 
   const containsMath =
     normalizedContent.includes('$$') ||
@@ -372,26 +368,27 @@ function RenderMarkdownComponent({
         className
       )}
     >
-      <Streamdown
-        mode={isStreaming ? 'streaming' : 'static'}
-        animate={isStreaming ? false : isAnimating}
-        animationDuration={500}
-        linkSafety={{
-          enabled: false,
-        }}
-        className={cn(
-          'size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0',
-          className
-        )}
-        remarkPlugins={REMARK_PLUGINS}
-        rehypePlugins={rehypePlugins}
-        components={mergedComponents}
-        plugins={STREAMDOWN_PLUGINS}
-        controls={STREAMDOWN_CONTROLS}
-        mermaid={mermaidConfig}
-      >
-        {normalizedContent}
-      </Streamdown>
+      <ArtifactStreamingProvider value={!!isStreaming}>
+        <Streamdown
+          animate={isAnimating ?? true}
+          animationDuration={500}
+          linkSafety={{
+            enabled: false,
+          }}
+          className={cn(
+            'size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0',
+            className
+          )}
+          remarkPlugins={REMARK_PLUGINS}
+          rehypePlugins={rehypePlugins}
+          components={mergedComponents}
+          plugins={STREAMDOWN_PLUGINS}
+          controls={STREAMDOWN_CONTROLS}
+          mermaid={mermaidConfig}
+        >
+          {normalizedContent}
+        </Streamdown>
+      </ArtifactStreamingProvider>
     </div>
   )
 }

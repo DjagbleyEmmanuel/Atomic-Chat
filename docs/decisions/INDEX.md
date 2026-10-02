@@ -9,7 +9,7 @@ decision is reversed, add a new one that says which record it supersedes.
 2. Add one line to the right section of this index.
 3. Do **not** paste the record body into `AGENTS.md`.
 
-207 records, 2026-05-19 → 2026-08-14.
+216 records, 2026-05-19 → 2026-08-25.
 
 ---
 
@@ -33,8 +33,11 @@ decision is reversed, add a new one that says which record it supersedes.
 
 ---
 
-## Launch page & external coding agents (14)
+## Launch page & external coding agents (17)
 
+- **2026-08-25** — [Add Atomic Agent as a one-click Launch-page assistant, configured by merging an `openai-compatible` provider into `~/.atomic-agent/config.json`](2026-08-25-add-atomic-agent-as-a-one-click-launch-page-assistant.md)
+- **2026-08-20** — [Narrow `atomic-chat-cli` to models / serve / launch / server status](2026-08-20-narrow-atomic-chat-cli-to-models-serve-launch-and-server-status.md)
+- **2026-08-18** — [Add DeepSeek Harness (`dsh`) as a one-click Launch-page coding agent, configured by merging a hand-declared `llm-pi-ai` route into `$DSH_HOME/settings.yaml`](2026-08-18-add-deepseek-harness-as-a-launch-page-coding-agent.md)
 - **2026-07-07** — [Fall back to the Local API Server's "Current Model" when configuring Launch-page agents against a cloud-provider selection](2026-07-07-fall-back-to-the-local-api-server-s-current-model-when.md)
 - **2026-07-01** — [Fix Hermes Agent config on Windows writing to the wrong file (`%USERPROFILE%\.hermes` vs the installer's real `HERMES_HOME`), plus a stale-registry-env guard](2026-07-01-fix-hermes-agent-config-on-windows-writing-to-the-wrong-file.md)
 - **2026-06-29** — [Refresh PATH (+ npm global prefix) for the Launch-page interactive agent terminal so npm-installed agent shims resolve on Windows from the packaged app](2026-06-29-refresh-path-npm-global-prefix-for-the-launch-page-interactive.md)
@@ -124,8 +127,10 @@ decision is reversed, add a new one that says which record it supersedes.
 - **2026-06-02** — [Surface MLX KV-cache quantization (TurboQuant / uniform) as a provider setting](2026-06-02-surface-mlx-kv-cache-quantization-turboquant-uniform-as-a.md)
 - **2026-05-19** — [Use `AtomicBot-ai/mlx-vlm` as the MLX backend](2026-05-19-use-atomicbot-ai-mlx-vlm-as-the-mlx-backend.md)
 
-## llama.cpp providers & backend selection (49)
+## llama.cpp providers & backend selection (51)
 
+- **2026-08-21** — [Gate CUDA 13 on NVIDIA compute capability, not the driver version alone](2026-08-21-gate-cuda-13-on-nvidia-compute-capability-not-driver-alone.md)
+- **2026-08-19** — [Disable the TurboQuant `llamacpp` provider by default on fresh installs](2026-08-19-disable-the-turboquant-provider-by-default-on-fresh-installs.md)
 - **2026-08-14** — [Keep the engine version out of the `latest/` sentinel trap](2026-08-14-keep-the-engine-version-out-of-the-latest-sentinel-trap.md)
 - **2026-08-13** — [Mirror and sign upstream llama.cpp releases in atomic-chat-conf](2026-08-13-mirror-and-sign-upstream-llama-cpp-in-atomic-chat-conf.md)
 - **2026-08-13** — [Add Windows ROCm to the upstream backend matrix](2026-08-13-add-windows-rocm-to-the-upstream-backend-matrix.md)
@@ -176,8 +181,12 @@ decision is reversed, add a new one that says which record it supersedes.
 - **2026-05-19** — [Use `AtomicBot-ai/atomic-llama-cpp-turboquant` as the LLM backend](2026-05-19-use-atomicbot-ai-atomic-llama-cpp-turboquant-as-the-llm-backend.md)
 - **2026-05-19** — [Ship upstream `ggml-org/llama.cpp` as a second macOS provider, no fork](2026-05-19-ship-upstream-ggml-org-llama-cpp-as-a-second-macos-provider-no.md)
 
-## Models, Hub & downloads (23)
+## Models, Hub & downloads (27)
 
+- **2026-08-19** — [Do not preload a model on startup](2026-08-19-do-not-preload-a-model-on-startup.md)
+- **2026-08-19** — [Offer a low-spec model tier in onboarding](2026-08-19-offer-a-low-spec-model-tier-in-onboarding.md)
+- **2026-08-19** — [Delete only what a failed download wrote](2026-08-19-delete-only-what-a-failed-download-wrote.md)
+- **2026-08-18** — [Delete an installed model from the Hub download panel](2026-08-18-delete-an-installed-model-from-the-hub-download-panel.md)
 - **2026-08-14** — [Build the Hub "Installed on this device" list from the provider registry](2026-08-14-build-the-hub-installed-filter-from-the-provider-registry.md)
 - **2026-08-14** — [Recommend our own Gemma 4 E2B build in onboarding](2026-08-14-recommend-our-own-gemma-4-e2b-build-in-onboarding.md)
 - **2026-08-14** — [Open the Hub recommendations with a promoted head ahead of the family grouping](2026-08-14-open-the-hub-recommendations-with-a-promoted-head.md)
@@ -208,16 +217,19 @@ decision is reversed, add a new one that says which record it supersedes.
 - **2026-07-15** — [Aggregate Local API Server request telemetry into three-minute summaries (ATO-297)](2026-07-15-aggregate-local-api-server-request-telemetry-into-three-minute.md)
 - **2026-06-09** — [Make the Local API Server "Invalid host header" rejection actionable + fix Trusted Hosts field copy (ATO-118, scope I+II)](2026-06-09-make-the-local-api-server-invalid-host-header-rejection.md)
 
-## Telemetry, crash reporting & error handling (5)
+## Telemetry, crash reporting & error handling (7)
 
+- **2026-08-17** — [Rename the string `status` property that PostHog had globally typed numeric, which silently hid ~63k events](2026-08-17-rename-the-string-status-property-that-posthog-had-typed-numeric.md)
+- **2026-08-17** — [Track LLM response outcomes (`chat_response_received`) and close the onboarding funnel's blind spots](2026-08-17-track-llm-response-outcomes-and-close-onboarding-funnel-gaps.md)
 - **2026-08-03** — [Triage the Sentry backlog: fix real defects and stop reporting recoverable failures as crashes](2026-08-03-triage-the-sentry-backlog-fix-real-defects-and-stop.md)
 - **2026-07-31** — [Use a valid ADL2 context for Windows AMD VRAM monitoring](2026-07-31-use-a-valid-adl2-context-for-windows-amd-vram-monitoring.md)
 - **2026-06-11** — [ATO-135 (web-app slice): clear the stuck "Failed to load" toast on a successful load (ATO-63) + map classified engine errors to actionable messages (ATO-121)](2026-06-11-ato-135-web-app-slice-clear-the-stuck-failed-to-load-toast-on-a.md)
 - **2026-06-10** — [Throttle crashloop `model_load` failure spam client-side; confirm `model_load.status` / api 404-noise are already-fixed-pending-rollout, not code bugs (ATO-130: ATO-133 + ATO-131 + ATO-132)](2026-06-10-throttle-crashloop-model-load-failure-spam-client-side-confirm.md)
 - **2026-06-09** — [Add zero-PII Sentry crash/error tracking to both the React frontend and the Rust/Tauri desktop, gated behind `productAnalytic` (ATO-113)](2026-06-09-add-zero-pii-sentry-crash-error-tracking-to-both-the-react.md)
 
-## Packaging, installers, autostart & platform policy (12)
+## Packaging, installers, autostart & platform policy (13)
 
+- **2026-08-19** — [Leave launch at startup off for new installs](2026-08-19-leave-launch-at-startup-off-for-new-installs.md)
 - **2026-08-05** — [Default autostart on only for clean desktop installs](2026-08-05-default-autostart-on-only-for-clean-desktop-installs.md)
 - **2026-08-05** — [Keep launch at startup opt-in and ignore development binaries](2026-08-05-keep-launch-at-startup-opt-in-and-ignore-development-binaries.md)
 - **2026-08-03** — [Disable WebKit DMABUF rendering on Linux](2026-08-03-disable-webkit-dmabuf-rendering-on-linux.md)
@@ -231,8 +243,12 @@ decision is reversed, add a new one that says which record it supersedes.
 - **2026-05-22** — [Pin static WiX `upgradeCode` to legacy Jan UUID for in-place MSI upgrades](2026-05-22-pin-static-wix-upgradecode-to-legacy-jan-uuid-for-in-place-msi.md)
 - **2026-05-19** — [Product identity is "Atomic Chat"; new code stops carrying Jan branding](2026-05-19-product-identity-is-atomic-chat-new-code-stops-carrying-jan.md)
 
-## UI / UX (26)
+## UI / UX (23)
 
+- **2026-08-21** — [Never list TurboQuant next to upstream llama.cpp](2026-08-21-never-list-turboquant-next-to-upstream-llama-cpp.md)
+- **2026-08-21** — [Keep attachments when a message is edited in a chat thread](2026-08-21-keep-attachments-when-a-message-is-edited-in-a-chat-thread.md)
+- **2026-08-21** — [Edit messages inline in the transcript instead of in a modal dialog](2026-08-21-edit-messages-inline-in-the-transcript-instead-of-a-modal.md)
+- **2026-08-19** — [Let onboarding connect a cloud provider](2026-08-19-let-onboarding-connect-a-cloud-provider.md)
 - **2026-08-14** — [Show the streaming code while an HTML artifact generates](2026-08-14-show-the-streaming-code-while-an-html-artifact-generates.md)
 - **2026-08-14** — [Collapse the engine log behind a toggle in the model-load toast](2026-08-14-collapse-the-engine-log-behind-a-toggle-in-the-model-load-toast.md)
 - **2026-08-13** — [Move sampling back onto each assistant (per-assistant sampler, popover stays the only editor)](2026-08-13-move-sampling-back-onto-each-assistant.md)
@@ -260,8 +276,9 @@ decision is reversed, add a new one that says which record it supersedes.
 - **2026-06-11** — [Add a unified "Sampling — {assistant}" popover (assistant switcher + sampling params in one place) (ATO-155)](2026-06-11-add-a-unified-sampling-assistant-popover-assistant-switcher.md)
 - **2026-06-10** — [Render inline image (`file`) parts in the chat thread bubble (ATO-120)](2026-06-10-render-inline-image-file-parts-in-the-chat-thread-bubble-ato-120.md)
 
-## Other (9)
+## Other (10)
 
+- **2026-08-21** — [Strip every non-image file part before the model converter](2026-08-21-strip-every-non-image-file-part-before-the-model-converter.md)
 - **2026-07-31** — [Surface MCP server runtime errors (ATO-385)](2026-07-31-surface-mcp-server-runtime-errors.md)
 - **2026-07-31** — [Fallback between HTTP-based MCP transports (ATO-384, ATO-385)](2026-07-31-fallback-between-http-based-mcp-transports.md)
 - **2026-07-29** — [Gate agent changes with local contract evidence](2026-07-29-gate-agent-changes-with-local-contract-evidence.md)

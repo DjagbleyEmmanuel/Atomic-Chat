@@ -125,7 +125,9 @@ export class DefaultModelsService implements ModelsService {
       }))
     )
 
-    return results.filter(({ models }) => Array.isArray(models) && models.length > 0)
+    return results.filter(
+      ({ models }) => Array.isArray(models) && models.length > 0
+    )
   }
 
   private getHuggingFaceHeaders(hfToken?: string): HeadersInit | undefined {
@@ -506,7 +508,10 @@ export class DefaultModelsService implements ModelsService {
     try {
       markDownloadStart(id)
       posthog.capture('model_download', {
-        status: 'started',
+        // NOT `status` — globally typed numeric in PostHog by
+        // `api_server_request.status`, which silently nulls string values.
+        // Must stay in sync with the terminal event in DownloadManagement.
+        download_status: 'started',
         download_kind: 'model',
         model_id: id,
         quant: quantFromModelId(id),
@@ -568,7 +573,17 @@ export class DefaultModelsService implements ModelsService {
   }
 
   async deleteModel(id: string, provider?: string): Promise<void> {
-    return this.getEngine(provider)?.delete(id)
+    const engine = this.getEngine(provider)
+    // `getEngine()?.delete()` used to resolve to `undefined` when the provider
+    // had no engine registered, so the caller reported a successful delete and
+    // the weights stayed on disk. Fail loudly instead — same reasoning as the
+    // `LOCAL_LLAMACPP_PROVIDER` note above.
+    if (!engine) {
+      throw new Error(
+        `No engine registered for provider "${provider ?? defaultProvider}"`
+      )
+    }
+    return engine.delete(id)
   }
 
   async getActiveModels(provider?: string): Promise<string[]> {

@@ -42,15 +42,6 @@ import { setLaunchAtStartup } from '@/lib/launchAtStartup'
 const TOKEN_VALIDATION_TIMEOUT_MS = 10_000
 const ATOMIC_CLI_COMMAND = 'atomic-chat-cli'
 
-function formatAtomicCliDisplayPath(path: string): string {
-  if (/[/\\]jan\.exe$/i.test(path)) {
-    return path.replace(/jan\.exe$/i, 'atomic-chat-cli.exe')
-  }
-  return path.replace(/[/\\]jan$/, (segment) =>
-    segment.replace(/jan$/, ATOMIC_CLI_COMMAND)
-  )
-}
-
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const Route = createFileRoute(route.settings.general as any)({
   component: General,
@@ -162,7 +153,7 @@ function General() {
       setCliPath(s.path)
       toast.success(
         t('settings:general.atomicBotCliInstalledToast', {
-          path: s.path ? formatAtomicCliDisplayPath(s.path) : ATOMIC_CLI_COMMAND,
+          path: s.path ?? ATOMIC_CLI_COMMAND,
         })
       )
     } catch (e) {
@@ -352,6 +343,16 @@ function General() {
                   }
                 />
               )}
+              <CardItem
+                title={t('settings:general.preloadModelOnStartup')}
+                description={t('settings:general.preloadModelOnStartupDesc')}
+                actions={
+                  <Switch
+                    checked={preloadModelOnStartup}
+                    onCheckedChange={setPreloadModelOnStartup}
+                  />
+                }
+              />
             </Card>
 
             <Card title="Contact Us">
@@ -648,7 +649,7 @@ function General() {
                   description={
                     cliInstalled && cliPath
                       ? t('settings:general.atomicBotCliInstalled', {
-                          path: formatAtomicCliDisplayPath(cliPath),
+                          path: cliPath,
                         })
                       : t('settings:general.atomicBotCliNotInstalled')
                   }
@@ -705,16 +706,6 @@ function General() {
                   <Switch
                     checked={spellCheckChatInput}
                     onCheckedChange={(e) => setSpellCheckChatInput(e)}
-                  />
-                }
-              />
-              <CardItem
-                title="Preload last used model on startup"
-                description="Start the local inference server with your last model when the app opens."
-                actions={
-                  <Switch
-                    checked={preloadModelOnStartup}
-                    onCheckedChange={setPreloadModelOnStartup}
                   />
                 }
               />

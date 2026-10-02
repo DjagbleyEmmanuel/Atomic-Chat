@@ -28,6 +28,8 @@
   "unstar": "Bỏ gắn dấu sao",
   "deleteAll": "Xóa tất cả",
   "star": "Gắn dấu sao",
+  "openInNewWindow": "Mở trong cửa sổ mới",
+  "openInNewWindowFailed": "Không thể mở cuộc trò chuyện này trong cửa sổ mới",
   "rename": "Đổi tên",
   "delete": "Xóa",
   "copied": "Đã sao chép!",
@@ -297,9 +299,6 @@
     },
     "deleteThread": {
       "description": "Bạn có chắc chắn muốn xóa cuộc trò chuyện này không? Hành động này không thể hoàn tác."
-    },
-    "editMessage": {
-      "title": "Chỉnh sửa tin nhắn"
     },
     "messageMetadata": {
       "title": "Siêu dữ liệu tin nhắn"

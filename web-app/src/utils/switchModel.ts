@@ -78,7 +78,13 @@ function emitModelLoad(
   try {
     const settings = args.model?.settings
     const props: Record<string, unknown> = {
-      status,
+      // NOT `status`. PostHog types a property globally by its observed values,
+      // and `api_server_request.status` (an HTTP code) already claimed that
+      // name as numeric — so these strings silently read back as null. That is
+      // why the "model_load.status is currently empty" note has been sitting on
+      // the Models & Errors dashboard: ~42k events of success/failed were
+      // unreadable. Keep this name event-specific.
+      load_status: status,
       model_id: args.modelId,
       backend: loadBackendFromProvider(args.providerName),
       model_source: modelLoadSource(args.modelId),
@@ -196,6 +202,9 @@ const TERMINAL_LOAD_CODES = new Set([
   // A partial / corrupt download (ATO-187) won't fix itself on auto-retry —
   // only a manual re-download resolves it, so don't loop the auto-start.
   'MODEL_FILE_CORRUPT',
+  // A multi-part GGUF missing shards is the same situation: only fetching the
+  // rest of the set fixes it.
+  'MODEL_SHARDS_INCOMPLETE',
   'BINARY_NOT_FOUND',
   // The engine build can't parse this model's architecture/format (e.g. a
   // newer qwen3vl GGUF). Retrying loads the same unsupported file — never auto-retry.
@@ -798,11 +807,21 @@ function isOutOfMemoryError(err: ErrorObject): boolean {
 // The two on-device llama.cpp engines are interchangeable for most models, so
 // when one rejects a model we can point the user at the other. `llamacpp` is the
 // turboquant fork; `llamacpp-upstream` is stock llama.cpp. The turboquant engine
-// only ships on macOS, so it's only a valid suggestion there.
+// only ships on macOS, so it's only a valid suggestion there — and only when
+// the user hasn't deactivated it (it ships disabled on fresh installs).
 function alternateLocalBackend(providerName?: string): string | undefined {
   if (providerName === 'llamacpp') return getProviderTitle('llamacpp-upstream')
-  if (providerName === 'llamacpp-upstream')
-    return IS_MACOS ? getProviderTitle('llamacpp') : undefined
+  // MLX is macOS-only and its arch support is welded to the bundled sidecar,
+  // so a brand-new architecture lands here well before the backend is bumped
+  // (issue #250). The GGUF build of the same model runs on llama.cpp today —
+  // say so, instead of leaving "update the app" as the only advice.
+  if (providerName === 'mlx') return getProviderTitle('llamacpp-upstream')
+  if (providerName === 'llamacpp-upstream') {
+    const fork = useModelProvider.getState().getProviderByName('llamacpp')
+    return IS_MACOS && fork?.active !== false
+      ? getProviderTitle('llamacpp')
+      : undefined
+  }
   return undefined
 }
 
@@ -886,11 +905,13 @@ function reportModelLoadError(
     return
   }
   if (err.code === 'MODEL_ARCH_NOT_SUPPORTED') {
-    toast.error(t('model-errors:archNotSupportedTitle'), {
-      id: 'model-load-error',
+    // The backend names the architecture it choked on, which is the one thing
+    // a bug report needs. Keep it one click away instead of dropping it.
+    showModelLoadErrorToast({
+      title: t('model-errors:archNotSupportedTitle'),
       description: unsupportedDescription(t, 'archNotSupported', providerName),
+      details: splitModelLoadError(err).details,
       duration: 10000,
-      closeButton: true,
     })
     return
   }
@@ -903,7 +924,10 @@ function reportModelLoadError(
     })
     return
   }
-  if (err.code === 'MODEL_FILE_CORRUPT') {
+  // A shard set missing members is an incomplete download by another name, and
+  // the remedy the corrupt-file copy already gives — delete and download again —
+  // is exactly right for it.
+  if (err.code === 'MODEL_FILE_CORRUPT' || err.code === 'MODEL_SHARDS_INCOMPLETE') {
     toast.error(t('model-errors:modelFileCorruptTitle'), {
       id: 'model-load-error',
       description: t('model-errors:modelFileCorruptDescription'),

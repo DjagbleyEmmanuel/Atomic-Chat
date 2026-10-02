@@ -135,6 +135,24 @@ export const INTEGRATION_AGENTS: IntegrationAgent[] = [
     endpointWithPrefix: true,
   },
   {
+    id: 'dsh',
+    name: 'DeepSeek Harness',
+    description: 'Plugin-based open-source agent harness by DeepSeek AI.',
+    kind: 'coding',
+    detectBin: 'dsh',
+    docsUrl: 'https://github.com/deepseek-ai/deepseek-harness',
+    installable: true,
+    configurable: true,
+    // A provider route DeepSeek Harness does not ship in its catalog is only
+    // valid with a non-empty model list, and it rejects the whole `llm-pi-ai`
+    // section when one route is invalid -- so an unset model would take the
+    // user's other providers down with it, not merely fail to help.
+    requiresModel: true,
+    // The route is declared with the `openai-completions` protocol, whose
+    // `baseURL` is expected to already carry the `/v1` prefix.
+    endpointWithPrefix: true,
+  },
+  {
     id: 'zed',
     name: 'Zed',
     description: 'High-performance code editor with a built-in AI agent.',
@@ -219,6 +237,22 @@ export const INTEGRATION_AGENTS: IntegrationAgent[] = [
     configurable: true,
     requiresModel: true,
     endpointWithPrefix: false,
+  },
+  {
+    id: 'atomic-agent',
+    name: 'Atomic Agent',
+    description:
+      'Local-first agent that browses, edits files, and runs commands.',
+    kind: 'assistant',
+    detectBin: 'atomic-agent',
+    docsUrl: 'https://github.com/AtomicBot-ai/atomic-agent',
+    installable: true,
+    configurable: true,
+    requiresModel: true,
+    // Atomic Agent stores an `openai-compatible` provider, whose `baseUrl` is
+    // the OpenAI API root. It normalises a trailing `/v1` away itself, but the
+    // stored value should still read as the base URL the user would paste.
+    endpointWithPrefix: true,
   },
   {
     id: 'hermes',

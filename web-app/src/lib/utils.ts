@@ -23,7 +23,11 @@ export function basenameNoExt(filePath: string): string {
   }
 
   // fallback: remove only the last extension
-  return base.slice(0, -path.extname(base).length)
+  const ext = path.extname(base)
+  if (ext) {
+    return base.slice(0, -ext.length)
+  }
+  return base
 }
 
 /**
@@ -102,7 +106,7 @@ export function getProviderLogo(provider: string) {
     case 'xai':
       return '/images/model-provider/xai.svg'
     case 'minimax':
-      return '/images/model-provider/minimax.svg'
+      return '/svg/minimax.svg'
     case 'nvidia':
       return '/images/model-provider/nvidia.svg'
     case 'moonshot':

@@ -2,6 +2,7 @@ import posthog from 'posthog-js'
 import { useEffect } from 'react'
 
 import { useServiceHub } from '@/hooks/useServiceHub'
+import { createSafeUnlisten } from '@/lib/tauriEvent'
 import { useAnalytic } from '@/hooks/useAnalytic'
 import {
   API_SERVER_REQUEST_EVENT,
@@ -15,6 +16,7 @@ import {
   getAnalyticsPlatform,
   mapGpuVendor,
 } from '@/lib/telemetry'
+import { isFirstLaunch } from '@/lib/onboarding-telemetry'
 import {
   setSentryConsent,
   setSentryTags,
@@ -285,6 +287,10 @@ export function AnalyticProvider() {
           posthog.capture('app_opened', {
             platform: osPlatform,
             app_version: VERSION,
+            // Lets the onboarding funnel be filtered to genuine first sessions.
+            // Derived from persisted state rather than a counter so it stays
+            // correct for users who upgraded from a build without it.
+            is_first_launch: isFirstLaunch(),
           })
 
           // Detached: the device-list probe spawns the backend and can be slow,
@@ -320,12 +326,14 @@ export function AnalyticProvider() {
                 ])
               )
               .then(([unlistenRequest, unlistenSummary]) => {
+                const detachRequest = createSafeUnlisten(unlistenRequest)
+                const detachSummary = createSafeUnlisten(unlistenSummary)
                 if (cancelled) {
-                  unlistenRequest()
-                  unlistenSummary()
+                  void detachRequest()
+                  void detachSummary()
                 } else {
-                  unlistenApiServerRequest = unlistenRequest
-                  unlistenApiServerSummary = unlistenSummary
+                  unlistenApiServerRequest = detachRequest
+                  unlistenApiServerSummary = detachSummary
                 }
               })
               .catch((err) => {
@@ -342,8 +350,8 @@ export function AnalyticProvider() {
 
     return () => {
       cancelled = true
-      unlistenApiServerRequest?.()
-      unlistenApiServerSummary?.()
+      void unlistenApiServerRequest?.()
+      void unlistenApiServerSummary?.()
     }
   }, [productAnalytic, serviceHub])
 

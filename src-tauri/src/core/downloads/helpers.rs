@@ -1,7 +1,7 @@
 use super::models::{DownloadEvent, DownloadItem, ProgressTracker, ProxyConfig};
 use crate::core::app::commands::get_jan_data_folder_path;
 use futures_util::StreamExt;
-use jan_utils::normalize_path;
+use jan_utils::{canonicalize_existing_prefix, normalize_path};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_RANGE, RANGE};
 use std::collections::HashMap;
 use std::path::Path;
@@ -552,7 +552,14 @@ pub async fn _download_files_internal(
         let save_path = jan_data_folder.join(&item.save_path);
         let save_path = normalize_path(&save_path);
 
-        if !save_path.starts_with(&jan_data_folder) {
+        // Compare the paths as the filesystem sees them, not as they were
+        // spelled. On atomic Fedora variants `/home` is a symlink to
+        // `/var/home`, so a target inside the data folder reached under the
+        // other name looked like an escape attempt and blocked the download.
+        let resolved_save_path = canonicalize_existing_prefix(&save_path);
+        let resolved_data_folder = canonicalize_existing_prefix(&jan_data_folder);
+
+        if !resolved_save_path.starts_with(&resolved_data_folder) {
             return Err(format!(
                 "Path {} is outside of Jan data folder {}",
                 save_path.display(),
@@ -646,10 +653,20 @@ pub async fn _download_files_internal(
             .map_err(|e| format!("Validation task join error: {e}"))?;
 
         if let Err(validation_error) = validation_result {
-            // Clean up the file if validation fails
+            // Clean up the file if validation fails. Logged at warn: this is a
+            // deletion of user data (several GB of it, for a model file), and
+            // when a report says "the app removed my model" this line is what
+            // says whether the downloader did it, and to which file.
+            log::warn!(
+                "Validation failed ({validation_error}); removing {}",
+                save_path.display()
+            );
             let _ = tokio::fs::remove_file(&save_path).await;
 
-            // Try to clean up the parent directory if it's empty
+            // Try to clean up the parent directory if it's empty. `remove_dir`
+            // (not `remove_dir_all`) is load-bearing: the directory is shared
+            // with the model's mmproj, drafts and sibling shards, and it must
+            // survive whenever any of them are still there.
             if let Some(parent) = save_path.parent() {
                 let _ = tokio::fs::remove_dir(parent).await;
             }
