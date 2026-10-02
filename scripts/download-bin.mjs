@@ -611,7 +611,11 @@ async function main() {
     const ext = platform === 'darwin' ? 'dylib' : platform === 'win32' ? 'dll' : 'so'
     const targetLibPath = path.join(binDir, `sqlite-vec.${ext}`)
 
-    if (fs.existsSync(targetLibPath)) {
+    // A 0-byte file is a `make` placeholder, not a real library: `make
+    // test-local` touches these paths so the tree builds without the network,
+    // and `existsSync` alone would treat that placeholder as a finished
+    // download and ship an unloadable extension.
+    if (fs.existsSync(targetLibPath) && fs.statSync(targetLibPath).size > 0) {
       console.log(`sqlite-vec already present at ${targetLibPath}`)
     } else {
       let sqlvecUrl = await fetchLatestSqliteVecUrl(platform, os.arch())
