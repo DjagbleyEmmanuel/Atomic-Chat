@@ -1,8 +1,8 @@
 /* eslint-disable react-refresh/only-export-components */
 
-import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
-import { CheckIcon, CopyIcon } from "lucide-react";
+import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/utils'
+import { CheckIcon, CopyIcon } from 'lucide-react'
 import {
   type ComponentProps,
   createContext,
@@ -12,15 +12,15 @@ import {
   useEffect,
   useRef,
   useState,
-} from "react";
-import { type BundledLanguage, codeToHtml, type ShikiTransformer } from "shiki";
-import { useGeneralSetting } from "@/hooks/useGeneralSetting";
+} from 'react'
+import { type BundledLanguage, codeToHtml, type ShikiTransformer } from 'shiki'
+import { useGeneralSetting } from '@/hooks/useGeneralSetting'
 
 type CodeBlockProps = HTMLAttributes<HTMLDivElement> & {
-  code: string;
-  language: BundledLanguage;
-  showLineNumbers?: boolean;
-};
+  code: string
+  language: BundledLanguage
+  showLineNumbers?: boolean
+}
 
 // Highlight cadence for the standalone code block.
 // - HIGHLIGHT_SETTLE_MS: after the code stops changing, one final exact pass.
@@ -39,54 +39,54 @@ const CODE_HIGHLIGHT_CADENCE_MS = {
 } as const;
 
 type CodeBlockContextType = {
-  code: string;
-};
+  code: string
+}
 
 const CodeBlockContext = createContext<CodeBlockContextType>({
-  code: "",
-});
+  code: '',
+})
 
 const lineNumberTransformer: ShikiTransformer = {
-  name: "line-numbers",
+  name: 'line-numbers',
   line(node, line) {
     node.children.unshift({
-      type: "element",
-      tagName: "span",
+      type: 'element',
+      tagName: 'span',
       properties: {
         className: [
-          "inline-block",
-          "min-w-10",
-          "mr-4",
-          "text-right",
-          "text-muted-foreground",
+          'inline-block',
+          'min-w-10',
+          'mr-4',
+          'text-right',
+          'text-muted-foreground',
         ],
       },
-      children: [{ type: "text", value: String(line) }],
-    });
+      children: [{ type: 'text', value: String(line) }],
+    })
   },
-};
+}
 
 export async function highlightCode(
   code: string,
   language: BundledLanguage,
-  showLineNumbers = false,
+  showLineNumbers = false
 ) {
   const transformers: ShikiTransformer[] = showLineNumbers
     ? [lineNumberTransformer]
-    : [];
+    : []
 
   return await Promise.all([
     codeToHtml(code, {
       lang: language,
-      theme: "one-light",
+      theme: 'one-light',
       transformers,
     }),
     codeToHtml(code, {
       lang: language,
-      theme: "one-dark-pro",
+      theme: 'one-dark-pro',
       transformers,
     }),
-  ]);
+  ])
 }
 
 export const CodeBlock = ({
@@ -97,15 +97,15 @@ export const CodeBlock = ({
   children,
   ...props
 }: CodeBlockProps) => {
-  const [html, setHtml] = useState<string>("");
-  const [darkHtml, setDarkHtml] = useState<string>("");
+  const [html, setHtml] = useState<string>('')
+  const [darkHtml, setDarkHtml] = useState<string>('')
   const mounted = useRef(false);
   const highlightToken = useRef(0);
   // Always points at the latest code/language so the streaming interval can
   // highlight the current snapshot without re-running its effect on every token.
   const codeRef = useRef({ code, language, showLineNumbers });
   codeRef.current = { code, language, showLineNumbers };
-  const lastHighlighted = useRef("");
+  const lastHighlighted = useRef('')
 
   const codeLiveHighlight = useGeneralSetting((s) => s.codeLiveHighlight);
   const codeHighlightCadence = useGeneralSetting(
@@ -145,7 +145,7 @@ export const CodeBlock = ({
     // screen while a fresh one computes — swapping in new colours instead of
     // flashing back to plain white for every streamed token.
     highlightToken.current += 1;
-    lastHighlighted.current = "";
+    lastHighlighted.current = ''
 
     // Final pass: highlight once the stream goes quiet, guaranteeing an exact
     // result that matches the finished code (the interval below only fires
@@ -254,14 +254,14 @@ export const CodeBlock = ({
         </div>
       </div>
     </CodeBlockContext.Provider>
-  );
-};
+  )
+}
 
 export type CodeBlockCopyButtonProps = ComponentProps<typeof Button> & {
-  onCopy?: () => void;
-  onError?: (error: Error) => void;
-  timeout?: number;
-};
+  onCopy?: () => void
+  onError?: (error: Error) => void
+  timeout?: number
+}
 
 export const CodeBlockCopyButton = ({
   onCopy,
@@ -271,30 +271,30 @@ export const CodeBlockCopyButton = ({
   className,
   ...props
 }: CodeBlockCopyButtonProps) => {
-  const [isCopied, setIsCopied] = useState(false);
-  const { code } = useContext(CodeBlockContext);
+  const [isCopied, setIsCopied] = useState(false)
+  const { code } = useContext(CodeBlockContext)
 
   const copyToClipboard = async () => {
-    if (typeof window === "undefined" || !navigator?.clipboard?.writeText) {
-      onError?.(new Error("Clipboard API not available"));
-      return;
+    if (typeof window === 'undefined' || !navigator?.clipboard?.writeText) {
+      onError?.(new Error('Clipboard API not available'))
+      return
     }
 
     try {
-      await navigator.clipboard.writeText(code);
-      setIsCopied(true);
-      onCopy?.();
-      setTimeout(() => setIsCopied(false), timeout);
+      await navigator.clipboard.writeText(code)
+      setIsCopied(true)
+      onCopy?.()
+      setTimeout(() => setIsCopied(false), timeout)
     } catch (error) {
-      onError?.(error as Error);
+      onError?.(error as Error)
     }
-  };
+  }
 
-  const Icon = isCopied ? CheckIcon : CopyIcon;
+  const Icon = isCopied ? CheckIcon : CopyIcon
 
   return (
     <Button
-      className={cn("shrink-0", className)}
+      className={cn('shrink-0', className)}
       onClick={copyToClipboard}
       size="icon"
       variant="ghost"
@@ -302,5 +302,5 @@ export const CodeBlockCopyButton = ({
     >
       {children ?? <Icon size={14} />}
     </Button>
-  );
-};
+  )
+}

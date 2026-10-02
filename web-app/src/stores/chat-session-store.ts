@@ -3,9 +3,13 @@ import { create } from "zustand";
 import type { Chat, UIMessage } from "@ai-sdk/react";
 import type { ChatStatus } from "ai";
 import { CustomChatTransport } from "@/lib/custom-chat-transport";
-import { notifyThreadCompleted } from "@/lib/notifications";
-import { useThreadNotifications } from "@/hooks/useThreadNotifications";
+import {
+  desktopNotificationsEnabled,
+  isWindowAway,
+  showDesktopNotification,
+} from "@/lib/notifications";
 import { useThreadReadStatus } from "@/stores/thread-read-store";
+import { useThreadNotifications } from "@/hooks/useThreadNotifications";
 import i18n from "@/i18n/setup";
 
 export type SessionData = {
@@ -50,6 +54,15 @@ const STREAMING_STATUSES: ChatStatus[] = [
 // Pure helper function for checking if a session is busy (for reactive use in components)
 export function isSessionBusy(session: ChatSession | undefined): boolean {
   return session?.isStreaming || (session?.data?.tools?.length ?? 0) > 0;
+}
+
+/**
+ * `true` while any chat session is streaming or still running tool calls.
+ * Model auto-switch paths use it to avoid unloading an engine that is in the
+ * middle of answering (a `stopAllModels` mid-stream SIGKILLs the server).
+ */
+export function isAnyChatBusy(): boolean {
+  return Object.values(useChatSessions.getState().sessions).some(isSessionBusy);
 }
 
 const createSessionData = (): SessionData => ({
@@ -162,19 +175,8 @@ export const useChatSessions = create<ChatSessionState>((set, get) => ({
       if (justFinished) {
         const hasMessages = existing.chat.messages.length > 0;
         const hasPendingTools = existing.data.tools.length > 0;
-        const hasDocument = typeof document !== "undefined";
-        const isVisible = hasDocument
-          ? document.visibilityState === "visible"
-          : true;
-        // On macOS a background Tauri window stays "visible"; use hasFocus()
-        // to detect the user switching to another app.
-        const hasFocus = hasDocument
-          ? typeof document.hasFocus === "function"
-            ? document.hasFocus()
-            : true
-          : true;
         const notFocusedHere =
-          !isVisible || !hasFocus || state.activeConversationId !== sessionId;
+          isWindowAway() || state.activeConversationId !== sessionId;
         // Treat undefined (pre-feature or lost during rehydration) as ON, so
         // the master switch only suppresses notifications when explicitly OFF.
         const globallyEnabled =
@@ -186,6 +188,7 @@ export const useChatSessions = create<ChatSessionState>((set, get) => ({
         if (
           globallyEnabled &&
           !threadMuted &&
+          desktopNotificationsEnabled() &&
           hasMessages &&
           !hasPendingTools &&
           notFocusedHere
@@ -198,7 +201,7 @@ export const useChatSessions = create<ChatSessionState>((set, get) => ({
             "settings:threadNotifications.notificationBody",
             { title: threadTitle }
           );
-          void notifyThreadCompleted(notificationTitle, notificationBody);
+          void showDesktopNotification(notificationTitle, notificationBody);
         }
 
         if (

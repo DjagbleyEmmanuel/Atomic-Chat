@@ -360,6 +360,76 @@ describe('useModelProvider - displayName functionality', () => {
       result.current.selectedModel?.settings?.ctx_len?.controller_props?.value
     ).toBe(32768)
   })
+
+  it.each([
+    {
+      name: 'subscription catalogue is removed',
+      provider: {
+        provider: 'chatgpt',
+        active: true,
+        api_key: '',
+        models: [{ id: 'gpt-5.1-codex', capabilities: ['completion'] }],
+        settings: [],
+      },
+      update: { models: [] },
+    },
+    {
+      name: 'cloud API key is removed',
+      provider: {
+        provider: 'openai',
+        active: true,
+        api_key: 'sk-test',
+        models: [{ id: 'gpt-5', capabilities: ['completion'] }],
+        settings: [{ key: 'api-key' }],
+      },
+      update: { api_key: '' },
+    },
+  ])(
+    'clears the provider and model together when $name',
+    ({ provider, update }) => {
+      const { result } = renderHook(() => useModelProvider())
+
+      act(() => {
+        useModelProvider.setState({
+          providers: [provider] as ModelProvider[],
+          selectedProvider: provider.provider,
+          selectedModel: provider.models[0] as Model,
+          deletedModels: [],
+        })
+        result.current.updateProvider(
+          provider.provider,
+          update as Partial<ModelProvider>
+        )
+      })
+
+      expect(result.current.selectedModel).toBeNull()
+      expect(result.current.selectedProvider).toBe('')
+    }
+  )
+
+  it('clears the provider when a refresh removes the selected model', () => {
+    const { result } = renderHook(() => useModelProvider())
+    const provider = {
+      provider: 'llamacpp-upstream',
+      active: true,
+      persist: true,
+      models: [{ id: 'removed.gguf', capabilities: ['completion'] }],
+      settings: [],
+    } as ModelProvider
+
+    act(() => {
+      useModelProvider.setState({
+        providers: [provider],
+        selectedProvider: provider.provider,
+        selectedModel: provider.models[0],
+        deletedModels: [],
+      })
+      result.current.setProviders([{ ...provider, models: [] }])
+    })
+
+    expect(result.current.selectedModel).toBeNull()
+    expect(result.current.selectedProvider).toBe('')
+  })
 })
 
 describe('useModelProvider - turboquant first-registration default', () => {
@@ -432,6 +502,48 @@ describe('useModelProvider - turboquant first-registration default', () => {
     // The user (an existing profile) had turboquant active — the fresh-install
     // default must not flip it off.
     expect(result.current.getProviderByName('llamacpp')?.active).toBe(true)
+  })
+})
+
+describe('useModelProvider - withdrawn providers', () => {
+  beforeEach(() => {
+    seedServiceHub({ path: { sep: () => '/' } as PathService })
+    localStorageMock.getItem.mockReturnValue(null)
+  })
+
+  it('drops the Apple on-device provider an earlier version persisted, and a selection on it', () => {
+    const appleModel = { id: 'apple/on-device', capabilities: ['tools'] }
+    act(() => {
+      useModelProvider.setState({
+        providers: [
+          {
+            provider: 'foundation-models',
+            active: true,
+            persist: true,
+            models: [appleModel],
+            settings: [],
+          },
+          { provider: 'openai', active: true, models: [], settings: [] },
+        ] as any,
+        selectedProvider: 'foundation-models',
+        selectedModel: appleModel as any,
+        deletedModels: [],
+      })
+    })
+    const { result } = renderHook(() => useModelProvider())
+
+    act(() => {
+      result.current.setProviders([
+        { provider: 'llamacpp-upstream', active: true, models: [], settings: [] },
+      ] as any)
+    })
+
+    expect(result.current.providers.map((p) => p.provider)).toEqual([
+      'llamacpp-upstream',
+      'openai',
+    ])
+    expect(result.current.selectedModel).toBeNull()
+    expect(result.current.selectedProvider).toBe('')
   })
 })
 
@@ -605,5 +717,53 @@ describe('useModelProvider migrations', () => {
     expect(migratedState.providers[1].base_url).toBe(
       'https://api.openai.com/v1'
     )
+  })
+
+  it('re-enables cloud providers the user connected but that stayed disabled', () => {
+    // Builds that registered cloud entries `active: false` left them off for
+    // good — `setProviders` preserves the persisted flag, so connecting one
+    // afterwards produced a provider the Cloud page calls connected while the
+    // picker and the proxy registration both ignore it.
+    const persistApi = (useModelProvider as any).persist
+    const migrate = persistApi?.getOptions().migrate as
+      | ((state: unknown, version: number) => any)
+      | undefined
+
+    expect(migrate).toBeDefined()
+
+    const persistedState = {
+      providers: [
+        { provider: 'openai', active: false, api_key: 'sk-test', models: [], settings: [] },
+        { provider: 'anthropic', active: false, api_key: '', models: [], settings: [] },
+        {
+          provider: 'ollama',
+          active: false,
+          api_key: '',
+          base_url: 'http://localhost:11434/v1',
+          models: [],
+          settings: [],
+        },
+        // A local engine the platform disabled: not this migration's business.
+        { provider: 'foundation-models', active: false, persist: true, models: [], settings: [] },
+      ],
+      selectedProvider: 'openai',
+      selectedModel: null,
+      deletedModels: [],
+    }
+
+    const migrated = migrate!(persistedState, 14)
+    const active = Object.fromEntries(
+      migrated.providers.map((p: any) => [p.provider, p.active])
+    )
+
+    expect(active).toEqual({
+      // Connected — a key is intent on its own.
+      openai: true,
+      // Never set up: whatever the user chose stands.
+      anthropic: false,
+      // Keyless loopback with nothing behind it — not proof of a connection.
+      ollama: false,
+      'foundation-models': false,
+    })
   })
 })

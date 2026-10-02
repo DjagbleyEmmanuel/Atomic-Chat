@@ -222,7 +222,7 @@ export const useInterfaceSettings = create<InterfaceSettingsState>()(
             state.fontSize = '16px'
           }
 
-          // Migrate accent: если сохранённый пресет больше не существует — применить единственный
+          // Migrate accent: if the saved preset no longer exists — apply the only one
           const colorExists = ACCENT_COLORS.some((c) => c.value === state.accentColor)
           if (!colorExists) {
             state.accentColor = DEFAULT_ACCENT_COLOR

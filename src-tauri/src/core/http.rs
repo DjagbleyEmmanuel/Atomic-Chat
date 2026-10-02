@@ -1,5 +1,6 @@
 use futures_util::StreamExt;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tauri::ipc::Channel;
@@ -67,6 +68,38 @@ fn shared_post_client(timeout_secs: u64) -> reqwest::Client {
 #[derive(serde::Serialize, Clone)]
 pub struct HttpStreamChunk {
     pub data: String,
+    /// Set on the one message sent after the last chunk. The end of the stream has to travel on
+    /// the channel itself: the command's own return reaches the webview by another route and can
+    /// overtake chunks still on their way, and a reader that took the return for the end closed a
+    /// short reply — a tool call is two chunks — before any of it had arrived.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub done: bool,
+}
+
+/// The longest prefix of `pending` that is whole UTF-8, as text; what is left in `pending` is the
+/// start of a character whose remaining bytes are in the next network chunk. Decoding each chunk
+/// by itself turned every character cut by a chunk boundary into two replacement characters —
+/// routine for Cyrillic, CJK or emoji in a streamed reply. Bytes that are not UTF-8 at all still
+/// become replacement characters.
+fn take_complete_utf8(pending: &mut Vec<u8>) -> String {
+    match std::str::from_utf8(pending) {
+        Ok(text) => {
+            let text = text.to_owned();
+            pending.clear();
+            text
+        }
+        Err(error) if error.error_len().is_none() => {
+            let rest = pending.split_off(error.valid_up_to());
+            let text = String::from_utf8_lossy(pending).into_owned();
+            *pending = rest;
+            text
+        }
+        Err(_) => {
+            let text = String::from_utf8_lossy(pending).into_owned();
+            pending.clear();
+            text
+        }
+    }
 }
 
 /// Simple non-streaming HTTP POST that returns the full response body as text.
@@ -138,6 +171,42 @@ pub async fn get_local_http(
     Ok(text)
 }
 
+/// Streams currently waiting on or reading a local response. A local server
+/// answers as many requests as it has slots and queues the rest, so a count
+/// well above one when a stream stalls means the wait was spent behind other
+/// requests rather than on a slow model.
+static STREAMS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts one stream for as long as it is alive.
+struct StreamInFlight;
+
+impl StreamInFlight {
+    fn enter() -> Self {
+        STREAMS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for StreamInFlight {
+    fn drop(&mut self) {
+        STREAMS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A stream that stays silent for the whole inactivity budget leaves the user
+/// with a turn that just stops, and was reported nowhere: the error only
+/// travelled back to the webview as a string. `log::error!` makes it a Sentry
+/// event carrying the app log tail; the message stays fixed so every stall
+/// groups into one issue, and the in-flight count goes out just before it as a
+/// breadcrumb.
+fn report_stalled_stream(message: &str) {
+    log::warn!(
+        "[stream] {} local streams in flight (this one included) when it stalled",
+        STREAMS_IN_FLIGHT.load(Ordering::SeqCst)
+    );
+    log::error!("{message}");
+}
+
 /// Streams an HTTP POST response back to the frontend via a Tauri IPC Channel.
 /// Bypasses tauri_plugin_http's fetch interception, which may not properly
 /// bridge ReadableStream for SSE responses in the webview.
@@ -155,6 +224,7 @@ pub async fn stream_local_http(
     timeout_secs: u64,
     on_chunk: Channel<HttpStreamChunk>,
 ) -> Result<u16, String> {
+    let _in_flight = StreamInFlight::enter();
     let configured_secs = timeout_secs;
     let timeout_secs = stream_idle_timeout_secs(timeout_secs);
     // The Settings UI shows the raw configured value, so log both — otherwise
@@ -171,10 +241,14 @@ pub async fn stream_local_http(
     }
     req = req.body(body);
 
-    let response = tokio::time::timeout(idle_timeout, req.send())
-        .await
-        .map_err(|_| format!("Request failed: no response headers within {timeout_secs}s"))?
-        .map_err(|e| format!("Request failed: {e}"))?;
+    let response = match tokio::time::timeout(idle_timeout, req.send()).await {
+        Ok(sent) => sent.map_err(|e| format!("Request failed: {e}"))?,
+        Err(_) => {
+            let message = format!("Request failed: no response headers within {timeout_secs}s");
+            report_stalled_stream(&message);
+            return Err(message);
+        }
+    };
     let status = response.status().as_u16();
 
     if !response.status().is_success() {
@@ -183,20 +257,25 @@ pub async fn stream_local_http(
     }
 
     let mut stream = response.bytes_stream();
+    let mut pending: Vec<u8> = Vec::new();
     loop {
         let next = match tokio::time::timeout(idle_timeout, stream.next()).await {
             Ok(next) => next,
             Err(_) => {
-                return Err(format!(
-                    "Stream error: no data received for {timeout_secs}s"
-                ));
+                let message = format!("Stream error: no data received for {timeout_secs}s");
+                report_stalled_stream(&message);
+                return Err(message);
             }
         };
         let Some(chunk_result) = next else { break };
         match chunk_result {
             Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes).to_string();
-                if let Err(e) = on_chunk.send(HttpStreamChunk { data: text }) {
+                pending.extend_from_slice(&bytes);
+                let text = take_complete_utf8(&mut pending);
+                if text.is_empty() {
+                    continue;
+                }
+                if let Err(e) = on_chunk.send(HttpStreamChunk { data: text, done: false }) {
                     log::debug!("Channel closed by receiver: {e}");
                     break;
                 }
@@ -207,7 +286,38 @@ pub async fn stream_local_http(
         }
     }
 
+    // Whatever is left is a character the server never finished.
+    let tail = String::from_utf8_lossy(&pending).into_owned();
+    if let Err(e) = on_chunk.send(HttpStreamChunk { data: tail, done: true }) {
+        log::debug!("Channel closed by receiver: {e}");
+    }
+
     Ok(status)
+}
+
+#[cfg(test)]
+mod utf8_tests {
+    use super::take_complete_utf8;
+
+    #[test]
+    fn a_character_cut_by_a_chunk_boundary_is_held_until_it_is_whole() {
+        let bytes = "привет 🙂".as_bytes();
+        for cut in 1..bytes.len() {
+            let mut pending = bytes[..cut].to_vec();
+            let mut text = take_complete_utf8(&mut pending);
+            pending.extend_from_slice(&bytes[cut..]);
+            text.push_str(&take_complete_utf8(&mut pending));
+            assert_eq!(text, "привет 🙂", "cut at byte {cut}");
+            assert!(pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_do_not_stall_the_stream() {
+        let mut pending = vec![b'a', 0xff, b'b'];
+        assert_eq!(take_complete_utf8(&mut pending), "a\u{fffd}b");
+        assert!(pending.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -234,5 +344,18 @@ mod tests {
     #[test]
     fn stream_idle_timeout_treats_zero_as_unset() {
         assert_eq!(stream_idle_timeout_secs(0), STREAM_IDLE_TIMEOUT_FLOOR_SECS);
+    }
+
+    #[test]
+    fn a_stream_is_counted_only_while_it_is_alive() {
+        // The count is what tells a stall behind a queue of requests apart
+        // from a slow model, so a stream that ends must stop being counted.
+        let before = STREAMS_IN_FLIGHT.load(Ordering::SeqCst);
+        let first = StreamInFlight::enter();
+        let second = StreamInFlight::enter();
+        assert_eq!(STREAMS_IN_FLIGHT.load(Ordering::SeqCst), before + 2);
+        drop(first);
+        drop(second);
+        assert_eq!(STREAMS_IN_FLIGHT.load(Ordering::SeqCst), before);
     }
 }

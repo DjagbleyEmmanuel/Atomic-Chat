@@ -10,7 +10,6 @@
         "minHeight": 740,
         "resizable": true,
         "fullscreen": false,
-        "zoomHotkeysEnabled": true,
         "center": true,
         "hiddenTitle": true,
         "transparent": false,
@@ -34,12 +33,12 @@
       "resources/pre-install/**/*",
       "resources/LICENSE",
       "resources/agent-skills/**/*",
-      "resources/bin/jan-cli",
       "resources/bin/sqlite-vec.so",
       "resources/llamacpp-backend-upstream/**/*",
-      "resources/llamacpp-backend/**/*"
+      "resources/llamacpp-backend/**/*",
+      "licenses/cloudflared-LICENSE.txt"
     ],
-    "externalBin": ["resources/bin/uv"],
+    "externalBin": ["resources/bin/uv", "resources/bin/cloudflared"],
     "linux": {
       "appimage": {
         "bundleMediaFramework": false,

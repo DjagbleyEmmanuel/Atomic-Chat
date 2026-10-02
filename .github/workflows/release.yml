@@ -141,6 +141,7 @@ jobs:
   build-macos:
     if: github.event_name == 'push' || inputs.build_macos
     runs-on: macos-latest-xlarge
+    timeout-minutes: 75
     needs: create-draft-release
     outputs:
       mac_sig: ${{ steps.metadata.outputs.mac_sig }}
@@ -261,6 +262,38 @@ jobs:
           file src-tauri/icons/dmg/background.png
           ls -la src-tauri/icons/dmg/background.png
 
+      - name: Prepare bundled binaries (sidecars, atomic-chat-core, CLI)
+        run: |
+          yarn copy:assets:tauri
+
+          echo "=== Pre-build DMG verification ==="
+          file src-tauri/icons/dmg/background.png
+          grep -A2 '"background"' src-tauri/tauri.macos.conf.json
+
+          yarn download:bin
+          yarn download:core
+          # The release targets universal-apple-darwin, so the Remote access
+          # sidecar has to be a real fat binary (download-bin.mjs lipo's the
+          # two verified slices). One architecture under the universal name
+          # would only surface on an Intel Mac, as "bad CPU type".
+          cloudflared_archs="$(lipo -archs src-tauri/resources/bin/cloudflared-universal-apple-darwin)"
+          echo "cloudflared universal sidecar architectures: ${cloudflared_archs}"
+          case " ${cloudflared_archs} " in *" x86_64 "*) ;; *) echo "::error::cloudflared sidecar lacks the x86_64 slice"; exit 1 ;; esac
+          case " ${cloudflared_archs} " in *" arm64 "*) ;; *) echo "::error::cloudflared sidecar lacks the arm64 slice"; exit 1 ;; esac
+          yarn build:foundation-models-server
+          # Copies atomic-chat-core to jan-cli and signs the core pair with the
+          # imported Developer ID (hardened runtime + sidecar entitlements).
+          yarn build:cli
+
+      # Runs after the binaries are in place: the tauri build script requires
+      # every bundled resource and externalBin (jan-cli, the core pair, bun,
+      # uv, cloudflared) and the generated icons to exist, so this gate cannot
+      # compile any earlier in the job.
+      - name: Gate atomic-core lock identity (macOS)
+        timeout-minutes: 20
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --features test-tauri core::atomic_core::lock::tests::
+
       - name: Build app (universal binary)
         env:
           TAURI_BUNDLER_DMG_IGNORE_CI: "true"
@@ -286,17 +319,7 @@ jobs:
           SENTRY_ENVIRONMENT: production
           SENTRY_RELEASE: ${{ github.sha }}
         run: |
-          yarn copy:assets:tauri
-
-          echo "=== Pre-build DMG verification ==="
-          file src-tauri/icons/dmg/background.png
-          grep -A2 '"background"' src-tauri/tauri.macos.conf.json
-          echo "=== Building ==="
-
-          yarn download:bin
-          yarn build:foundation-models-server
-          yarn build:cli
-          # Универсальная macOS-сборка + переименование VOLNAME с версией + ресигн/нотаризация DMG
+          # Universal macOS build + VOLNAME rename with the version + DMG re-sign/notarization
           make build-mac
 
       - name: Upload Rust debug files to Sentry (macOS)
@@ -375,6 +398,9 @@ jobs:
     if: github.event_name == 'push' || inputs.build_windows
     # Pinned to windows-2022 — DigiCert KSP is incompatible with Server 2025
     runs-on: windows-2022
+    # A green run is ~40min. The ceiling exists so a hung step fails the job in
+    # an hour instead of running to GitHub's 6h default.
+    timeout-minutes: 75
     needs: create-draft-release
     outputs:
       win_sig: ${{ steps.metadata.outputs.win_sig }}
@@ -404,6 +430,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          # Releases are tag pushes, and an Actions cache written under
+          # `refs/tags/vX.Y.Z` is readable only by that same tag — the next
+          # release restores nothing from it. Saving it costs ~2.5min per job
+          # and evicts caches that *are* reachable, so only the default branch
+          # writes. Restore still reads main's cache from any ref.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache Yarn
         uses: actions/cache@v4
@@ -523,8 +555,69 @@ jobs:
           yarn build:core
           yarn build:extensions
 
-      - name: Download binaries (bun, uv)
+      - name: Download binaries (bun, uv, cloudflared)
         run: yarn download:bin
+
+      - name: Download the pinned atomic-chat-core release
+        run: yarn download:core
+
+      # The core pair ships as bundle resources, and "Sign Windows binaries
+      # with DigiCert" below runs after `tauri build`, when they are already
+      # packed inside the installers — so they are signed here, before
+      # bundling. Build CLI copies the signed atomic-chat-core.exe to
+      # jan-cli.exe. Bun keeps the payload in a `.bun` PE section, which the
+      # appended Authenticode signature leaves intact; --verify-only runs both
+      # signed binaries to prove it.
+      - name: Sign the atomic-chat-core binaries with DigiCert
+        shell: pwsh
+        env:
+          SM_API_KEY: ${{ secrets.SM_API_KEY }}
+          SM_CLIENT_CERT_PASSWORD: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+          SM_HOST: https://clientauth.one.digicert.com
+        run: |
+          if (-not $env:SM_CODE_SIGNING_CERT_SHA1_HASH) {
+            throw "SM_CODE_SIGNING_CERT_SHA1_HASH is not set (certsync did not capture a fingerprint)"
+          }
+          foreach ($name in @('atomic-chat-core.exe', 'atomic-chat-app-core.exe')) {
+            $path = "src-tauri\resources\bin\$name"
+            Write-Host "Signing: $path"
+            signtool sign /sha1 "$env:SM_CODE_SIGNING_CERT_SHA1_HASH" `
+              /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "$path"
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed for $path" }
+            signtool verify /pa "$path"
+            if ($LASTEXITCODE -ne 0) { throw "Signature verification failed for $path" }
+          }
+          node scripts/download-core.mjs --verify-only
+          if ($LASTEXITCODE -ne 0) { throw "A signed atomic-chat-core binary no longer runs" }
+
+      - name: Verify the cloudflared sidecar is Cloudflare's signed binary
+        # cloudflared ships inside our installer with Cloudflare's own
+        # Authenticode signature; we deliberately do not re-sign it (their
+        # certificate is the one SmartScreen and antivirus engines know).
+        # download-bin.mjs already pinned the sha256; this checks the other
+        # half of the supply chain: that the file is intact and was signed by
+        # Cloudflare. Any other status or signer fails the build.
+        shell: pwsh
+        run: |
+          $sidecar = 'src-tauri/resources/bin/cloudflared-x86_64-pc-windows-msvc.exe'
+          if (-not (Test-Path $sidecar)) {
+            Write-Host "::error::$sidecar not found after yarn download:bin."
+            exit 1
+          }
+          $signature = Get-AuthenticodeSignature -FilePath $sidecar
+          $subject = $signature.SignerCertificate.Subject
+          Write-Host "cloudflared signature: $($signature.Status); signer: $subject"
+          if ($signature.Status -ne 'Valid') {
+            Write-Host "::error::cloudflared Authenticode status is $($signature.Status), expected Valid."
+            exit 1
+          }
+          # Match the company name itself, in either spelling: their macOS
+          # Developer ID reads "Cloudflare Inc.", and a subject quotes a name
+          # that contains a comma (O="Cloudflare, Inc.").
+          if ($subject -notmatch 'Cloudflare,? Inc') {
+            Write-Host "::error::cloudflared is signed by an unexpected publisher: $subject"
+            exit 1
+          }
 
       - name: Download upstream llamacpp backend (manifest resolver)
         shell: bash
@@ -638,16 +731,17 @@ jobs:
         shell: bash
         run: |
           mkdir -p src-tauri/resources/bin
-          cd src-tauri && cargo build --release --features cli --bin jan-cli
-          cp target/release/jan-cli.exe resources/bin/jan-cli.exe
+          cp src-tauri/resources/bin/atomic-chat-core.exe src-tauri/resources/bin/jan-cli.exe
 
       # Runs after Build CLI: the tauri build script requires
       # resources/bin/jan-cli.exe to exist, and `shell: bash` (-e -o pipefail)
       # makes a cargo test failure actually fail the step — the default pwsh
       # shell only reports the last command's exit code.
       - name: Gate Agent checks (Windows)
+        timeout-minutes: 20
         shell: bash
         run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --features test-tauri core::atomic_core::lock::tests::
           cargo test --manifest-path src-tauri/Cargo.toml --lib --features test-tauri core::agent::
           yarn workspace @janhq/web-app vitest --run src/lib/agent-path.test.ts src/lib/agent-file-links.test.ts src/stores/workspace-preview-store.test.ts
 
@@ -809,6 +903,7 @@ jobs:
     # Mint / Pop!_OS / Arch. Upstream remains the Linux default while the
     # TurboQuant Vulkan build ships as the optional second provider.
     runs-on: ubuntu-22.04
+    timeout-minutes: 75
     needs: create-draft-release
     outputs:
       linux_sig: ${{ steps.metadata.outputs.linux_sig }}
@@ -829,6 +924,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          # Releases are tag pushes, and an Actions cache written under
+          # `refs/tags/vX.Y.Z` is readable only by that same tag — the next
+          # release restores nothing from it. Saving it costs ~2.5min per job
+          # and evicts caches that *are* reachable, so only the default branch
+          # writes. Restore still reads main's cache from any ref.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache Yarn
         uses: actions/cache@v4
@@ -858,6 +959,8 @@ jobs:
             libsoup-3.0-dev \
             libwebkit2gtk-4.1-dev \
             libjavascriptcoregtk-4.1-dev \
+            libasound2-dev \
+            pkg-config \
             patchelf \
             squashfs-tools \
             unzip
@@ -900,8 +1003,24 @@ jobs:
           yarn build:core
           yarn build:extensions
 
-      - name: Download binaries (bun, uv, sqlite-vec)
+      - name: Download binaries (bun, uv, cloudflared, sqlite-vec)
         run: yarn download:bin
+
+      - name: Download the pinned atomic-chat-core release
+        run: yarn download:core
+
+      - name: Assert the cloudflared sidecar was bundled
+        # download-bin.mjs fails the step on a sha256 mismatch, so reaching
+        # this point means the file was verified. This only guards against
+        # the externalBin path and the installed name drifting apart, which
+        # `tauri build` would report as an opaque path-not-found much later.
+        run: |
+          sidecar=src-tauri/resources/bin/cloudflared-x86_64-unknown-linux-gnu
+          if [ ! -x "$sidecar" ]; then
+            echo "::error::$sidecar is missing or not executable after yarn download:bin."
+            exit 1
+          fi
+          echo "cloudflared present: $(ls -l "$sidecar")"
 
       - name: Assert sqlite-vec was bundled
         # `scripts/download-bin.mjs` treats sqlite-vec as non-fatal (it
@@ -962,9 +1081,19 @@ jobs:
       - name: Build CLI (Linux)
         run: |
           mkdir -p src-tauri/resources/bin
-          cd src-tauri && cargo build --release --features cli --bin jan-cli
-          cp target/release/jan-cli resources/bin/jan-cli
-          chmod +x resources/bin/jan-cli
+          cp src-tauri/resources/bin/atomic-chat-core src-tauri/resources/bin/jan-cli
+          chmod +x src-tauri/resources/bin/jan-cli
+
+      # The agent's pty/process contract is Unix-only (see contract_tests.rs):
+      # ConPTY never EOFs the output pipe on child exit, so those cases cannot
+      # run in the Windows gate. This is where they actually execute. Runs after
+      # Build CLI for the same reason as on Windows — the tauri build script
+      # wants resources/bin/jan-cli to exist.
+      - name: Gate Agent checks (Linux)
+        timeout-minutes: 20
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --features test-tauri core::atomic_core::lock::tests::
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --features test-tauri core::agent::
 
       - name: Build app (AppImage)
         env:

@@ -9,6 +9,7 @@ export type ToolPresentation =
       input?: unknown
       output?: unknown
       errorText?: string
+      deniedReason?: string
     }
   | {
       kind: 'web_search_exa'
@@ -74,7 +75,6 @@ export type TraceBlock =
       tools: Array<{
         key: string
         toolName: string
-        toolCallId?: string
         state: ToolUIPart['state']
         presentation: ToolPresentation
       }>

@@ -101,6 +101,33 @@ describe('saveProviderApiKey', () => {
     expect(patch.settings[0].controller_props.value).toBe('sk-test')
   })
 
+  it('enables a provider that was left disabled', () => {
+    // Saving a key is an explicit "I want to use this": leaving `active: false`
+    // in place would keep it out of the picker and out of the proxy
+    // registration, connected in name only.
+    const updateProvider = vi.fn()
+    saveProviderApiKey({
+      provider: makeProvider({ active: false }),
+      apiKey: 'sk-test',
+      duringOnboarding: false,
+      updateProvider,
+      serviceHub: {
+        providers: () => ({ updateSettings: vi.fn().mockResolvedValue(undefined) }),
+      } as never,
+    })
+
+    expect(updateProvider).toHaveBeenCalledWith(
+      'openai',
+      expect.objectContaining({ active: true, api_key: 'sk-test' })
+    )
+    // The stored provider is enabled and carries the key in both places.
+    const [name, patch] = updateProvider.mock.calls[0]
+    expect(name).toBe('openai')
+    expect(patch.active).toBe(true)
+    expect(patch.api_key).toBe('sk-test')
+    expect(patch.settings[0].controller_props.value).toBe('sk-test')
+  })
+
   it('still persists when the extension settings write rejects', () => {
     // Cloud providers have no engine extension, so updateSettings is a no-op
     // for them and must never gate the save.

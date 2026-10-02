@@ -8,7 +8,9 @@ use tokio::time::timeout;
 use super::{
     constants::{
         default_filesystem_root, default_mcp_config, filesystem_mcp_pinned_spec,
+        retired_serper_default_server, APP_WRITTEN_FILESYSTEM_MCP_VERSIONS,
         DEFAULT_MCP_TOOL_LIST_TIMEOUT_SECS, FILESYSTEM_MCP_PACKAGE, LEGACY_FILESYSTEM_PLACEHOLDER,
+        RETIRED_SERPER_SERVER_KEY,
     },
     helpers::{kill_process_tree_by_pid, restart_active_mcp_servers, start_mcp_server},
 };
@@ -23,6 +25,77 @@ use std::{collections::BTreeSet, fs, time::Duration};
 
 async fn tool_call_timeout(state: &State<'_, AppState>) -> Duration {
     state.mcp_settings.lock().await.tool_call_timeout_duration()
+}
+
+/// Rewrite every filesystem-MCP package arg this app is responsible for to the
+/// currently pinned spec. Returns true when anything changed.
+///
+/// Two shapes are rewritten: the bare package name (an unversioned install,
+/// which lets `bun x` serve a stale cached build — ATO-164), and a spec an
+/// earlier release of this app pinned itself
+/// (`APP_WRITTEN_FILESYSTEM_MCP_VERSIONS`). A version the *user* pinned by hand
+/// is left alone, as is anything already on the current spec, which makes this
+/// idempotent.
+///
+/// The app-written set is what lets a bad pin be corrected at all. The first
+/// pin shipped `@2026.1.14`, published four weeks before the upstream fix it
+/// was chosen for (servers#2609) merged — so it froze users on the very build
+/// whose CWD-relative path resolution ATO-164 set out to escape. Matching only
+/// the bare token made every already-migrated config unreachable by any later
+/// release.
+///
+/// Scans every server entry, not just the one named `filesystem`, so
+/// custom-named entries are covered too.
+pub(crate) fn repin_filesystem_mcp_servers(servers: &mut Map<String, Value>) -> bool {
+    let pinned_spec = filesystem_mcp_pinned_spec();
+    let app_written_specs: Vec<String> = APP_WRITTEN_FILESYSTEM_MCP_VERSIONS
+        .iter()
+        .map(|version| format!("{FILESYSTEM_MCP_PACKAGE}@{version}"))
+        .collect();
+
+    let mut mutated = false;
+    for server in servers.values_mut() {
+        let Some(args) = server.get_mut("args").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for arg in args.iter_mut() {
+            let Some(current) = arg.as_str() else {
+                continue;
+            };
+            let needs_repin = current == FILESYSTEM_MCP_PACKAGE
+                || app_written_specs.iter().any(|spec| spec == current);
+            if !needs_repin {
+                continue;
+            }
+            log::info!("Migrating config: pinned filesystem MCP server {current} -> {pinned_spec}");
+            *arg = Value::String(pinned_spec.clone());
+            mutated = true;
+        }
+    }
+    mutated
+}
+
+/// Remove the `serper` entry the default template used to seed, and only
+/// that: the entry must equal `retired_serper_default_server()` exactly.
+/// Returns true when it was removed.
+///
+/// The template shipped Serper switched off behind a `YOUR_SERPER_API_KEY_HERE`
+/// placeholder next to an always-on Exa doing the same job, so as seeded it
+/// could never be switched on, and it was the only off row a fresh install's
+/// plugins menu showed. Fresh installs stopped seeding it; this reaches the
+/// installs that already have it. The web app saves the server map verbatim,
+/// so an entry the user never touched still matches, while any edit —
+/// switching it on, a real key, other args, an extra field — makes it the
+/// user's and it stays. Idempotent: once removed there is nothing to match.
+pub(crate) fn drop_retired_serper_default(servers: &mut Map<String, Value>) -> bool {
+    if servers.get(RETIRED_SERPER_SERVER_KEY) != Some(&retired_serper_default_server()) {
+        return false;
+    }
+    servers.remove(RETIRED_SERPER_SERVER_KEY);
+    log::info!(
+        "Migrating config: dropped the retired default {RETIRED_SERPER_SERVER_KEY} MCP server"
+    );
+    true
 }
 
 #[tauri::command]
@@ -272,6 +345,10 @@ pub async fn get_tools(
                             description: tool.description.as_ref().map(|d| d.to_string()),
                             input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
                             server: server_name.clone(),
+                            annotations: tool
+                                .annotations
+                                .as_ref()
+                                .and_then(|annotations| serde_json::to_value(annotations).ok()),
                         });
                     }
                 }
@@ -280,6 +357,13 @@ pub async fn get_tools(
                 }
             }
         }
+    }
+
+    if super::web_search::enabled(&app).await {
+        all_tools.retain(|tool| {
+            !(tool.server == "exa" && super::web_search::is_bundled_tool(&tool.name))
+        });
+        all_tools.extend(super::web_search::tools());
     }
 
     let servers = collect_mcp_server_statuses(&state).await;
@@ -349,7 +433,8 @@ pub(crate) async fn collect_mcp_server_statuses(state: &AppState) -> Vec<McpServ
 /// 5. Supports cancellation via cancellation_token
 /// 6. Returns error if no server has the requested tool or if specified server not found
 #[tauri::command]
-pub async fn call_tool(
+pub async fn call_tool<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppState>,
     tool_name: String,
     server_name: Option<String>,
@@ -357,6 +442,33 @@ pub async fn call_tool(
     cancellation_token: Option<String>,
 ) -> Result<CallToolResult, String> {
     let timeout_duration = tool_call_timeout(&state).await;
+    if super::web_search::is_bundled_tool(&tool_name)
+        && server_name.as_deref().is_none_or(|name| name == "exa")
+        && super::web_search::enabled(&app).await
+    {
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        if let Some(token) = &cancellation_token {
+            state
+                .tool_call_cancellations
+                .lock()
+                .await
+                .insert(token.clone(), cancel_tx);
+        }
+        let working_dir = get_jan_data_folder_path(app.clone())
+            .join("mcp")
+            .join("downloads");
+        let result = tokio::select! {
+            result = timeout(timeout_duration, super::web_search::call(&tool_name, arguments, &working_dir)) => {
+                result.unwrap_or_else(|_| Err("Web tool timed out. Try again.".into()))
+            }
+            _ = cancel_rx, if cancellation_token.is_some() => Err("Web tool was cancelled.".into()),
+        };
+        if let Some(token) = &cancellation_token {
+            state.tool_call_cancellations.lock().await.remove(token);
+        }
+        return result;
+    }
+    let data_dir = get_jan_data_folder_path(app.clone());
     match server_name.as_deref() {
         Some(server) => log::info!(
             "MCP server {server}: calling tool {tool_name} (timeout {}s)",
@@ -392,6 +504,11 @@ pub async fn call_tool(
         }
     }
 
+    // When a signed-in server rejects the call as unauthorized, the session is
+    // refreshed and the server restarted for one retry — set inside the loop,
+    // acted on after the servers lock is released.
+    let mut auth_retry: Option<(String, String)> = None;
+
     // Iterate through servers and find the one that contains the tool
     for (srv_name, service) in servers_to_check.iter() {
         let tools = match service.list_all_tools().await {
@@ -410,9 +527,20 @@ pub async fn call_tool(
 
         log::info!("MCP server {srv_name}: dispatching tool {tool_name}");
 
+        // rmcp's own expiry check never fires (it compares the static
+        // `expires_in`), so a near-expiry session is refreshed here, in place.
+        // A cheap no-op for servers without an OAuth session.
+        if let Err(e) = state
+            .mcp_oauth
+            .refresh_if_stale(&data_dir, srv_name, false)
+            .await
+        {
+            log::warn!("MCP server {srv_name}: pre-call token refresh failed: {e}");
+        }
+
         let tool_call = service.call_tool(CallToolRequestParam {
             name: tool_name.clone().into(),
-            arguments,
+            arguments: arguments.clone(),
         });
 
         // Race between timeout, tool call, and cancellation
@@ -452,10 +580,58 @@ pub async fn call_tool(
             }
             Err(e) => {
                 log::error!("MCP server {srv_name}: tool {tool_name} failed: {e}");
+                if crate::core::mcp::oauth::is_auth_error(e)
+                    && state.mcp_oauth.has_entry(&data_dir, srv_name).await
+                {
+                    auth_retry = Some((srv_name.to_string(), e.clone()));
+                    break;
+                }
             }
         }
 
         return result;
+    }
+
+    if let Some((srv, original_error)) = auth_retry {
+        drop(servers);
+        log::warn!(
+            "MCP server {srv}: auth failure on tool {tool_name}; refreshing the sign-in \
+             and reconnecting for one retry"
+        );
+        state
+            .mcp_oauth
+            .refresh_if_stale(&data_dir, &srv, true)
+            .await?;
+        let config = state
+            .mcp_active_servers
+            .lock()
+            .await
+            .get(&srv)
+            .cloned()
+            .ok_or_else(|| original_error.clone())?;
+        start_mcp_server(app.clone(), state.mcp_servers.clone(), srv.clone(), config).await?;
+
+        let servers = state.mcp_servers.lock().await;
+        let Some(service) = servers.get(&srv) else {
+            return Err(original_error);
+        };
+        let retry = timeout(
+            timeout_duration,
+            service.call_tool(CallToolRequestParam {
+                name: tool_name.clone().into(),
+                arguments,
+            }),
+        )
+        .await;
+        return match retry {
+            Ok(call_result) => {
+                call_result.map_err(|e| format!("{srv}: {e} — open Connectors and sign in again"))
+            }
+            Err(_) => Err(format!(
+                "Tool call '{tool_name}' timed out after {} seconds",
+                timeout_duration.as_secs()
+            )),
+        };
     }
 
     log::warn!("MCP: tool {tool_name} not found on any connected server");
@@ -601,26 +777,48 @@ pub async fn get_mcp_configs<R: Runtime>(app: AppHandle<R>) -> Result<String, St
     // forces a fresh fetch (cache miss) of the fixed build (servers#2609).
     //
     // We scan every server's args (not just the one named "filesystem") so
-    // custom-named entries are covered, and only rewrite the *bare* package
-    // token — an explicit user pin (`...@<ver>`) is left untouched. The check
-    // is idempotent: once rewritten, the arg equals the pinned spec and never
-    // re-triggers.
-    let pinned_spec = filesystem_mcp_pinned_spec();
+    // custom-named entries are covered, and rewrite two shapes: the *bare*
+    // package token, and a spec this app itself pinned in an earlier release
+    // (`APP_WRITTEN_FILESYSTEM_MCP_VERSIONS`). A version the *user* chose is
+    // left untouched. The check is idempotent: once rewritten, the arg equals
+    // the current pinned spec, which is in neither set.
+    //
+    // Re-pinning app-written specs is what makes this migration reach existing
+    // installs at all. The first pin shipped `@2026.1.14` — a build published
+    // before servers#2609 landed, i.e. still carrying the CWD-relative bug it
+    // was meant to cure. Matching only the bare token made that a one-shot:
+    // every config the app had already rewritten was frozen on the broken
+    // version, and no release could ever correct it.
+    if let Some(servers) = config_object
+        .get_mut("mcpServers")
+        .and_then(|v| v.as_object_mut())
+    {
+        mutated |= repin_filesystem_mcp_servers(servers);
+    }
+
+    // Migration: Linear retired its SSE endpoint (mcp.linear.app/sse now
+    // 404s) in favour of streamable HTTP at /mcp. Rewrite only the exact
+    // retired URL — any other user-edited URL is left untouched. Idempotent:
+    // once rewritten the URL no longer matches.
     if let Some(servers) = config_object
         .get_mut("mcpServers")
         .and_then(|v| v.as_object_mut())
     {
         for server in servers.values_mut() {
-            if let Some(args) = server.get_mut("args").and_then(|v| v.as_array_mut()) {
-                for arg in args.iter_mut() {
-                    if arg.as_str() == Some(FILESYSTEM_MCP_PACKAGE) {
-                        *arg = Value::String(pinned_spec.clone());
-                        log::info!(
-                            "Migrating config: pinned filesystem MCP server to {pinned_spec}"
-                        );
-                        mutated = true;
-                    }
-                }
+            let Some(server_obj) = server.as_object_mut() else {
+                continue;
+            };
+            if server_obj.get("url").and_then(|v| v.as_str()) == Some("https://mcp.linear.app/sse")
+            {
+                server_obj.insert(
+                    "url".to_string(),
+                    Value::String("https://mcp.linear.app/mcp".to_string()),
+                );
+                server_obj.insert("type".to_string(), Value::String("http".to_string()));
+                log::info!(
+                    "Migrating config: moved Linear MCP off the retired /sse endpoint to /mcp"
+                );
+                mutated = true;
             }
         }
     }

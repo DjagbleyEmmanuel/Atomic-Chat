@@ -5,6 +5,8 @@ import {
   useEffect,
   useMemo,
   useRef,
+  type ComponentType,
+  type MemoExoticComponent,
   type ReactNode,
 } from 'react'
 import { cn, disableIndentedCodeBlockPlugin } from '@/lib/utils'
@@ -108,8 +110,115 @@ function extractCodeText(children: ReactNode): string {
   return ''
 }
 
+const REACT_MEMO_TYPE = Symbol.for('react.memo')
+
+function isMemoComponent(
+  type: unknown
+): type is MemoExoticComponent<ComponentType<Record<string, unknown>>> {
+  return (
+    typeof type === 'object' &&
+    type !== null &&
+    (type as { $$typeof?: symbol }).$$typeof === REACT_MEMO_TYPE
+  )
+}
+
+/**
+ * `pre` for the nested renderer that delegates code blocks back to streamdown.
+ *
+ * streamdown 2.1.1 memoises its `code` renderer on the hast node's start/end
+ * line and column. The nested renderer always receives a closed fence, so a
+ * final line that is still growing keeps the exact same position and the
+ * block never re-renders: it froze at the first token of its last line, and
+ * the copy button inside that subtree copied the stale text (#263). A new
+ * line moves `end.line`, which is why every line but the last was intact.
+ *
+ * streamdown's own `pre` just returns its child — the memoised `code`
+ * element — so render that element's inner component directly and the
+ * position comparator is never consulted. The `Block` memo one level up still
+ * skips unchanged content. Falls back to the child untouched if it isn't a
+ * memo element. Delete once the app moves to upstream streamdown ≥ 2.6, whose
+ * comparator already accounts for this.
+ */
+const UnmemoizedCodePre: Components['pre'] = ({ children }) => {
+  const child = Array.isArray(children)
+    ? children.find(isValidElement)
+    : children
+  if (!isValidElement(child) || !isMemoComponent(child.type)) return children
+  const Inner = child.type.type
+  return <Inner {...(child.props as Record<string, unknown>)} />
+}
+
 // Cache for normalized LaTeX content
 const latexCache = new Map<string, string>()
+
+const repairStrongMarkers = (text: string): string =>
+  text.replace(
+    /\*\*([ \t]*)([^*\r\n]*?[^\s*])([ \t]*)\*\*/g,
+    (match, leading: string, value: string, trailing: string) =>
+      leading || trailing ? `**${value}**` : match
+  )
+
+/** Repair whitespace inside strong markers while leaving Markdown code intact. */
+const normalizeMalformedStrong = (input: string): string => {
+  let fence: { marker: string; length: number } | null = null
+  const chunks = input.split(/(\n)/)
+
+  return chunks
+    .map((line, index) => {
+      if (index % 2 === 1) return line
+
+      const fenceRun = line.match(/^ {0,3}(`{3,}|~{3,})/)?.[1]
+      if (fence) {
+        const closingRun = line.match(
+          /^ {0,3}(`+|~+)[ \t]*\r?$/
+        )?.[1]
+        if (
+          closingRun?.[0] === fence.marker &&
+          closingRun.length >= fence.length
+        ) {
+          fence = null
+        }
+        return line
+      }
+      if (fenceRun) {
+        fence = { marker: fenceRun[0], length: fenceRun.length }
+        return line
+      }
+
+      let result = ''
+      let cursor = 0
+      while (cursor < line.length) {
+        const codeStart = line.indexOf('`', cursor)
+        if (codeStart < 0) {
+          result += repairStrongMarkers(line.slice(cursor))
+          break
+        }
+
+        result += repairStrongMarkers(line.slice(cursor, codeStart))
+        let runEnd = codeStart + 1
+        while (line[runEnd] === '`') runEnd += 1
+        const delimiter = line.slice(codeStart, runEnd)
+        let codeEnd = line.indexOf(delimiter, runEnd)
+        while (
+          codeEnd >= 0 &&
+          (line[codeEnd - 1] === '`' ||
+            line[codeEnd + delimiter.length] === '`')
+        ) {
+          codeEnd = line.indexOf(delimiter, codeEnd + delimiter.length)
+        }
+        if (codeEnd < 0) {
+          result += line.slice(codeStart)
+          break
+        }
+
+        const afterCode = codeEnd + delimiter.length
+        result += line.slice(codeStart, afterCode)
+        cursor = afterCode
+      }
+      return result
+    })
+    .join('')
+}
 
 /**
  * Optimized preprocessor: normalize LaTeX fragments into $ / $$.
@@ -186,10 +295,13 @@ function RenderMarkdownComponent({
 
   const normalizedContent = useMemo(() => {
     const prepared = enableHtmlPreview ? wrapBareHtmlDocument(content) : content
-    const fenced = closeUnclosedCodeFence(prepared)
-    return normalizeLatex(fenced)
+    return normalizeLatex(
+      normalizeMalformedStrong(closeUnclosedCodeFence(prepared))
+    )
   }, [content, enableHtmlPreview])
   const thetaMarked = useRef(false)
+  const streamedThisMountRef = useRef(Boolean(isStreaming))
+  if (isStreaming) streamedThisMountRef.current = true
 
   useEffect(() => {
     thetaMarked.current = false
@@ -220,6 +332,11 @@ function RenderMarkdownComponent({
 
   // Props for the nested renderer that delegates non-HTML code blocks back to
   // streamdown so mermaid / syntax highlighting behave exactly as before.
+  // Memoised so streamdown's `Block` sees one stable `components` identity.
+  const delegateComponents = useMemo<Components>(
+    () => ({ ...(components ?? {}), pre: UnmemoizedCodePre }),
+    [components]
+  )
   const delegateProps = useMemo(
     () => ({
       animate: false as const,
@@ -229,13 +346,28 @@ function RenderMarkdownComponent({
       plugins: STREAMDOWN_PLUGINS,
       controls: STREAMDOWN_CONTROLS,
       mermaid: mermaidConfig,
-      components,
+      components: delegateComponents,
     }),
-    [components, mermaidConfig]
+    [delegateComponents, mermaidConfig]
   )
 
   const mergedComponents = useMemo<Components | undefined>(() => {
     if (!enableHtmlPreview) return components
+
+    const LinkRenderer: Components['a'] = ({
+      className: linkClassName,
+      ...props
+    }) => (
+      <a
+        {...props}
+        target="_blank"
+        rel="noopener noreferrer"
+        className={cn(
+          'text-blue-600 underline decoration-blue-500/40 underline-offset-2 hover:decoration-blue-600 focus-visible:decoration-blue-600 dark:text-blue-400 dark:hover:decoration-blue-400',
+          linkClassName
+        )}
+      />
+    )
 
     const CodeRenderer: Components['code'] = ({
       node,
@@ -297,12 +429,14 @@ function RenderMarkdownComponent({
       )
     }
 
-    return { code: CodeRenderer, ...(components ?? {}) }
+    return { a: LinkRenderer, code: CodeRenderer, ...(components ?? {}) }
   }, [enableHtmlPreview, components, delegateProps])
 
   const containsMath =
     normalizedContent.includes('$$') ||
     /(^|[^\\])\$[^$\n]+\$/.test(normalizedContent)
+  const containsUrl = /(?:https?:\/\/|www\.)/i.test(normalizedContent)
+  const containsStrong = /\*\*(?=\S)[^\r\n]*?\S\*\*/.test(normalizedContent)
 
   // Short plain-text replies (e.g. "Yes", "4") skip the markdown pipeline for
   // speed, but only when there's no markdown syntax that would be lost — a
@@ -339,7 +473,9 @@ function RenderMarkdownComponent({
     content.length < 32 &&
     !components &&
     !containsMath &&
-    !containsMarkdownSyntax
+    !containsMarkdownSyntax &&
+    !containsUrl &&
+    !containsStrong
   ) {
     return (
       <div
@@ -370,8 +506,20 @@ function RenderMarkdownComponent({
     >
       <ArtifactStreamingProvider value={!!isStreaming}>
         <Streamdown
-          animate={isAnimating ?? true}
-          animationDuration={500}
+          // Streamdown's entrance animation restarts as fenced code blocks
+          // grow token-by-token. That repeatedly translates the whole block
+          // and fights the chat's stick-to-bottom scroll, producing a visible
+          // jump. The stream itself is already the motion cue; animate only a
+          // completed, static message.
+          // Never replay the entrance animation when a live response flips to
+          // ready. Re-animating the already painted tree fades the entire
+          // answer toward white for a frame and looks like a page reload.
+          animate={
+            !isStreaming &&
+            !streamedThisMountRef.current &&
+            (isAnimating ?? true)
+          }
+          animationDuration={180}
           linkSafety={{
             enabled: false,
           }}
@@ -400,6 +548,7 @@ export const RenderMarkdown = memo(
     prevProps.enableHtmlPreview === nextProps.enableHtmlPreview &&
     prevProps.allowRawHtml === nextProps.allowRawHtml &&
     prevProps.displayMode === nextProps.displayMode &&
+    prevProps.isAnimating === nextProps.isAnimating &&
     // With HTML preview on, re-render on streaming→done to drop the loader.
     (!nextProps.enableHtmlPreview ||
       prevProps.isStreaming === nextProps.isStreaming)

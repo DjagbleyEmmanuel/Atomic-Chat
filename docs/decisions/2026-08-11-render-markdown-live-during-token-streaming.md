@@ -10,3 +10,14 @@ title: "Render markdown live during token streaming via Streamdown streaming mod
 - **Consequences:** Headings, bold, lists, inline code and code blocks all appear in real time while the model is speaking, matching the pre-3.0.0 experience. Per-token cost is a deferred markdown parse (grows with message length; `useTransition` keeps the UI responsive) plus content-cached code tokenization. Watch for long messages where the incremental re-parse cost rises, and for streamdown's lazy code block relying on a CDN for grammar downloads — offline it falls back to plain-text tokens (pre-existing behaviour, unchanged here).
 - **Owner:** team
 - **Links:** `web-app/src/containers/RenderMarkdown.tsx`, `web-app/src/components/ai-elements/code-block.tsx`, streamdown `mode="streaming"` + `@streamdown/code`
+
+---
+
+**Superseded (2026-10-02, upstream v2.1.2 merge):** Upstream adopted the same
+outcome and now owns this code path. The explicit
+`mode={isStreaming ? 'streaming' : 'static'}` switch was replaced upstream by
+`ArtifactStreamingProvider` plus Streamdown's own streaming default, and the
+per-token highlight cadence now lives in the fork's `CodeBlock`
+(`codeLiveHighlight` / `codeHighlightCadence`). The decision stands; the
+implementation is upstream's. The standalone `CodeBlock` still renders plain
+`<pre>` text while a highlight pass is pending, so it is never blank mid-stream.

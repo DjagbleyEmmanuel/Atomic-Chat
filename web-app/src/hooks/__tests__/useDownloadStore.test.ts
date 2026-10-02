@@ -8,6 +8,8 @@ describe('useDownloadStore', () => {
       downloads: {},
       localDownloadingModels: new Set(),
       resumableDownloads: new Set(),
+      downloadOriginByModelId: {},
+      downloadRequestOriginByModelId: {},
     })
   })
 
@@ -21,6 +23,48 @@ describe('useDownloadStore', () => {
     })
   })
 
+  describe('download request origins', () => {
+    it('marks ordinary download surfaces as standalone by default', () => {
+      const { result } = renderHook(() => useDownloadStore())
+
+      act(() => {
+        result.current.setDownloadOrigin('model-1', 'owner/model')
+      })
+
+      expect(result.current.downloadOriginByModelId['model-1']).toBe(
+        'owner/model'
+      )
+      expect(result.current.downloadRequestOriginByModelId['model-1']).toBe(
+        'standalone'
+      )
+    })
+
+    it('records and clears reply-gate intent independently of repo identity', () => {
+      const { result } = renderHook(() => useDownloadStore())
+
+      act(() => {
+        result.current.setDownloadOrigin(
+          'model-1',
+          'owner/model',
+          'reply-gate'
+        )
+      })
+
+      expect(result.current.downloadRequestOriginByModelId['model-1']).toBe(
+        'reply-gate'
+      )
+
+      act(() => {
+        result.current.clearDownloadOrigin('model-1')
+      })
+
+      expect(result.current.downloadOriginByModelId['model-1']).toBeUndefined()
+      expect(
+        result.current.downloadRequestOriginByModelId['model-1']
+      ).toBeUndefined()
+    })
+  })
+
   describe('updateProgress', () => {
     it('should add new download progress', () => {
       const { result } = renderHook(() => useDownloadStore())
@@ -29,7 +73,7 @@ describe('useDownloadStore', () => {
         result.current.updateProgress('test-id', 50, 'test-model', 500, 1000)
       })
 
-      expect(result.current.downloads['test-id']).toEqual({
+      expect(result.current.downloads['test-id']).toMatchObject({
         name: 'test-model',
         progress: 50,
         current: 500,
@@ -50,7 +94,7 @@ describe('useDownloadStore', () => {
         result.current.updateProgress('test-id', 75, undefined, 750)
       })
 
-      expect(result.current.downloads['test-id']).toEqual({
+      expect(result.current.downloads['test-id']).toMatchObject({
         name: 'test-model',
         progress: 75,
         current: 750,
@@ -71,7 +115,7 @@ describe('useDownloadStore', () => {
         result.current.updateProgress('test-id', 75)
       })
 
-      expect(result.current.downloads['test-id']).toEqual({
+      expect(result.current.downloads['test-id']).toMatchObject({
         name: 'test-model',
         progress: 75,
         current: 250,
@@ -86,7 +130,7 @@ describe('useDownloadStore', () => {
         result.current.updateProgress('test-id', 50)
       })
 
-      expect(result.current.downloads['test-id']).toEqual({
+      expect(result.current.downloads['test-id']).toMatchObject({
         name: '',
         progress: 50,
         current: 0,
@@ -108,12 +152,96 @@ describe('useDownloadStore', () => {
         result.current.updateProgress('test-id', 0, 'test-model', 0, 0)
       })
 
-      expect(result.current.downloads['test-id']).toEqual({
+      expect(result.current.downloads['test-id']).toMatchObject({
         name: 'test-model',
         progress: 0,
         current: 0,
         total: 0,
       })
+    })
+  })
+
+  describe('speed sampling', () => {
+    it('starts with no speed estimate', () => {
+      const { result } = renderHook(() => useDownloadStore())
+
+      act(() => {
+        result.current.updateProgress('test-id', 0.1, 'test-model', 100, 1000)
+      })
+
+      // One data point cannot give a rate; the panel omits speed and ETA
+      // rather than showing a number derived from a single sample.
+      expect(result.current.downloads['test-id'].speed.bytesPerSecond).toBe(0)
+      expect(result.current.downloads['test-id'].speed.atBytes).toBe(100)
+    })
+
+    it('estimates speed once two samples are far enough apart', () => {
+      vi.useFakeTimers()
+      try {
+        const { result } = renderHook(() => useDownloadStore())
+
+        act(() => {
+          result.current.updateProgress('test-id', 0.1, 'test-model', 0, 1000)
+        })
+        act(() => {
+          vi.advanceTimersByTime(1000)
+          result.current.updateProgress('test-id', 0.5, 'test-model', 500, 1000)
+        })
+
+        // 500 bytes in one second, and the first estimate is unsmoothed.
+        expect(result.current.downloads['test-id'].speed.bytesPerSecond).toBe(
+          500
+        )
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('ignores samples taken too close together', () => {
+      vi.useFakeTimers()
+      try {
+        const { result } = renderHook(() => useDownloadStore())
+
+        act(() => {
+          result.current.updateProgress('test-id', 0.1, 'test-model', 0, 1000)
+        })
+        act(() => {
+          vi.advanceTimersByTime(50)
+          result.current.updateProgress('test-id', 0.2, 'test-model', 200, 1000)
+        })
+
+        // A 50ms window would report 4 MB/s from a 200-byte chunk.
+        expect(result.current.downloads['test-id'].speed.bytesPerSecond).toBe(0)
+        expect(result.current.downloads['test-id'].current).toBe(200)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('resets the estimate when a transfer restarts from zero', () => {
+      vi.useFakeTimers()
+      try {
+        const { result } = renderHook(() => useDownloadStore())
+
+        act(() => {
+          result.current.updateProgress('test-id', 0.1, 'test-model', 0, 1000)
+        })
+        act(() => {
+          vi.advanceTimersByTime(1000)
+          result.current.updateProgress('test-id', 0.5, 'test-model', 500, 1000)
+        })
+        act(() => {
+          vi.advanceTimersByTime(1000)
+          result.current.updateProgress('test-id', 0, 'test-model', 0, 1000)
+        })
+
+        // Carrying the 500-byte baseline into a restarted transfer would make
+        // the next sample look like a huge burst.
+        expect(result.current.downloads['test-id'].speed.bytesPerSecond).toBe(0)
+        expect(result.current.downloads['test-id'].speed.atBytes).toBe(0)
+      } finally {
+        vi.useRealTimers()
+      }
     })
   })
 
@@ -297,6 +425,161 @@ describe('useDownloadStore', () => {
 
       expect(result.current.resumableDownloads.has('model-1')).toBe(false)
       expect(result.current.localDownloadingModels.has('model-1')).toBe(true)
+    })
+  })
+
+  describe('updateStage (ATO — #290)', () => {
+    it('reports a retry without rewinding the transferred bytes', () => {
+      const { result } = renderHook(() => useDownloadStore())
+
+      act(() => {
+        result.current.updateProgress('model-1', 0.5, 'model-1', 500, 1000)
+        result.current.updateStage('model-1', {
+          kind: 'retrying',
+          attempt: 2,
+          maxAttempts: 5,
+        })
+      })
+
+      const entry = result.current.downloads['model-1']
+      // The whole point of a separate action: a stage event carries no byte
+      // counts, and routing it through updateProgress published 0/0.
+      expect(entry.current).toBe(500)
+      expect(entry.total).toBe(1000)
+      expect(entry.progress).toBe(0.5)
+      expect(entry.stage).toEqual({
+        kind: 'retrying',
+        attempt: 2,
+        maxAttempts: 5,
+      })
+    })
+
+    it('clears the stage once bytes actually move', () => {
+      const { result } = renderHook(() => useDownloadStore())
+
+      act(() => {
+        result.current.updateStage('model-1', {
+          kind: 'connecting',
+          attempt: 0,
+          maxAttempts: 5,
+        })
+        result.current.updateProgress('model-1', 0.1, 'model-1', 100, 1000)
+      })
+
+      expect(result.current.downloads['model-1'].stage).toBeUndefined()
+    })
+
+    // Field feedback, 2026-09-29: a quiet connection kept the last estimate,
+    // so the panel quoted a live speed and ETA for a stopped transfer.
+    it('drops the speed estimate when the transfer stalls or reconnects', () => {
+      vi.useFakeTimers()
+      try {
+        const { result } = renderHook(() => useDownloadStore())
+        act(() => {
+          result.current.updateProgress('model-1', 0.1, 'model-1', 0, 1000)
+        })
+        act(() => {
+          vi.advanceTimersByTime(1000)
+          result.current.updateProgress('model-1', 0.5, 'model-1', 500, 1000)
+        })
+        expect(result.current.downloads['model-1'].speed.bytesPerSecond).toBe(
+          500
+        )
+
+        for (const kind of ['stalled', 'retrying']) {
+          act(() => {
+            result.current.updateProgress('model-1', 0.5, 'model-1', 500, 1000)
+            vi.advanceTimersByTime(1000)
+            result.current.updateProgress('model-1', 0.6, 'model-1', 600, 1000)
+            result.current.updateStage('model-1', {
+              kind,
+              attempt: 1,
+              maxAttempts: 5,
+            })
+          })
+          const entry = result.current.downloads['model-1']
+          expect(entry.speed.bytesPerSecond).toBe(0)
+          expect(entry.speed.atBytes).toBe(600)
+          expect(entry.current).toBe(600)
+        }
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('counts each stall once, and every reconnect attempt', () => {
+      const { result } = renderHook(() => useDownloadStore())
+      const stalled = { kind: 'stalled', attempt: 0, maxAttempts: 5 }
+      act(() => {
+        result.current.updateProgress('model-1', 0.1, 'model-1', 100, 1000)
+        result.current.updateStage('model-1', stalled)
+        result.current.updateStage('model-1', stalled)
+        result.current.updateStage('model-1', {
+          kind: 'retrying',
+          attempt: 1,
+          maxAttempts: 5,
+        })
+        result.current.updateStage('model-1', {
+          kind: 'retrying',
+          attempt: 2,
+          maxAttempts: 5,
+        })
+        result.current.updateProgress('model-1', 0.2, 'model-1', 200, 1000)
+        result.current.updateStage('model-1', stalled)
+      })
+
+      const entry = result.current.downloads['model-1']
+      expect(entry.stalls).toBe(2)
+      expect(entry.retries).toBe(2)
+    })
+
+    it('remembers where the run started, and starts over on a restart', () => {
+      vi.useFakeTimers()
+      try {
+        const { result } = renderHook(() => useDownloadStore())
+        act(() => {
+          result.current.updateProgress('model-1', 0.4, 'model-1', 400, 1000)
+        })
+        const start = result.current.downloads['model-1'].transferStart
+        expect(start?.bytes).toBe(400)
+
+        act(() => {
+          vi.advanceTimersByTime(1000)
+          result.current.updateProgress('model-1', 0.6, 'model-1', 600, 1000)
+        })
+        expect(result.current.downloads['model-1'].transferStart).toEqual(
+          start
+        )
+
+        act(() => {
+          result.current.updateProgress('model-1', 0, 'model-1', 0, 1000)
+        })
+        expect(result.current.downloads['model-1'].transferStart?.bytes).toBe(
+          0
+        )
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('creates an entry for a download that has not reported bytes yet', () => {
+      // The first stage event arrives before any progress event, because the
+      // preflight ladder runs before a single byte is requested.
+      const { result } = renderHook(() => useDownloadStore())
+
+      act(() => {
+        result.current.updateStage('model-1', {
+          kind: 'connecting',
+          attempt: 0,
+          maxAttempts: 5,
+        })
+      })
+
+      const entry = result.current.downloads['model-1']
+      expect(entry).toBeDefined()
+      expect(entry.name).toBe('model-1')
+      expect(entry.total).toBe(0)
+      expect(entry.stage?.kind).toBe('connecting')
     })
   })
 

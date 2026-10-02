@@ -6,10 +6,10 @@
     "lines": 65.6
   },
   "web-app/src/containers/SetupScreen.tsx": {
-    "statements": 34.44,
-    "branches": 63.63,
-    "functions": 22.22,
-    "lines": 34.44
+    "statements": 79.29,
+    "branches": 66.22,
+    "functions": 86.66,
+    "lines": 79.29
   },
   "web-app/src/containers/SetupBackendStep.tsx": {
     "statements": 3.21,
@@ -52,5 +52,119 @@
     "branches": 73.25,
     "functions": 59.37,
     "lines": 54.59
+  },
+  "web-app/src/lib/scanned-model-import.ts": {
+    "statements": 100,
+    "branches": 100,
+    "functions": 100,
+    "lines": 100
+  },
+  "web-app/src/lib/diffusion/size.ts": {
+    "statements": 95,
+    "branches": 85,
+    "functions": 100,
+    "lines": 95
+  },
+  "web-app/src/lib/diffusion/recipe.ts": {
+    "statements": 95,
+    "branches": 85,
+    "functions": 100,
+    "lines": 95
+  },
+  "web-app/src/lib/diffusion/generation-stop.ts": {
+    "statements": 95,
+    "branches": 85,
+    "functions": 100,
+    "lines": 95
+  },
+  "web-app/src/lib/diffusion/errors.ts": {
+    "statements": 95,
+    "branches": 85,
+    "functions": 100,
+    "lines": 95
+  },
+  "web-app/src/lib/diffusion/telemetry.ts": {
+    "statements": 95,
+    "branches": 85,
+    "functions": 100,
+    "lines": 95
+  },
+  "web-app/src/stores/image-generation-store.ts": {
+    "statements": 80,
+    "branches": 70,
+    "functions": 85,
+    "lines": 80
+  },
+  "web-app/src/services/diffusion/backendMatrix.ts": {
+    "statements": 95,
+    "branches": 85,
+    "functions": 100,
+    "lines": 95
+  },
+  "web-app/src/lib/diffusion/fit.ts": {
+    "statements": 95,
+    "branches": 85,
+    "functions": 100,
+    "lines": 95
+  },
+  "web-app/src/lib/diffusion/validate.ts": {
+    "statements": 95,
+    "branches": 85,
+    "functions": 100,
+    "lines": 95
+  },
+  "web-app/src/lib/diffusion/models.ts": {
+    "statements": 95,
+    "branches": 85,
+    "functions": 100,
+    "lines": 95
+  },
+  "web-app/src/stores/media-gallery-store.ts": {
+    "statements": 90,
+    "branches": 80,
+    "functions": 100,
+    "lines": 90
+  },
+  "web-app/src/stores/video-generation-store.ts": {
+    "statements": 80,
+    "branches": 70,
+    "functions": 85,
+    "lines": 80
+  },
+  "web-app/src/hooks/useVideoForm.ts": {
+    "statements": 90,
+    "branches": 80,
+    "functions": 100,
+    "lines": 90
+  },
+  "web-app/src/hooks/useVideoSetting.ts": {
+    "statements": 90,
+    "branches": 80,
+    "functions": 100,
+    "lines": 90
+  },
+  "web-app/src/lib/video/duration.ts": {
+    "statements": 95,
+    "branches": 85,
+    "functions": 100,
+    "lines": 95
+  },
+  "web-app/src/lib/video/validate.ts": {
+    "statements": 95,
+    "branches": 85,
+    "functions": 100,
+    "lines": 95
+  },
+  "web-app/src/lib/video/recipe.ts": {
+    "statements": 95,
+    "branches": 85,
+    "functions": 100,
+    "lines": 95
+  },
+  "web-app/src/lib/video/poster.ts": {
+    "statements": 85,
+    "branches": 75,
+    "functions": 100,
+    "lines": 85
   }
 }

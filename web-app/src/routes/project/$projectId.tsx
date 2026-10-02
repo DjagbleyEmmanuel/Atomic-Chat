@@ -11,9 +11,14 @@ import HeaderPage from '@/containers/HeaderPage'
 import ThreadList from '@/containers/ThreadList'
 import { AvatarEmoji } from '@/containers/AvatarEmoji'
 
-import { FolderPenIcon, MessageCircle, MoreHorizontal, PencilIcon, Trash2 } from 'lucide-react'
+import {
+  FolderPenIcon,
+  MessageCircle,
+  MoreHorizontal,
+  PencilIcon,
+  Trash2,
+} from 'lucide-react'
 import ProjectFiles from '@/containers/ProjectFiles'
-import DropdownModelProvider from '@/containers/DropdownModelProvider'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -36,7 +41,9 @@ function ProjectPageContent() {
   const { projectId } = useParams({ from: '/project/$projectId' })
   const { getFolderById, updateFolder } = useThreadManagement()
   const threads = useThreads((state) => state.threads)
-  const deleteAllThreadsByProject = useThreads((state) => state.deleteAllThreadsByProject)
+  const deleteAllThreadsByProject = useThreads(
+    (state) => state.deleteAllThreadsByProject
+  )
   const { assistants } = useAssistant()
 
   const [editDialogOpen, setEditDialogOpen] = useState(false)
@@ -87,19 +94,15 @@ function ProjectPageContent() {
 
   return (
     <div className="flex flex-col h-svh w-full min-w-0 overflow-hidden">
-      <HeaderPage>
-        <div className="flex items-center justify-between w-full">
-          <DropdownModelProvider showSampler={false} />
-        </div>
-      </HeaderPage>
+      {/* The model is picked from the composer; the header only frames the
+          page. */}
+      <HeaderPage />
 
       <div className="h-full relative flex flex-col px-4 md:px-8 py-4 overflow-y-auto">
         <div className="mx-auto w-full md:w-4/5 xl:w-4/6">
           {/* Project Name with Dropdown */}
           <div className="flex items-center justify-between gap-2 mb-4">
-            <h1 className="text-2xl font-semibold">
-              {project.name}
-            </h1>
+            <h1 className="text-2xl font-semibold">{project.name}</h1>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button variant="ghost" size="icon-xs">
@@ -130,6 +133,8 @@ function ProjectPageContent() {
               showSpeedToken={false}
               initialMessage={true}
               projectId={projectId}
+              containerClassName="max-w-none"
+              minRows={3}
             />
           </div>
 
@@ -140,7 +145,10 @@ function ProjectPageContent() {
                 <h2 className="text-base font-medium">
                   {t('projects.conversation')}
                 </h2>
-                <DropdownMenu open={dropdownOpen} onOpenChange={setDropdownOpen}>
+                <DropdownMenu
+                  open={dropdownOpen}
+                  onOpenChange={setDropdownOpen}
+                >
                   <DropdownMenuTrigger asChild>
                     <Button variant="ghost" size="icon-xs">
                       <MoreHorizontal className="size-4" />
@@ -174,7 +182,9 @@ function ProjectPageContent() {
                 {t('projects.noConversationsIn', { projectName: project.name })}
               </h3>
               <p className="text-sm text-muted-foreground">
-                {t('projects.startNewConversation', { projectName: project.name })}
+                {t('projects.startNewConversation', {
+                  projectName: project.name,
+                })}
               </p>
             </div>
           )}
@@ -184,7 +194,9 @@ function ProjectPageContent() {
             {/* Assistant Section */}
             <div className="flex items-center justify-between p-4 border-b border-border">
               <div className="flex flex-col gap-1">
-                <h3 className="text-sm font-medium">{t('projects.addProjectDialog.assistant')}</h3>
+                <h3 className="text-sm font-medium">
+                  {t('projects.addProjectDialog.assistant')}
+                </h3>
                 {projectAssistant ? (
                   <div className="flex items-center gap-1.5 mt-1">
                     {projectAssistant.avatar && (
@@ -194,7 +206,9 @@ function ProjectPageContent() {
                         textClassName="text-sm"
                       />
                     )}
-                    <span className="text-sm text-muted-foreground">{projectAssistant.name}</span>
+                    <span className="text-sm text-muted-foreground">
+                      {projectAssistant.name}
+                    </span>
                   </div>
                 ) : (
                   <p className="text-sm text-muted-foreground">

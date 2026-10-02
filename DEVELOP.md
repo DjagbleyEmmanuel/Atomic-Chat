@@ -1,63 +1,82 @@
-# Стабильный запуск и доработка Atomic Chat
+# Running and developing Atomic Chat reliably
 
-## Что произошло в логе
+## What happened in the log
 
-1. **Ошибки Vite/esbuild** (`The service was stopped` / `The service is no longer running`) появились **после того, как ты закрыл окно Atomic Chat**. При закрытии приложения завершается процесс `cargo run` → завершается весь `yarn dev` → останавливается дочерний Vite. В момент остановки Vite ещё успевает попытаться обработать запросы (HMR и т.д.) и пишет, что сервис уже не запущен. Это не баг кода, а следствие остановки dev-процесса.
+1. **Vite/esbuild errors** (`The service was stopped` / `The service is no longer running`) appeared **after you closed the Atomic Chat window**. Closing the app ends the `cargo run` process → the whole `yarn dev` ends → the child Vite process stops. While stopping, Vite still tries to handle requests (HMR, etc.) and reports that the service is no longer running. This is not a code bug, just a consequence of the dev process shutting down.
 
-2. **Иконки генерируются при каждом запуске** — скрипт `dev:tauri` каждый раз вызывает `yarn build:icon`. Так задумано в проекте, добавляет несколько секунд к старту.
+2. **Icons are generated on every launch** — the `dev:tauri` script calls `yarn build:icon` every time. This is by design in the project and adds a few seconds to startup.
 
-3. **Rust пересобирается** — при первом после изменений запуске cargo делает инкрементальную сборку (~13–40 с). Без изменений в Rust сборка почти мгновенная.
+3. **Rust gets rebuilt** — on the first launch after changes, cargo does an incremental build (~13–40 s). Without Rust changes the build is almost instant.
 
 ---
 
-## Как запускать стабильно
+## How to run reliably
 
-### Один терминал, один процесс
+### Isolated QA/dev profile
+
+To check the first-run flow without reading or changing your usual profile,
+start the app with an absolute directory in `ATOMIC_CHAT_PROFILE_DIR`. Settings
+then live in `<profile>/settings.json` and data in `<profile>/data`; the legacy
+Atomic Chat/Jan directories are not used in this mode. The app hands
+`<profile>/data` to the core it starts (`--data-folder`).
+
+```bash
+ATOMIC_CHAT_PROFILE_DIR=/tmp/atomic-chat-clean-flow yarn dev
+```
+
+The CLI is the core's and does not read the variable: give it a folder of its
+own (it refuses the app's data folder), for example
+`bun run ../atomic-chat-core/src/cli/bin.ts --data-folder /tmp/atomic-chat-clean-cli --help`.
+
+The variable is meant for QA and development only. An empty or relative value,
+or one containing `..`, is ignored and the app uses the usual profile.
+
+### One terminal, one process
 
 ```bash
 cd /Users/max/Desktop/desc-app/jan
 yarn dev
 ```
 
-- Дождись в логе: `Running target/debug/Atomic Chat` и появления окна Atomic Chat.
-- **Не закрывай этот терминал** и по возможности **не закрывай окно Atomic Chat** во время разработки.
-- Редактируй код в `web-app/` — Vite подхватит изменения (hot reload), перезапуск не нужен.
-- Редактируешь Rust в `src-tauri/` — после сохранения Tauri сам пересоберёт и перезапустит приложение.
+- Wait for `Running target/debug/Atomic Chat` in the log and for the Atomic Chat window to appear.
+- **Do not close this terminal**, and if possible **do not close the Atomic Chat window** while developing.
+- Edit code in `web-app/` — Vite picks up the changes (hot reload), no restart needed.
+- When you edit Rust in `src-tauri/`, Tauri rebuilds and restarts the app on save.
 
-**Когда закончил работу:** закрой окно Atomic Chat, затем в терминале нажми **Ctrl+C** один раз. Так и Vite, и Tauri завершатся предсказуемо, без лишних сообщений об остановленном сервисе.
+**When you are done:** close the Atomic Chat window, then press **Ctrl+C** once in the terminal. That way both Vite and Tauri shut down predictably, without extra messages about a stopped service.
 
 ---
 
-## Порядок при каждом «приходе за компьютер»
+## Routine for every time you sit down to work
 
-1. Открыть терминал.
+1. Open a terminal.
 2. `cd /Users/max/Desktop/desc-app/jan`
 3. `yarn dev`
-4. Дождаться открытия окна Atomic Chat.
-5. Дорабатывать фронт в `web-app/` или бэкенд в `src-tauri/`.
-6. В конце: закрыть окно Atomic Chat → в терминале **Ctrl+C**.
+4. Wait for the Atomic Chat window to open.
+5. Work on the frontend in `web-app/` or the backend in `src-tauri/`.
+6. At the end: close the Atomic Chat window → **Ctrl+C** in the terminal.
 
-Повторный запуск — снова только `yarn dev` (без `make dev`), если не менял зависимости и не делал `make clean`.
+To run again, just `yarn dev` (no `make dev`), as long as you have not changed dependencies or run `make clean`.
 
 ---
 
-## Что где править
+## What to edit where
 
-| Задача | Где код |
+| Task | Where the code is |
 |--------|--------|
-| UI, экраны, компоненты | `web-app/src/` |
-| Логика расширений, ядро (TypeScript) | `core/`, `extensions/` |
-| Нативное API, плагины, CLI | `src-tauri/` (Rust) |
+| UI, screens, components | `web-app/src/` |
+| Extension logic, core (TypeScript) | `core/`, `extensions/` |
+| Native API, plugins, CLI | `src-tauri/` (Rust) |
 
-После правок в **web-app** перезапуск не нужен — сработает hot reload. После правок в **Rust** Tauri сам пересоберёт и перезапустит приложение.
+After changes in **web-app** no restart is needed — hot reload kicks in. After changes in **Rust**, Tauri rebuilds and restarts the app on its own.
 
 ---
 
-## Если что-то пошло не так
+## If something goes wrong
 
-- **«The service is no longer running»** — обычно значит, что процесс уже завершён (закрыли окно или нажали Ctrl+C). Просто заново запусти `yarn dev`.
-- **Окно не открывается / зависает** — убедись, что порт 1420 свободен (`lsof -i :1420`), заверши старые процессы и снова `yarn dev`.
-- **После смены ветки или pull** — при необходимости выполни `make dev` один раз (полная установка и сборка), дальше снова только `yarn dev`.
+- **"The service is no longer running"** — usually means the process has already exited (the window was closed or Ctrl+C was pressed). Just run `yarn dev` again.
+- **The window does not open / hangs** — make sure port 1420 is free (`lsof -i :1420`), kill old processes and run `yarn dev` again.
+- **After switching branches or pulling** — if needed, run `make dev` once (full install and build), then go back to just `yarn dev`.
 
 ---
 
@@ -71,6 +90,9 @@ Dev (`make dev-windows-cpu` / `yarn dev`) and the installed `Atomic Chat.exe` **
 | `%APPDATA%\Atomic Chat\data\llamacpp\backends\` | **Legacy** (pre-2026-05-22) turboquant `llamacpp` backends. Left orphaned on existing installs and ignored by the Windows app; safe to delete manually. Models under `data\llamacpp\models\` are still active (shared root). | manual delete, `make clean-windows-all`, uninstaller |
 | `%APPDATA%\Atomic Chat\data\models\` | Downloaded GGUF / MLX models | factory reset (UI), `make clean-windows-all`, uninstaller |
 | `%APPDATA%\Atomic Chat\data\threads\` | Chat history | factory reset, `make clean-windows-all`, uninstaller |
+| `%APPDATA%\Atomic Chat\data\diffusion\backends\` | Downloaded `stable-diffusion.cpp` (`sd-server`) builds, one tree per tag and backend id, sourced from `leejet/stable-diffusion.cpp` via `atomic-chat-conf/backends/sdcpp-manifest.json`. Trees carry an `.atomic-owned` marker. | factory reset, `make clean-windows-all`, uninstaller |
+| `%APPDATA%\Atomic Chat\data\diffusion\models\` | Image-generation checkpoints (`<family>\*.gguf`) and shared side files (`shared\<repo>\`: VAE, text encoders). Deliberately outside `models\` so the hub and the local-model scanner never list them. | factory reset, `make clean-windows-all`, uninstaller |
+| `%APPDATA%\Atomic Chat\data\images\` | Generated images (`<jobId>-<nn>.png` with the recipe in a PNG `tEXt` chunk, `.thumb.png` beside each) and `.flags.json`. Relocatable from Settings → Media. | factory reset, `make clean-windows-all`, uninstaller |
 | `%APPDATA%\Atomic Chat\data\extensions\` | Installed extensions (`@janhq/*`, `llamacpp-extension`, …) | factory reset, `make clean-windows-all`, uninstaller |
 | `%APPDATA%\Atomic Chat\data\logs\app.log` | Application logs (`tauri_plugin_log`) | factory reset, `make clean-windows-all`, uninstaller |
 | `%APPDATA%\Atomic Chat\data\store.json` | Migration / version store | factory reset, `make clean-windows-all`, uninstaller |

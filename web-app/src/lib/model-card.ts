@@ -20,15 +20,15 @@ export const HARDWARE_FIT: Record<
 > = {
   ok: {
     label: 'Good fit',
-    tip: 'This model is likely to run on your hardware',
+    tip: 'Full offload likely possible on your system.',
   },
   maybe: {
-    label: 'Should run',
-    tip: 'This model can probably run on your hardware',
+    label: 'Might fit',
+    tip: 'Within the last GB of VRAM headroom, so loading can fail if other apps are using GPU memory.',
   },
   no: {
-    label: 'Too large',
-    tip: 'This model is probably too large for your hardware',
+    label: 'Won’t fit',
+    tip: 'Exceeds combined VRAM and system RAM budget.',
   },
 }
 
@@ -193,9 +193,9 @@ export type Capability = {
   className: string
 }
 
-//* Outlined-tinted палитра с light + dark вариантами — тот же канон, что у
-//* FIT_BADGE_CLASS: светлый pill в light-теме и приглушённый тёмный с светлым
-//* текстом в dark. Цвет каждой способности сохранён (amber/blue/fuchsia/teal).
+//* Outlined-tinted palette with light + dark variants — the same convention as
+//* FIT_BADGE_CLASS: a light pill in the light theme and a muted dark one with light
+//* text in dark. Each capability keeps its color (amber/blue/fuchsia/teal).
 const CAP_COLORS = {
   vision:
     'border border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950/45 dark:text-amber-200',

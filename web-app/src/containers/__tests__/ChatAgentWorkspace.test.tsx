@@ -1,10 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
-import {
-  canSelectChatAgentMode,
-  ChatAgentModeSwitch,
-} from '@/containers/ChatAgentModeSwitch'
 import { AgentTaskSuggestions } from '@/containers/AgentTaskSuggestions'
 import { AgentApprovalModeSelect } from '@/containers/AgentApprovalModeSelect'
 
@@ -26,78 +22,7 @@ vi.mock('@/i18n/react-i18next-compat', () => ({
 }))
 
 describe('Chat and Agent workspace controls', () => {
-  it('allows mode selection only for the Home composer', () => {
-    expect(canSelectChatAgentMode(true, undefined)).toBe(true)
-    expect(canSelectChatAgentMode(false, undefined)).toBe(false)
-    expect(canSelectChatAgentMode(undefined, undefined)).toBe(false)
-    expect(canSelectChatAgentMode(true, 'project-1')).toBe(false)
-  })
-
-  it('exposes pressed state and changes the selected mode', async () => {
-    const user = userEvent.setup()
-    const onChange = vi.fn()
-
-    render(
-      <ChatAgentModeSwitch
-        isAgentMode={false}
-        onChange={onChange}
-        chatLabel="Chat"
-        agentLabel="Agent"
-      />
-    )
-
-    expect(screen.getByRole('button', { name: 'Chat' })).toHaveAttribute(
-      'aria-pressed',
-      'true'
-    )
-    expect(screen.getByRole('button', { name: 'Agent' })).toHaveAttribute(
-      'aria-pressed',
-      'false'
-    )
-
-    await user.click(screen.getByRole('button', { name: 'Agent' }))
-
-    expect(onChange).toHaveBeenCalledWith(true)
-  })
-
-  it('disables Agent mode and exposes the MLX restriction tooltip', () => {
-    const onChange = vi.fn()
-
-    render(
-      <ChatAgentModeSwitch
-        isAgentMode={false}
-        onChange={onChange}
-        chatLabel="Chat"
-        agentLabel="Agent"
-        agentDisabled
-        agentDisabledTooltip="Switch to a llama.cpp model."
-      />
-    )
-
-    const agentButton = screen.getByRole('button', { name: 'Agent' })
-    expect(agentButton).toBeDisabled()
-    expect(agentButton.parentElement).toHaveAttribute(
-      'title',
-      'Switch to a llama.cpp model.'
-    )
-    expect(onChange).not.toHaveBeenCalled()
-  })
-
-  it('shows the Agent attention dot when requested', () => {
-    render(
-      <ChatAgentModeSwitch
-        isAgentMode={false}
-        onChange={vi.fn()}
-        chatLabel="Chat"
-        agentLabel="Agent"
-        showAgentAttention
-      />
-    )
-
-    expect(screen.getByTestId('agent-mode-attention-dot')).toBeInTheDocument()
-  })
-
-  it('shows suggestions only in Agent mode and fills without submitting', async () => {
+  it('shows suggestions when visible and fills without submitting', async () => {
     const user = userEvent.setup()
     const onSelect = vi.fn()
     const { rerender } = render(
@@ -126,18 +51,78 @@ describe('Chat and Agent workspace controls', () => {
       <AgentApprovalModeSelect
         mode="manual"
         onChange={onChange}
+        menuTitle="How should tool calls be approved?"
         manualSelectedLabel="Manually"
         manualLabel="Manually approve"
         manualDescription="Pause for sensitive actions."
         skipSelectedLabel="Skip All"
         skipLabel="Skip all approvals"
         skipDescription="Never pause."
+        skipConfirmTitle="Enable Full access?"
+        skipConfirmBody="Tool calls will run without approval prompts."
+        skipConfirmCancel="Cancel"
+        skipConfirmAccept="I understand"
       />
     )
 
     await user.click(screen.getByRole('button', { name: 'Manually' }))
+    expect(
+      screen.getByText('How should tool calls be approved?')
+    ).toBeInTheDocument()
     await user.click(screen.getByText('Skip all approvals'))
 
+    // Full access asks first; the mode changes only from the dialog.
+    expect(onChange).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'I understand' }))
+
     expect(onChange).toHaveBeenCalledWith('skip')
+  })
+
+  // Full access used to paint the trigger and its whole menu row red, which
+  // read as an error and scared people off a mode that is theirs to pick. It
+  // now looks like the other mode; its icon and words say what it does.
+  it('gives full access no colour of its own', async () => {
+    const user = userEvent.setup()
+
+    render(
+      <AgentApprovalModeSelect
+        mode="skip"
+        onChange={vi.fn()}
+        menuTitle="How should tool calls be approved?"
+        manualSelectedLabel="Manually"
+        manualLabel="Manually approve"
+        manualDescription="Pause for sensitive actions."
+        skipSelectedLabel="Skip All"
+        skipLabel="Skip all approvals"
+        skipDescription="Never pause."
+        skipConfirmTitle="Enable Full access?"
+        skipConfirmBody="Tool calls will run without approval prompts."
+        skipConfirmCancel="Cancel"
+        skipConfirmAccept="I understand"
+      />
+    )
+
+    // Icon classes without the lucide name that tells the two icons apart.
+    const look = (icon: Element | null) =>
+      [...(icon?.classList ?? [])]
+        .filter((name) => !name.startsWith('lucide'))
+        .join(' ')
+
+    const trigger = screen.getByRole('button', { name: 'Skip All' })
+    expect(trigger.className).not.toMatch(/destructive|amber/)
+    expect(look(trigger.querySelector('svg'))).toBe('size-4')
+
+    await user.click(trigger)
+    const fullAccess = screen.getByRole('menuitem', {
+      name: /Skip all approvals/,
+    })
+    const manual = screen.getByRole('menuitem', { name: /Manually approve/ })
+    expect(fullAccess).toHaveAttribute('data-variant', 'default')
+    expect(look(fullAccess.querySelector('svg'))).toBe(
+      look(manual.querySelector('svg'))
+    )
+    expect(screen.getByText('Never pause.').className).toBe(
+      screen.getByText('Pause for sensitive actions.').className
+    )
   })
 })

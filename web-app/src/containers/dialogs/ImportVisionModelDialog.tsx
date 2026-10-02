@@ -282,9 +282,7 @@ export const ImportVisionModelDialog = ({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>{trigger}</DialogTrigger>
       <DialogContent
-        onInteractOutside={(e) => {
-          e.preventDefault()
-        }}
+        className="sm:max-w-lg lg:max-w-lg xl:max-w-lg"
       >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">

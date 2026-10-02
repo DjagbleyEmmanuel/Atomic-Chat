@@ -31,7 +31,6 @@ type PromptStoreState = {
   setPrompt: (value: string) => void
   resetPrompt: () => void
   setActiveThread: (threadId: string | undefined) => void
-  clearDraft: (threadId: string) => void
 }
 
 export const usePrompt = create<PromptStoreState>((set, get) => ({
@@ -66,13 +65,5 @@ export const usePrompt = create<PromptStoreState>((set, get) => ({
       prompt: threadId ? drafts[threadId] ?? '' : '',
       activeThreadId: threadId,
     })
-  },
-  clearDraft: (threadId) => {
-    const { drafts } = get()
-    if (!(threadId in drafts)) return
-    const nextDrafts = { ...drafts }
-    delete nextDrafts[threadId]
-    persistDrafts(nextDrafts)
-    set({ drafts: nextDrafts })
   },
 }))

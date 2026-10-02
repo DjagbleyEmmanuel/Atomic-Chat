@@ -1,7 +1,11 @@
 {
+  "api": "API",
+  "cloud": "Cloud",
   "assistants": "Asistentes",
   "hardware": "Hardware",
   "mcp-servers": "Servidores MCP",
+  "connectors": "Conectores",
+  "plugins": "Plugins",
   "local_api_server": "Servidor API local",
   "remote_access": "Acceso remoto",
   "integrations": "Integraciones",
@@ -30,6 +34,9 @@
   "recents": "Recientes",
   "hub": "Hub",
   "models": "Modelos",
+  "images": "Images",
+  "video": "Video",
+  "media": "Media",
   "helpSupport": "Ayuda y soporte",
   "helpUsImproveJan": "Ayúdanos a mejorar Atomic Bot",
   "unstarAll": "Quitar todas las estrellas",
@@ -452,9 +459,24 @@
   },
   "errors": {
     "fileTooLarge": "Archivo demasiado grande",
-    "fileTooLargeDescription": "{{fileName}} excede el límite de {{maxFileSizeMB}}MB"
+    "fileTooLargeDescription": "{{fileName}} excede el límite de {{maxFileSizeMB}}MB",
+    "fileReadFailed": "No se pudo leer el archivo",
+    "fileReadFailedDescription": "No se pudo leer {{fileName}} desde el disco"
   },
   "files": {
     "chunksCount": "{{count}} fragmentos"
+  },
+  "skills": "Habilidades",
+  "pluginsMenu": {
+    "title": "Plugins",
+    "emptySkills": "Aún no hay habilidades",
+    "manageSkills": "Gestionar habilidades"
+  },
+  "desktopNotification": {
+    "modelReadyTitle": "Modelo descargado",
+    "modelReadyBody": "{{name}} está listo para usar.",
+    "engineReadyTitle": "Motor instalado",
+    "chatEngineReadyBody": "llama.cpp está listo para ejecutar modelos.",
+    "mediaEngineReadyBody": "El motor de imágenes y video está listo."
   }
 }

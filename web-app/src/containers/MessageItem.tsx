@@ -5,23 +5,26 @@ import {
   useEffect,
   useRef,
   type ComponentPropsWithoutRef,
+  type UIEventHandler,
 } from 'react'
 import type { UIMessage, ChatStatus } from 'ai'
 import { RenderMarkdown } from './RenderMarkdown'
 import { useInterfaceSettings } from '@/hooks/useInterfaceSettings'
 import { cn } from '@/lib/utils'
-import { twMerge } from 'tailwind-merge'
 import {
   Reasoning,
   ReasoningContent,
   ReasoningTrigger,
+  ReasoningViewport,
 } from '@/components/ai-elements/reasoning'
-import { Shimmer } from '@/components/ai-elements/shimmer'
-import { Tool } from '@/components/ai-elements/tools/tool'
 import { CopyButton } from './CopyButton'
 import { useModelProvider } from '@/hooks/useModelProvider'
-import { useGeneralSetting } from '@/hooks/useGeneralSetting'
-import { IconMessageReply, IconPencil, IconRefresh } from '@tabler/icons-react'
+import {
+  IconAlertCircle,
+  IconMessageReply,
+  IconPencil,
+  IconRefresh,
+} from '@tabler/icons-react'
 import { AudioPlayer } from '@/containers/AudioPlayer'
 import { InlineMessageEditor } from '@/containers/InlineMessageEditor'
 import { DeleteMessageDialog } from '@/containers/dialogs/DeleteMessageDialog'
@@ -31,20 +34,23 @@ import { AttachmentChip } from '@/containers/AttachmentChip'
 import { useMemo } from 'react'
 import { Button } from '@/components/ui/button'
 import { useTranslation } from '@/i18n/react-i18next-compat'
-import { buildTraceBlocks } from '@/lib/tools/message-trace-parts'
-import { ToolRenderer } from '@/components/ai-elements/tools/tool-renderer'
+import {
+  buildTraceBlocks,
+  isAgentTurnActive,
+} from '@/lib/tools/message-trace-parts'
+import type { AgentRunSummary } from '@/types/agent'
+import { ToolActivityGroup } from '@/components/ai-elements/tools/activity-group'
 import { TraceBlock } from '@/lib/tools/types'
 import {
-  ActivityDetail,
-  AgentActivity,
-} from '@/components/ai-elements/agent-activity'
-import {
   agentFilePathFromHref,
+  containsAgentFileLink,
   type AgentFileReference,
   extractAgentToolPaths,
   linkAgentFileReferences,
 } from '@/lib/agent-file-links'
 import { useServiceHub } from '@/hooks/useServiceHub'
+import { agentErrorCopy } from '@/lib/agent-error-copy'
+import { isPlatformTauri } from '@/lib/platform/utils'
 
 const CHAT_STATUS = {
   STREAMING: 'streaming',
@@ -69,17 +75,11 @@ export type MessageItemProps = {
   status: ChatStatus
   requestActive?: boolean
   reasoningContainerRef?: React.RefObject<HTMLDivElement | null>
-  onReasoningScroll?: () => void
+  onReasoningScroll?: UIEventHandler<HTMLDivElement>
   onRegenerate?: (messageId: string) => void
   onEdit?: (messageId: string, newText: string) => void
   onDelete?: (messageId: string) => void
   onReply?: (messageId: string, snippet: string) => void
-  onCancelToolCall?: (toolCallId: string) => void
-  onRetryToolCall?: (
-    toolCallId: string,
-    toolName: string,
-    input: unknown
-  ) => void
   assistant?: { avatar?: React.ReactNode; name?: string }
   showAssistant?: boolean
   isAnimating?: boolean
@@ -101,8 +101,6 @@ export const MessageItem = memo(
     onEdit,
     onDelete,
     onReply,
-    onCancelToolCall,
-    onRetryToolCall,
     agentAttachmentReferences = [],
   }: MessageItemProps) => {
     const { t } = useTranslation('chat')
@@ -110,12 +108,6 @@ export const MessageItem = memo(
     const selectedModel = useModelProvider((state) => state.selectedModel)
     const messageDisplayMode = useInterfaceSettings(
       (state) => state.messageDisplayMode
-    )
-    // Global "Disable reasoning" toggle: some providers (e.g. MiniMax) ignore
-    // every known API flag and keep streaming chain-of-thought. Hide those
-    // parts in the UI so the experience matches the user's intent.
-    const disableReasoning = useGeneralSetting(
-      (state) => state.disableReasoning
     )
     const [previewImage, setPreviewImage] = useState<{
       url: string
@@ -198,22 +190,30 @@ export const MessageItem = memo(
     const getThinkingMessage = useCallback(
       (thinking: boolean, duration?: number) => {
         if (thinking) {
-          return <Shimmer duration={1}>{t('activity.thinking')}</Shimmer>
+          return t('activity.thinkingFor', { count: duration ?? 1 })
         }
-        if (!duration) {
-          return <p>{t('activity.reasoned')}</p>
+        if (duration === undefined) {
+          return t('activity.reasoned')
         }
-        return <p>{t('activity.thoughtFor', { count: duration })}</p>
+        return t('activity.thoughtFor', { count: duration })
       },
       [t]
     )
 
     const isStreaming = isLastMessage && status === CHAT_STATUS.STREAMING
+    const agentRunStatus = (
+      message.metadata as { agent_run?: AgentRunSummary } | undefined
+    )?.agent_run?.status
+    // Agent metadata owns its lifecycle; Chat's transport flags can lag a
+    // terminal agent event or go idle while permission is being requested.
     const isRequestActive =
       isLastMessage &&
       message.role === 'assistant' &&
-      (requestActive ??
-        (status === CHAT_STATUS.STREAMING || status === CHAT_STATUS.SUBMITTED))
+      (agentRunStatus !== undefined
+        ? isAgentTurnActive(agentRunStatus)
+        : (requestActive ??
+          (status === CHAT_STATUS.STREAMING ||
+            status === CHAT_STATUS.SUBMITTED)))
     const isAgentMessage = Boolean(
       (message.metadata as { agent_run?: unknown } | undefined)?.agent_run
     )
@@ -234,45 +234,54 @@ export const MessageItem = memo(
           : [],
       [agentAttachmentReferences, isAgentMessage, message.parts]
     )
-    const agentMarkdownComponents = useMemo(
-      () =>
-        isAgentMessage
-          ? {
-              a: ({
-                href,
-                children,
-                ...props
-              }: ComponentPropsWithoutRef<'a'>) => {
-                const filePath = href ? agentFilePathFromHref(href) : null
-                if (!filePath) {
-                  return (
-                    <a href={href} {...props}>
-                      {children}
-                    </a>
-                  )
-                }
+    const messageMarkdownComponents = useMemo(
+      () => ({
+        a: ({
+          href,
+          children,
+          target,
+          rel,
+          ...props
+        }: ComponentPropsWithoutRef<'a'>) => {
+          const filePath = href ? agentFilePathFromHref(href) : null
+          if (!filePath) {
+            return (
+              <a
+                href={href}
+                target={target ?? '_blank'}
+                rel={rel ?? 'noopener noreferrer'}
+                {...props}
+              >
+                {children}
+              </a>
+            )
+          }
 
-                return (
-                  <a
-                    href={href}
-                    {...props}
-                    onClick={(event) => {
-                      event.preventDefault()
-                      void serviceHub
-                        .opener()
-                        .openPath(filePath)
-                        .catch((error) => {
-                          console.error('Failed to open Agent file:', error)
-                        })
-                    }}
-                  >
-                    {children}
-                  </a>
-                )
-              },
-            }
-          : undefined,
-      [isAgentMessage, serviceHub]
+          return (
+            <a
+              href={href}
+              {...props}
+              className={cn(
+                'font-medium text-blue-600 underline decoration-blue-500/40 underline-offset-2 hover:decoration-blue-600 focus-visible:decoration-blue-600 dark:text-blue-400 dark:hover:decoration-blue-400',
+                props.className
+              )}
+              onClick={(event) => {
+                event.preventDefault()
+                if (!isPlatformTauri()) return
+                void serviceHub
+                  .opener()
+                  .openPath(filePath)
+                  .catch((error) => {
+                    console.error('Failed to open Agent file:', error)
+                  })
+              }}
+            >
+              {children}
+            </a>
+          )
+        },
+      }),
+      [serviceHub]
     )
 
     // Extract file metadata from message text (for user messages with attachments)
@@ -413,6 +422,14 @@ export const MessageItem = memo(
         return renderEditor(block.key)
       }
 
+      const assistantText =
+        message.role === 'assistant'
+          ? linkAgentFileReferences(
+              block.text,
+              isAgentMessage ? agentFileReferences : []
+            )
+          : block.text
+
       return (
         <div key={block.key} className="w-full">
           {message.role === 'user' ? (
@@ -488,12 +505,12 @@ export const MessageItem = memo(
                 )}
               >
                 <RenderMarkdown
-                  content={
-                    isAgentMessage
-                      ? linkAgentFileReferences(block.text, agentFileReferences)
-                      : block.text
+                  content={assistantText}
+                  components={
+                    isAgentMessage || containsAgentFileLink(assistantText)
+                      ? messageMarkdownComponents
+                      : undefined
                   }
-                  components={agentMarkdownComponents}
                   // The thread page reports `submitted` for the whole request, so
                   // `status === 'streaming'` alone would leave HTML artifacts
                   // thinking they are complete and re-render the iframe per token.
@@ -568,123 +585,95 @@ export const MessageItem = memo(
     }
 
     const renderReasoningBlock = (block: ReasoningTraceBlock) => {
-      const streaming = isRequestActive && block.streaming
+      // A reasoning part commonly reports `done` while the same turn pauses
+      // for tools. The disclosure belongs to the enclosing turn, so it must
+      // not finalize and restart as individual reasoning parts come and go.
+      const reasoningActive = isRequestActive
 
       return (
         <Reasoning
           key={block.key}
-          className="mb-3"
-          isStreaming={streaming}
-          defaultOpen={streaming}
+          className="mb-5"
+          isStreaming={reasoningActive}
+          defaultOpen={false}
         >
           <ReasoningTrigger getThinkingMessage={getThinkingMessage} />
-          <div
-            ref={streaming ? reasoningContainerRef : null}
-            onScroll={streaming ? onReasoningScroll : undefined}
-            className={twMerge(
-              'relative w-full overflow-auto',
-              streaming
-                ? 'mt-2 max-h-32 opacity-70 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden [mask-image:linear-gradient(to_bottom,transparent,black_1.5rem)]'
-                : 'h-auto opacity-100'
-            )}
+          <ReasoningViewport
+            ref={reasoningActive ? reasoningContainerRef : null}
+            onScroll={reasoningActive ? onReasoningScroll : undefined}
           >
-            {block.items.map((item) => (
-              <ReasoningContent key={item.key}>{item.text}</ReasoningContent>
-            ))}
-          </div>
+            <ReasoningContent isStreaming={reasoningActive}>
+              {block.items.map((item) => item.text).join('\n\n')}
+            </ReasoningContent>
+          </ReasoningViewport>
         </Reasoning>
       )
     }
 
     const renderActivityBlock = (block: ActivityTraceBlock) => {
-      const agentStatus = block.agentSummary?.status
-      const active =
-        isRequestActive &&
-        (!agentStatus ||
-          agentStatus === 'running' ||
-          agentStatus === 'awaiting_approval')
-      const summaryToolCount =
-        block.agentSummary?.tools.filter(
-          ({ tool }) => tool !== 'reply' && tool !== 'finish'
-        ).length ?? 0
-      const toolCount = block.tools.length || summaryToolCount
-      const durationSeconds = Number(
-        Math.max(0.1, (block.durationMs ?? 100) / 1000).toFixed(1)
-      )
+      const active = isRequestActive
+      const error = block.agentSummary?.error
+      // Pending agent calls already have input-available parts. Permission
+      // waits must still say Working until the run resumes executing them.
+      const awaitingPermission =
+        agentRunStatus === 'awaiting_approval' ||
+        agentRunStatus === 'awaiting_folder_access'
+
+      if (!block.tools.length && !error && !active) {
+        return null
+      }
 
       return (
-        <AgentActivity
-          key={block.key}
-          active={active}
-          workingLabel={t('activity.working')}
-          durationLabel={t('activity.workedFor', {
-            count: durationSeconds,
-          })}
-          hasDetails={toolCount > 0}
-        >
-          {toolCount > 0 && (
-            <ActivityDetail
-              label={t(
-                toolCount === 1
-                  ? 'activity.calledTool'
-                  : 'activity.calledTools',
-                { count: toolCount }
-              )}
-            >
-              {block.tools.map((tool) => (
-                <Tool
-                  key={tool.key}
-                  state={tool.state}
-                  className="py-1"
-                  toolCallId={tool.toolCallId}
-                  toolName={tool.toolName}
-                  input={
-                    'input' in tool.presentation
-                      ? tool.presentation.input
-                      : 'rawInput' in tool.presentation
-                        ? tool.presentation.rawInput
-                        : undefined
-                  }
-                  /* Agent-run tools execute inside the Rust backend, so the
-                     JS cancel/retry handlers cannot reach them — hide the
-                     controls rather than offering dead buttons. */
-                  onCancel={
-                    block.agentSummary ? undefined : onCancelToolCall
-                  }
-                  onRetry={block.agentSummary ? undefined : onRetryToolCall}
+        <div key={block.key} className="not-prose mb-3">
+          {(block.tools.length > 0 || active) && (
+            <ToolActivityGroup
+              tools={block.tools}
+              active={active}
+              working={awaitingPermission}
+              onRetry={onRegenerate ? handleRegenerate : undefined}
+            />
+          )}
+          {error &&
+            (() => {
+              const copy = agentErrorCopy(error)
+              return (
+                <div
+                  role="alert"
+                  className="mt-3 flex items-start gap-3 rounded-xl border border-destructive/20 bg-destructive/5 p-3"
+                  data-testid="agent-error-card"
                 >
-                  <ToolRenderer
-                    presentation={tool.presentation}
-                    state={tool.state}
+                  <IconAlertCircle
+                    size={18}
+                    className="mt-0.5 shrink-0 text-destructive"
                   />
-                </Tool>
-              ))}
-            </ActivityDetail>
-          )}
-          {block.agentSummary?.loops.map((loop, index) => (
-            <div
-              key={`${block.key}-loop-${index}`}
-              className="py-1 text-xs text-muted-foreground"
-            >
-              {loop.message}
-            </div>
-          ))}
-          {block.agentSummary?.error && (
-            <div className="py-1 text-xs text-destructive">
-              {block.agentSummary.error.category}:{' '}
-              {block.agentSummary.error.message}
-            </div>
-          )}
-        </AgentActivity>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium">{t(copy.titleKey)}</p>
+                    <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                      {t(copy.bodyKey)}
+                    </p>
+                  </div>
+                  {onRegenerate && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleRegenerate}
+                    >
+                      {t('chat:agentError.retry')}
+                    </Button>
+                  )}
+                </div>
+              )
+            })()}
+        </div>
       )
     }
 
     const traceBlocks = useMemo(
       () =>
-        buildTraceBlocks(message, disableReasoning, {
+        buildTraceBlocks(message, {
           ensureActivity: isRequestActive,
         }),
-      [message, disableReasoning, isRequestActive]
+      [message, isRequestActive]
     )
 
     // A message with only attachments has no text block to anchor the editor
@@ -762,7 +751,10 @@ export const MessageItem = memo(
 
         {/* Message actions for assistant messages (non-tool) */}
         {message.role === 'assistant' && (
-          <div className="flex flex-wrap items-center gap-2 text-muted-foreground text-xs mt-1">
+          <div
+            className="mt-3 flex min-h-6 flex-wrap items-center gap-2 text-xs text-muted-foreground"
+            data-testid="assistant-message-actions"
+          >
             <div
               className={cn(
                 'flex items-center gap-1',
@@ -894,10 +886,9 @@ export const MessageItem = memo(
       prevProps.status === nextProps.status &&
       prevProps.requestActive === nextProps.requestActive &&
       prevProps.onReply === nextProps.onReply &&
-      prevProps.onCancelToolCall === nextProps.onCancelToolCall &&
-      prevProps.onRetryToolCall === nextProps.onRetryToolCall &&
       prevProps.showAssistant === nextProps.showAssistant &&
       prevProps.hideActions === nextProps.hideActions &&
+      prevProps.onReasoningScroll === nextProps.onReasoningScroll &&
       prevProps.agentAttachmentReferences ===
         nextProps.agentAttachmentReferences
     )

@@ -3,6 +3,7 @@ import { resolve } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import { describe, expect, it } from 'vitest'
 import { z } from 'zod'
+import { HARDWARE_TIERS } from '@/lib/hardware-tier'
 
 const repositoryRoot = process.cwd().endsWith('/web-app')
   ? resolve(process.cwd(), '..')
@@ -58,15 +59,29 @@ const turboquantManifestSchema = z.object({
     .min(1),
 })
 
+const recommendationEntrySchema = z.object({
+  model_name: z.string().regex(/^[^/]+\/[^/]+$/),
+  description_key: z.string().startsWith('hub:'),
+})
+
+/** A rung's entry may pin the quant (and projector) the ladder was measured on. */
+const tierEntrySchema = recommendationEntrySchema.extend({
+  quant: z.string().min(1).optional(),
+  mmproj_quant: z.string().min(1).optional(),
+})
+
 const recommendationSchema = z.object({
   schema_version: z.literal(1),
   updated_at: z.iso.datetime(),
-  recommendations: z.array(
-    z.object({
-      model_name: z.string().regex(/^[^/]+\/[^/]+$/),
-      description_key: z.string().startsWith('hub:'),
-    })
-  ),
+  recommendations: z.array(recommendationEntrySchema),
+  /**
+   * Per-rung offers keyed by `HardwareTier`. Optional and partial — a manifest
+   * may override one rung — but a key outside the ladder is a typo the client
+   * would silently drop, and a rung with no entries would fall back unnoticed.
+   */
+  tiers: z
+    .partialRecord(z.enum(HARDWARE_TIERS), z.array(tierEntrySchema).min(1))
+    .optional(),
 })
 
 /**
@@ -240,6 +255,10 @@ describe('pinned external registry contracts', () => {
    * `schema_version` they do not know. Staff picks exist precisely so that the
    * Hub can evolve without touching that file, so the separation is asserted
    * rather than left to reviewer discipline.
+   *
+   * The screen may list staff picks (ADR 2026-09-11 puts the Hub's picks under
+   * the onboarding offer, through their own store); what must not change is
+   * where the offer comes from and what the recommended loader reads.
    */
   it('keeps the onboarding manifest independent of staff picks', () => {
     const recommended = recommendationSchema.parse(fixture('recommended-models'))
@@ -256,7 +275,6 @@ describe('pinned external registry contracts', () => {
       'utf8'
     )
     expect(setupScreen).toContain('useResolvedRecommendedModels')
-    expect(setupScreen).not.toMatch(/staff-?picks/i)
 
     const recommendedLoader = readFileSync(
       resolve(

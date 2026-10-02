@@ -3,12 +3,15 @@ import { createRootRoute, Outlet } from '@tanstack/react-router'
 
 import DialogAppUpdater from '@/containers/dialogs/AppUpdater'
 import BackendUpdater from '@/containers/dialogs/BackendUpdater'
+import EngineUpdateBanner from '@/containers/dialogs/EngineUpdateBanner'
+import ModelLoadSnackbar from '@/containers/ModelLoadSnackbar'
 import SuboptimalBackendDialog from '@/containers/dialogs/SuboptimalBackendDialog'
 import { Fragment } from 'react/jsx-runtime'
 import { ThemeProvider } from '@/providers/ThemeProvider'
 import { InterfaceProvider } from '@/providers/InterfaceProvider'
 import { KeyboardShortcutsProvider } from '@/providers/KeyboardShortcuts'
 import { DataProvider } from '@/providers/DataProvider'
+import { DeferredFirstSendProvider } from '@/providers/DeferredFirstSendProvider'
 import { route } from '@/constants/routes'
 import { ExtensionProvider } from '@/providers/ExtensionProvider'
 import { ToasterProvider } from '@/providers/ToasterProvider'
@@ -16,14 +19,19 @@ import { ToasterProvider } from '@/providers/ToasterProvider'
 // import { PromptAnalytic } from '@/containers/analytics/PromptAnalytic'
 import { useOnboardingModelReminder } from '@/hooks/useOnboardingModelReminder'
 import { PromptOnboardingModel } from '@/containers/PromptOnboardingModel'
+import { DownloadManagement } from '@/containers/DownloadManegement'
 import { AnalyticProvider } from '@/providers/AnalyticProvider'
 import { useLeftPanel } from '@/hooks/useLeftPanel'
 import { useTrayStatusSync } from '@/hooks/useTrayStatusSync'
+import { useRemoteAccessSync } from '@/hooks/useRemoteAccessSync'
 import ToolApproval from '@/containers/dialogs/ToolApproval'
 import AgentApprovalDialog from '@/containers/dialogs/AgentApprovalDialog'
 import AgentFolderAccessDialog from '@/containers/dialogs/AgentFolderAccessDialog'
+import VoiceSetupDialog from '@/containers/dialogs/VoiceSetupDialog'
+import ImageSetupDialog from '@/containers/dialogs/ImageSetupDialog'
+import { ImageGenerationProvider } from '@/providers/ImageGenerationProvider'
+import { VideoGenerationProvider } from '@/providers/VideoGenerationProvider'
 import { TranslationProvider } from '@/i18n/TranslationContext'
-import OutOfContextPromiseModal from '@/containers/dialogs/OutOfContextDialog'
 import AttachmentIngestionDialog from '@/containers/dialogs/AttachmentIngestionDialog'
 import WhatsNewDialog from '@/containers/dialogs/WhatsNewDialog'
 import { useEffect } from 'react'
@@ -56,6 +64,10 @@ const AppLayout = () => {
   // Feeds live server / model / RAM state into the desktop system tray.
   // No-op outside macOS and Windows Tauri builds (see hook implementation).
   useTrayStatusSync()
+  // Mirrors the Cloudflare tunnel's status for Settings → Remote & LAN and
+  // starts the tunnel with the Local API Server when asked to. No-op wherever
+  // there is no Local API Server (mobile, web).
+  useRemoteAccessSync()
   const isSetupCompleted = useSetupCompleted()
 
   return (
@@ -70,6 +82,13 @@ const AppLayout = () => {
         <KeyboardShortcutsProvider />
         <DialogAppUpdater />
         {isSetupCompleted && <BackendUpdater />}
+        {/* ATO-528/531: offers a new inference-engine build. Gated on
+            the same flag as <BackendUpdater /> — an engine update is
+            noise while onboarding is still picking the first one. */}
+        {isSetupCompleted && <EngineUpdateBanner />}
+        {/* ATO-530: a load the user is waiting on, top-right — the opposite
+            corner from the update banners above, so the two never meet. */}
+        {isSetupCompleted && <ModelLoadSnackbar />}
         {/* Unlike the recommendation dialogs above, this dialog only opens
             after ChatInput dispatches a mismatch prompt. Keep it mounted for
             upgraded/legacy users whose setup-completed flag is absent. */}
@@ -82,9 +101,23 @@ const AppLayout = () => {
           </div>
         </SidebarInset>
 
-        {/* Попап согласия на аналитику отключён; настройки → Privacy по-прежнему доступны */}
+        {/* Analytics consent popup is disabled; Settings → Privacy is still available */}
         {/* {productAnalyticPrompt && <PromptAnalytic />} */}
         {showOnboardingModelReminder && <PromptOnboardingModel />}
+        {/* ATO-462: mounted once at the root, not inside the sidebar or the
+            header. It used to render in one of two places depending on whether
+            the left panel was open, so a download's progress moved around the
+            screen — or vanished — as the user toggled the sidebar. This is also
+            the component that registers the download event listeners, so a
+            single mount keeps them registered exactly once. */}
+        <DownloadManagement />
+        {/* Binds the image-generation store to the native plugin for the life
+            of the app: a job lives in the plugin, so the run loop and the
+            event subscription must outlive the Images page. */}
+        <ImageGenerationProvider />
+        {/* The video job store, bound once for the same reason; it reads the
+            engine and the resident model through the image store. */}
+        <VideoGenerationProvider />
       </SidebarProvider>
     </div>
   )
@@ -151,6 +184,7 @@ function RootLayout() {
         <TranslationProvider>
           <ExtensionProvider>
             <DataProvider />
+            <DeferredFirstSendProvider />
             <GlobalEventHandler />
             <StartupBackendCoordinator />
             {IS_LOGS_ROUTE ? <LogsLayout /> : <AppLayout />}
@@ -159,8 +193,9 @@ function RootLayout() {
           <ToolApproval />
           <AgentApprovalDialog />
           <AgentFolderAccessDialog />
+          <VoiceSetupDialog />
+          <ImageSetupDialog />
           <AttachmentIngestionDialog />
-          <OutOfContextPromiseModal />
         </TranslationProvider>
       </ServiceHubProvider>
     </Fragment>

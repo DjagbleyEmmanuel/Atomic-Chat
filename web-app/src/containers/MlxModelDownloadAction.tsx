@@ -6,7 +6,12 @@ import { useModelProvider } from '@/hooks/useModelProvider'
 import { useServiceHub } from '@/hooks/useServiceHub'
 import { useTranslation } from '@/i18n'
 import { DeleteModelAction } from '@/containers/hub/DeleteModelAction'
-import { markDownloadCancellationRequested } from '@/lib/downloadCancellation'
+import { LargeModelWarningDialog } from '@/containers/hub/LargeModelWarningDialog'
+import {
+  isDownloadCancellationError,
+  markDownloadCancellationRequested,
+  wasDownloadCancellationRequested,
+} from '@/lib/downloadCancellation'
 import {
   findInstalledLocalModel,
   MLX_PROVIDER,
@@ -25,10 +30,14 @@ export const MlxModelDownloadAction = memo(
   ({
     model,
     deletable = false,
+    warnTooLarge = false,
   }: {
     model: CatalogModel
     // Offer a trash button next to "New chat" once the repo is on disk.
     deletable?: boolean
+    // The hardware-fit estimate calls this repo too large for the device:
+    // Download asks first instead of starting (see LargeModelWarningDialog).
+    warnTooLarge?: boolean
   }) => {
     const serviceHub = useServiceHub()
     const { t } = useTranslation()
@@ -41,6 +50,7 @@ export const MlxModelDownloadAction = memo(
     // `justDownloaded` is set by the download-success event: the provider list
     // is only re-listed a moment later, and the button must flip immediately.
     const [justDownloaded, setDownloaded] = useState(false)
+    const [warningOpen, setWarningOpen] = useState(false)
 
     const {
       downloads,
@@ -50,6 +60,8 @@ export const MlxModelDownloadAction = memo(
       removeLocalDownloadingModel,
       markResumableDownload,
       clearResumableDownload,
+      setDownloadOrigin,
+      clearDownloadOrigin,
     } = useDownloadStore()
 
     // Construct the model ID - use just the sanitized model name if developer is same as org
@@ -132,6 +144,7 @@ export const MlxModelDownloadAction = memo(
     const handleDownloadMlxModel = useCallback(async () => {
       clearResumableDownload(modelId)
       addLocalDownloadingModel(modelId)
+      setDownloadOrigin(modelId, model.model_name, 'standalone')
 
       const modelPath = `${model.developer}/${modelName}`
       try {
@@ -190,6 +203,13 @@ export const MlxModelDownloadAction = memo(
         console.error('Error downloading MLX model:', error)
         markResumableDownload(modelId)
         removeLocalDownloadingModel(modelId)
+        clearDownloadOrigin(modelId)
+        if (
+          wasDownloadCancellationRequested(modelId) ||
+          isDownloadCancellationError(error)
+        ) {
+          return
+        }
         toast.error('Failed to download MLX model', {
           description: error instanceof Error ? error.message : 'Unknown error',
         })
@@ -201,11 +221,21 @@ export const MlxModelDownloadAction = memo(
       addLocalDownloadingModel,
       removeLocalDownloadingModel,
       clearResumableDownload,
+      setDownloadOrigin,
+      clearDownloadOrigin,
       markResumableDownload,
       resumableDownloads,
       modelId,
       modelName,
     ])
+
+    const requestDownload = useCallback(() => {
+      if (warnTooLarge) {
+        setWarningOpen(true)
+        return
+      }
+      void handleDownloadMlxModel()
+    }, [warnTooLarge, handleDownloadMlxModel])
 
     const handleCancelDownload = useCallback(() => {
       markResumableDownload(modelId)
@@ -259,14 +289,22 @@ export const MlxModelDownloadAction = memo(
         ) : (
           <Button
             data-test-id={`hub-model-${modelId}`}
-            variant="outline"
+            variant="default"
             size="sm"
-            onClick={handleDownloadMlxModel}
-            className={cn('font-semibold', isDownloading && 'hidden')}
+            onClick={requestDownload}
+            className={cn(isDownloading && 'hidden')}
           >
             {t('hub:download')}
           </Button>
         )}
+        <LargeModelWarningDialog
+          open={warningOpen}
+          onOpenChange={setWarningOpen}
+          onConfirm={() => {
+            setWarningOpen(false)
+            void handleDownloadMlxModel()
+          }}
+        />
       </div>
     )
   }

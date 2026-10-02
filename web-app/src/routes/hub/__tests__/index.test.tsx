@@ -1,11 +1,13 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { CatalogModel } from '@/services/models/types'
+import type { CatalogModel, HuggingFaceRepo } from '@/services/models/types'
 import type { ResolvedStaffPick } from '@/hooks/useStaffPicks'
 
 const mocks = vi.hoisted(() => ({
   navigate: vi.fn(),
+  mediaSupported: false,
+  decisionSupported: false,
   search: {} as Record<string, unknown>,
   staffPicks: [] as ResolvedStaffPick[],
   mlxStaffPicks: [] as ResolvedStaffPick[],
@@ -14,15 +16,17 @@ const mocks = vi.hoisted(() => ({
   search_: vi.fn(() => [] as CatalogModel[]),
   fetchHuggingFaceRepo: vi.fn(async () => null),
   searchHuggingFaceCandidates: vi.fn(async () => [] as CatalogModel[]),
+  listHuggingFaceFeed: vi.fn(async () => ({
+    models: [] as CatalogModel[],
+    nextCursor: null as string | null,
+  })),
 }))
 
 vi.mock('@tanstack/react-router', () => ({
-  createFileRoute:
-    () =>
-    (options: Record<string, unknown>) => ({
-      ...options,
-      useSearch: () => mocks.search,
-    }),
+  createFileRoute: () => (options: Record<string, unknown>) => ({
+    ...options,
+    useSearch: () => mocks.search,
+  }),
   useNavigate: () => mocks.navigate,
 }))
 
@@ -43,8 +47,13 @@ vi.mock('@tanstack/react-virtual', () => ({
   }),
 }))
 
+// Interpolation options ride along in the output so a test can see what a
+// string would have carried — the feed heading must carry nothing.
 vi.mock('@/i18n/react-i18next-compat', () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({
+    t: (key: string, options?: Record<string, unknown>) =>
+      options ? `${key} ${JSON.stringify(options)}` : key,
+  }),
 }))
 
 vi.mock('@/containers/HeaderPage', () => ({
@@ -55,7 +64,10 @@ vi.mock('@/containers/HeaderPage', () => ({
 
 vi.mock('@/containers/hub/ModelDetailPanel', () => ({
   ModelDetailPanel: ({ model }: { model: CatalogModel | null }) => (
-    <aside data-testid="detail-panel">
+    <aside
+      data-testid="detail-panel"
+      data-quants={model?.quants?.length ?? 0}
+    >
       {model ? model.model_name : 'hub:selectModel'}
     </aside>
   ),
@@ -64,6 +76,69 @@ vi.mock('@/containers/hub/ModelDetailPanel', () => ({
 vi.mock('@/containers/hub/HubFilters', () => ({
   HubFilters: () => <div data-testid="hub-filters" />,
 }))
+
+vi.mock('@/containers/hub/DecisionHub', () => ({
+  DecisionHub: ({
+    categoryTabs,
+    query,
+    selectedModelId,
+    onSelectModel,
+  }: {
+    categoryTabs?: React.ReactNode
+    query: string
+    selectedModelId: string | null
+    onSelectModel: (id: string) => void
+  }) => (
+    <main data-testid="decision-hub">
+      {categoryTabs}
+      <span>{`decision catalog, query "${query}", open ${selectedModelId}`}</span>
+      <button type="button" onClick={() => onSelectModel('laya')}>
+        pick laya
+      </button>
+    </main>
+  ),
+}))
+
+// The Images / Video catalog has tests of its own; here it only has to show
+// what the route handed it, and hand a pick back.
+vi.mock('@/containers/hub/MediaHub', () => ({
+  MediaHub: ({
+    modality,
+    categoryTabs,
+    query,
+    selectedFamilyId,
+    onSelectFamily,
+  }: {
+    modality: string
+    categoryTabs?: React.ReactNode
+    query: string
+    selectedFamilyId: string | null
+    onSelectFamily: (id: string) => void
+  }) => (
+    <main data-testid="media-hub">
+      {categoryTabs}
+      <span>{`${modality} catalog, query "${query}", open ${selectedFamilyId}`}</span>
+      <button type="button" onClick={() => onSelectFamily('flux.1-schnell')}>
+        pick flux
+      </button>
+    </main>
+  ),
+}))
+
+vi.mock('@/lib/platform/const', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/platform/const')>()
+  return {
+    ...actual,
+    PlatformFeatures: new Proxy(actual.PlatformFeatures, {
+      get: (target, key) =>
+        key === 'mediaGeneration'
+          ? mocks.mediaSupported
+          : key === 'localInference'
+            ? true
+            : target[key as keyof typeof target],
+    }),
+  }
+})
 
 vi.mock('@/hooks/useStaffPicks', () => ({
   useStaffPicks: (_sources: CatalogModel[], format = 'gguf') => {
@@ -106,19 +181,28 @@ vi.mock('@/hooks/useGeneralSetting', () => {
 vi.mock('@/hooks/useHardware', () => ({
   useHardware: (
     selector: (s: {
-      hardwareData: { total_memory: number; gpus: unknown[] }
+      hardwareData: {
+        total_memory: number
+        gpus: unknown[]
+        cpu: { arch: string }
+      }
     }) => unknown
-  ) => selector({ hardwareData: { total_memory: 64 * 1024, gpus: [] } }),
+  ) =>
+    selector({
+      hardwareData: { total_memory: 64 * 1024, gpus: [], cpu: { arch: '' } },
+    }),
 }))
 
 vi.mock('@/hooks/useServiceHub', () => ({
   useServiceHub: () => ({
-    models: () => ({
-      fetchHuggingFaceRepo: mocks.fetchHuggingFaceRepo,
-      searchHuggingFaceCandidates: mocks.searchHuggingFaceCandidates,
-      convertHfRepoToCatalogModel: (repo: CatalogModel) => repo,
-    }),
-    providers: () => ({ getProviders: async () => [] }),
+      models: () => ({
+        fetchHuggingFaceRepo: mocks.fetchHuggingFaceRepo,
+        searchHuggingFaceCandidates: mocks.searchHuggingFaceCandidates,
+        listHuggingFaceFeed: mocks.listHuggingFaceFeed,
+        convertHfRepoToCatalogModel: (repo: CatalogModel) => repo,
+      }),
+      providers: () => ({ getProviders: async () => [] }),
+      decision: () => ({ isSupported: () => mocks.decisionSupported }),
   }),
 }))
 
@@ -137,11 +221,10 @@ vi.mock('@/stores/model-catalog-store', () => ({
 }))
 
 import { Route } from '../index'
-import {
-  HUB_FILTERS_STORAGE_KEY,
-  serializeHubFilters,
-} from '@/lib/hub-filters'
+import { HUB_FILTERS_STORAGE_KEY, serializeHubFilters } from '@/lib/hub-filters'
 import { setHubSearchQuery } from '../hub-session'
+import { resetHuggingFaceFeedForTest } from '@/hooks/useHuggingFaceFeed'
+import en from '@/locales/en/hub.json'
 
 const model = (name: string, extra: Partial<CatalogModel> = {}): CatalogModel =>
   ({
@@ -167,6 +250,8 @@ describe('/hub route', () => {
     localStorage.clear()
     setHubSearchQuery('')
     mocks.search = {}
+    mocks.mediaSupported = false
+    mocks.decisionSupported = false
     mocks.sources = []
     mocks.staffPicks = [
       {
@@ -194,12 +279,118 @@ describe('/hub route', () => {
     ]
     mocks.requestedPickFormats = []
     mocks.search_.mockReturnValue([])
+    mocks.searchHuggingFaceCandidates.mockImplementation(async () => [])
+    mocks.listHuggingFaceFeed.mockImplementation(async () => ({
+      models: [],
+      nextCursor: null,
+    }))
+    mocks.fetchHuggingFaceRepo.mockImplementation(async () => null)
+    resetHuggingFaceFeedForTest()
+  })
+
+  it('drops a feed row from a fitting-only list once its size arrives and is too big', async () => {
+    // The list endpoint carries no sizes, so a row cannot fail the fit filter
+    // until its card has been fetched; the test host has 64 GB.
+    mocks.listHuggingFaceFeed.mockResolvedValueOnce({
+      models: [model('bartowski/Kimi-K3-GGUF', { quants: [], num_quants: 0 })],
+      nextCursor: null,
+    })
+    mocks.fetchHuggingFaceRepo.mockImplementation(async (repoId: string) =>
+      repoId === 'bartowski/Kimi-K3-GGUF'
+        ? (model(repoId, {
+            quants: [
+              {
+                model_id: 'bartowski/Kimi-K3-Q4_K_M',
+                path: 'q4.gguf',
+                file_size: '500.00 GB',
+              },
+            ],
+          }) as unknown as HuggingFaceRepo)
+        : null
+    )
+    render(<HubPage />)
+
+    await waitFor(() =>
+      expect(screen.getByText('Kimi-K3-GGUF')).toBeInTheDocument()
+    )
+    await waitFor(() =>
+      expect(screen.queryByText('Kimi-K3-GGUF')).not.toBeInTheDocument()
+    )
+    // The picks are still there; only the oversized row went.
+    expect(screen.getByText('Qwen3.5 4B')).toBeInTheDocument()
+  })
+
+  it('lists the rest of Hugging Face under the picks and asks for the next page at the end', async () => {
+    // What the list endpoint gives: names and popularity, no file sizes.
+    const feedEntry = (name: string) =>
+      model(name, { quants: [], num_quants: 0 })
+    mocks.listHuggingFaceFeed
+      .mockResolvedValueOnce({
+        models: [
+          feedEntry('bartowski/Llama-4-8B-GGUF'),
+          // Already a pick: listed once, as the pick.
+          feedEntry('Qwen/Qwen3.5-4B-GGUF'),
+        ],
+        nextCursor: 'page-2',
+      })
+      .mockResolvedValueOnce({
+        models: [feedEntry('unsloth/Mistral-Next-GGUF')],
+        nextCursor: null,
+      })
+    render(<HubPage />)
+
+    await waitFor(() =>
+      expect(screen.getByText('Llama-4-8B-GGUF')).toBeInTheDocument()
+    )
+    expect(mocks.listHuggingFaceFeed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        format: 'gguf',
+        sort: 'trending',
+        cursor: null,
+      })
+    )
+    // The picks lead; the feed follows under its own heading.
+    const rows = screen.getAllByRole('button').map((b) => b.textContent ?? '')
+    expect(rows.findIndex((r) => r.includes('Gemma 4 12B'))).toBeLessThan(
+      rows.findIndex((r) => r.includes('Llama-4-8B-GGUF'))
+    )
+    // Two sections, two headings of the same rank and weight: the feed's is
+    // not a caption under the picks, and it carries no sort — that lives in
+    // the sort dropdown.
+    const headings = screen.getAllByRole('heading', { level: 2 })
+    expect(headings.map((heading) => heading.textContent)).toEqual([
+      'hub:staffPicks',
+      'hub:feedTitle',
+    ])
+    expect(headings[1].className).toBe(headings[0].className)
+    expect(headings[1]).not.toHaveClass('text-xs')
+    expect(headings[1].nextElementSibling).toHaveTextContent('Llama-4-8B-GGUF')
+    expect(en.feedTitle).toBe('More from Hugging Face')
+    expect(screen.getAllByText('Qwen3.5 4B')).toHaveLength(1)
+
+    // jsdom paints every row, so the end of the list is on screen at once:
+    // the next page is asked for, and the rows on screen get their sizes.
+    await waitFor(() =>
+      expect(mocks.listHuggingFaceFeed).toHaveBeenCalledWith(
+        expect.objectContaining({ cursor: 'page-2' })
+      )
+    )
+    await waitFor(() =>
+      expect(screen.getByText('Mistral-Next-GGUF')).toBeInTheDocument()
+    )
+    expect(mocks.fetchHuggingFaceRepo).toHaveBeenCalledWith(
+      'bartowski/Llama-4-8B-GGUF',
+      ''
+    )
+    expect(mocks.listHuggingFaceFeed).toHaveBeenCalledTimes(2)
   })
 
   it('opens on staff picks with an empty query', () => {
     render(<HubPage />)
 
-    expect(screen.queryByText('hub:staffPicks')).not.toBeInTheDocument()
+    expect(
+      screen.getByRole('heading', { level: 2, name: 'hub:staffPicks' })
+    ).toBeInTheDocument()
     expect(screen.queryByText('hub:searchResults')).not.toBeInTheDocument()
     expect(screen.getByText('Qwen3.5 4B')).toBeInTheDocument()
     expect(screen.getByText('Gemma 4 12B')).toBeInTheDocument()
@@ -219,7 +410,9 @@ describe('/hub route', () => {
     await waitFor(() =>
       expect(screen.getByText('Llama-4-8B-GGUF')).toBeInTheDocument()
     )
+    // Search results are one flat list: no section headings.
     expect(screen.queryByText('hub:searchResults')).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { level: 2 })).not.toBeInTheDocument()
     expect(mocks.search_).toHaveBeenCalledWith('llama', { limit: 500 })
     expect(screen.queryByText('Qwen3.5 4B')).not.toBeInTheDocument()
   })
@@ -263,6 +456,44 @@ describe('/hub route', () => {
 
     await user.clear(input)
 
+    await waitFor(() =>
+      expect(screen.getByText('Qwen3.5 4B')).toBeInTheDocument()
+    )
+  })
+
+  it('clears the query from the cross in the search box', async () => {
+    const user = userEvent.setup()
+    render(<HubPage />)
+    const input = screen.getByRole('textbox', { name: 'hub:searchPlaceholder' })
+    expect(
+      screen.queryByRole('button', { name: 'hub:clearSearch' })
+    ).not.toBeInTheDocument()
+
+    await user.type(input, 'llama')
+    await user.click(screen.getByRole('button', { name: 'hub:clearSearch' }))
+
+    expect(input).toHaveValue('')
+    expect(input).toHaveFocus()
+    await waitFor(() =>
+      expect(screen.getByText('Qwen3.5 4B')).toBeInTheDocument()
+    )
+  })
+
+  it('offers to clear a search that found nothing', async () => {
+    const user = userEvent.setup()
+    render(<HubPage />)
+    const input = screen.getByRole('textbox', { name: 'hub:searchPlaceholder' })
+
+    await user.type(input, 'zzzz')
+    await waitFor(() =>
+      expect(screen.getByText('hub:noModels')).toBeInTheDocument()
+    )
+    // The cross in the search box and the button under the message.
+    const clears = screen.getAllByRole('button', { name: 'hub:clearSearch' })
+    expect(clears).toHaveLength(2)
+    await user.click(clears[1])
+
+    expect(input).toHaveValue('')
     await waitFor(() =>
       expect(screen.getByText('Qwen3.5 4B')).toBeInTheDocument()
     )
@@ -335,6 +566,7 @@ describe('/hub route', () => {
         formats: ['mlx'],
         sort: 'recommended',
         onlyFitting: false,
+        uncensored: false,
       })
     )
 
@@ -361,5 +593,240 @@ describe('/hub route', () => {
       'tiny-lab/experimental-3b',
       ''
     )
+  })
+
+  it('gives a selected Hugging Face search hit the files it can download', async () => {
+    // Hugging Face's search endpoint lists repos without their files, so the
+    // hit arrives with no quants; the panel needs the card fetched for it.
+    const repo = 'prism-ml/Ternary-Bonsai-2-27B-gguf'
+    mocks.search = { q: 'bonsai', model: repo }
+    mocks.searchHuggingFaceCandidates.mockImplementation(async () => [
+      model(repo, { quants: [], num_quants: 0 }),
+    ])
+    mocks.fetchHuggingFaceRepo.mockImplementation(async (repoId: string) =>
+      repoId === repo ? (model(repo) as unknown as HuggingFaceRepo) : null
+    )
+    render(<HubPage />)
+
+    await waitFor(() =>
+      expect(screen.getByTestId('detail-panel')).toHaveAttribute(
+        'data-quants',
+        '1'
+      )
+    )
+    expect(screen.getByTestId('detail-panel')).toHaveTextContent(repo)
+    expect(mocks.fetchHuggingFaceRepo).toHaveBeenCalledWith(repo, '')
+  })
+
+  it('lists and paginates uncensored builds under a stable heading', async () => {
+    localStorage.setItem(
+      HUB_FILTERS_STORAGE_KEY,
+      serializeHubFilters({
+        formats: ['gguf'],
+        sort: 'recommended',
+        onlyFitting: true,
+        uncensored: true,
+      })
+    )
+    mocks.sources = [
+      model('test/plain-GGUF'),
+      model('test/qwen-abliterated-GGUF'),
+    ]
+    mocks.listHuggingFaceFeed.mockImplementation(async (params) => {
+      if (params.search === 'uncensored' && !params.cursor) {
+        return {
+          models: [model('hf/gemma-uncensored-GGUF')],
+          nextCursor: 'uncensored-page-2',
+        }
+      }
+      if (params.cursor === 'uncensored-page-2') {
+        return {
+          models: [model('hf/qwen-uncensored-page-2-GGUF')],
+          nextCursor: null,
+        }
+      }
+      if (params.search === 'abliterated') {
+        return {
+          models: [model('hf/llama-abliterated-GGUF')],
+          nextCursor: null,
+        }
+      }
+      return { models: [], nextCursor: null }
+    })
+    render(<HubPage />)
+
+    await waitFor(() =>
+      expect(screen.getByText('gemma-uncensored-GGUF')).toBeInTheDocument()
+    )
+    await waitFor(() =>
+      expect(
+        screen.getByText('qwen-uncensored-page-2-GGUF')
+      ).toBeInTheDocument()
+    )
+    expect(screen.getByText('qwen-abliterated-GGUF')).toBeInTheDocument()
+    expect(screen.getByText('llama-abliterated-GGUF')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'hub:uncensored' })).toBeVisible()
+    expect(screen.queryByText('plain-GGUF')).not.toBeInTheDocument()
+    // The curated picks carry no uncensored builds, so they are not shown.
+    expect(screen.queryByText('Qwen3.5 4B')).not.toBeInTheDocument()
+    expect(mocks.listHuggingFaceFeed).toHaveBeenCalledWith(
+      expect.objectContaining({ search: 'uncensored' })
+    )
+    expect(mocks.listHuggingFaceFeed).toHaveBeenCalledWith(
+      expect.objectContaining({ search: 'abliterated' })
+    )
+    // The terms ride along out of sight: the search box stays as typed.
+    expect(
+      screen.getByRole('textbox', { name: 'hub:searchPlaceholder' })
+    ).toHaveValue('')
+  })
+
+  describe('categories', () => {
+    const lastNavigation = () =>
+      mocks.navigate.mock.calls.at(-1)?.[0] as {
+        search: (prev: Record<string, unknown>) => Record<string, unknown>
+        replace?: boolean
+      }
+
+    const picker = () => screen.queryByTestId('hub-category-workflow-select')
+    const pick = async (category: string) => {
+      await userEvent.click(screen.getByTestId('hub-category-workflow-select'))
+      await userEvent.click(
+        screen.getByTestId(`hub-category-workflow-option-${category}`)
+      )
+    }
+
+    it('stays the chat catalog without the media engine, whatever the URL says', () => {
+      mocks.search = { category: 'image' }
+      render(<HubPage />)
+
+      expect(picker()).not.toBeInTheDocument()
+      expect(screen.queryByTestId('media-hub')).not.toBeInTheDocument()
+      expect(screen.getByText('Qwen3.5 4B')).toBeInTheDocument()
+    })
+
+    it('opens on Text, with the picker above the filters', () => {
+      mocks.mediaSupported = true
+      render(<HubPage />)
+
+      expect(picker()).toHaveAttribute('data-mode', 'chat')
+      expect(screen.getByText('Qwen3.5 4B')).toBeInTheDocument()
+      expect(screen.queryByTestId('media-hub')).not.toBeInTheDocument()
+    })
+
+    it('lists only the types this machine can run, each with what it does', async () => {
+      mocks.decisionSupported = true
+      render(<HubPage />)
+
+      await userEvent.click(screen.getByTestId('hub-category-workflow-select'))
+      const menu = screen.getByTestId('hub-category-workflow-menu')
+      expect(menu).toHaveTextContent('hub:categoryChatHint')
+      expect(menu).toHaveTextContent('hub:categoryDecisionHint')
+      expect(
+        screen.queryByTestId('hub-category-workflow-option-image')
+      ).not.toBeInTheDocument()
+      expect(
+        screen.queryByTestId('hub-category-workflow-option-video')
+      ).not.toBeInTheDocument()
+    })
+
+    it('shows the image catalog the URL names, with its search and selection', () => {
+      mocks.mediaSupported = true
+      mocks.search = { category: 'image', q: 'flux', model: 'z-image' }
+      render(<HubPage />)
+
+      expect(
+        screen.getByText('image catalog, query "flux", open z-image')
+      ).toBeInTheDocument()
+      expect(picker()).toHaveAttribute('data-mode', 'image')
+      // The chat feed is not even asked for.
+      expect(screen.queryByText('Qwen3.5 4B')).not.toBeInTheDocument()
+      expect(mocks.listHuggingFaceFeed.mock.calls).toEqual([])
+    })
+
+    it('shows the decision catalog the URL names, with its search and selection', () => {
+      mocks.decisionSupported = true
+      mocks.search = { category: 'decision', q: 'multi', model: 'laya' }
+      render(<HubPage />)
+
+      expect(
+        screen.getByText('decision catalog, query "multi", open laya')
+      ).toBeInTheDocument()
+      expect(picker()).toHaveAttribute('data-mode', 'decision')
+      expect(mocks.listHuggingFaceFeed.mock.calls).toEqual([])
+    })
+
+    it('stays the chat catalog where decision models cannot run', () => {
+      mocks.mediaSupported = true
+      mocks.search = { category: 'decision' }
+      render(<HubPage />)
+
+      expect(screen.queryByTestId('decision-hub')).not.toBeInTheDocument()
+      expect(picker()).toHaveAttribute('data-mode', 'chat')
+    })
+
+    it('drops the selection of the old category when switching', async () => {
+      mocks.mediaSupported = true
+      render(<HubPage />)
+
+      await pick('video')
+
+      const navigation = lastNavigation()
+      expect(navigation.replace).toBe(true)
+      expect(
+        navigation.search({
+          q: 'wan',
+          model: 'Qwen/Qwen3.5-4B-GGUF',
+          repo: 'x',
+        })
+      ).toEqual({
+        q: 'wan',
+        category: 'video',
+        model: undefined,
+        repo: undefined,
+      })
+    })
+
+    it('leaves Text out of the URL when switching back to it', async () => {
+      mocks.mediaSupported = true
+      mocks.search = { category: 'video', model: 'wan-2.2-ti2v-5b' }
+      render(<HubPage />)
+
+      await pick('chat')
+
+      expect(
+        lastNavigation().search({ category: 'video', model: 'wan-2.2-ti2v-5b' })
+      ).toEqual({ category: undefined, model: undefined, repo: undefined })
+    })
+
+    it('puts a decision model picked in its catalog into the URL', async () => {
+      mocks.decisionSupported = true
+      mocks.search = { category: 'decision' }
+      render(<HubPage />)
+
+      await userEvent.click(screen.getByRole('button', { name: 'pick laya' }))
+
+      const navigation = lastNavigation()
+      expect(navigation.replace).toBe(false)
+      expect(navigation.search({ category: 'decision' })).toEqual({
+        category: 'decision',
+        model: 'laya',
+      })
+    })
+
+    it('puts a family picked in the media catalog into the URL', async () => {
+      mocks.mediaSupported = true
+      mocks.search = { category: 'image' }
+      render(<HubPage />)
+
+      await userEvent.click(screen.getByRole('button', { name: 'pick flux' }))
+
+      const navigation = lastNavigation()
+      expect(navigation.replace).toBe(false)
+      expect(navigation.search({ category: 'image' })).toEqual({
+        category: 'image',
+        model: 'flux.1-schnell',
+      })
+    })
   })
 })

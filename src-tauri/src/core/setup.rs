@@ -16,7 +16,10 @@ use tauri::{
 use tauri_plugin_store::Store;
 
 use crate::core::app::commands::get_jan_data_folder_path;
-use crate::core::mcp::helpers::{add_server_config, ensure_mcp_config_exists};
+use crate::core::mcp::constants::MCP_CONFIG_VERSION;
+use crate::core::mcp::helpers::{
+    add_server_config, drop_retired_serper_default_from_config, ensure_mcp_config_exists,
+};
 
 use super::{
     extensions::commands::get_jan_extensions_path, mcp::helpers::run_mcp_commands, state::AppState,
@@ -205,11 +208,19 @@ pub fn migrate_mcp_servers(
     }
     if mcp_version < 3 {
         log::info!("Migrating MCP schema version 3: Updating Exa to streamable HTTP");
-        if let Err(e) = migrate_exa_to_http(app_handle) {
+        if let Err(e) = migrate_exa_to_http(app_handle.clone()) {
             log::error!("Failed to migrate Exa to HTTP: {e}");
         }
     }
-    store.set("mcp_version", 3);
+    if mcp_version < 4 {
+        log::info!("Migrating MCP schema version 4: Dropping the retired serper default");
+        match drop_retired_serper_default_from_config(app_handle) {
+            Ok(true) => log::info!("Dropped the untouched serper default from mcp_config.json"),
+            Ok(false) => {}
+            Err(e) => log::error!("Failed to drop the serper default: {e}"),
+        }
+    }
+    store.set("mcp_version", MCP_CONFIG_VERSION);
     store.save().expect("Failed to save store");
     Ok(())
 }
@@ -474,7 +485,7 @@ pub fn setup_tray(app: &App) -> tauri::Result<TrayIcon> {
         };
     }
 
-    //* Иконка в строке меню macOS: отдельный asset; icon_as_template(false) — показывать PNG как есть
+    //* macOS menu bar icon: separate asset; icon_as_template(false) — show the PNG as is
     //  Single-click opens the status menu (Pico-style). The right-click menu is the same.
     let mut tray_builder = TrayIconBuilder::with_id("tray")
         .menu(&menu)
@@ -482,7 +493,7 @@ pub fn setup_tray(app: &App) -> tauri::Result<TrayIcon> {
 
     #[cfg(target_os = "macos")]
     {
-        //* Template: система красит чёрный контур как батарею; PNG со скруглением и «пустой» звездой
+        //* Template: the system tints the black outline like the battery icon; PNG with rounded corners and a "hollow" star
         let menu_bar_icon = tauri::image::Image::from_bytes(include_bytes!(
             "../../../web-app/public/images/tray-macos-template.png"
         ))?;

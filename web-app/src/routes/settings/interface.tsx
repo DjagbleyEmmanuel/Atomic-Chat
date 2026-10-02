@@ -61,7 +61,7 @@ function InterfaceSettings() {
                 description={t('settings:interface.chatBackgroundDesc')}
                 actions={<ChatBackgroundPicker />}
               />
-              {/* Accent color — скрыто */}
+              {/* Accent color — hidden */}
               {false && (
                 <CardItem
                   title="Accent color"

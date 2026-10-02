@@ -5,6 +5,7 @@ import type { ServiceHub } from '@/services'
 import {
   isKeylessRemoteProvider,
   isLocalProvider,
+  isSubscriptionProvider,
   registerRemoteProvider,
 } from '@/utils/registerRemoteProvider'
 
@@ -22,7 +23,11 @@ async function reconcileRemoteProvider(
     )
   }
 
-  if (!provider.api_key?.trim() && !isKeylessRemoteProvider(provider)) {
+  if (
+    !provider.api_key?.trim() &&
+    !isKeylessRemoteProvider(provider) &&
+    !isSubscriptionProvider(provider.provider)
+  ) {
     throw new Error(
       `Remote provider "${provider.provider}" has no configured API key.`
     )
@@ -81,6 +86,16 @@ async function reconcileRemoteProvider(
     }
     useAppState.getState().setServerStatus('running')
   } catch (error) {
+    // The model switch, the autostart and the agent settings raise the proxy
+    // too, outside `readinessQueue`, and one of them can land between the
+    // status check above and this start. The server they raised is the one we
+    // wanted — failing the send over it is ATO-524. Mirrors switchModel.ts,
+    // hermes-agent.tsx and claude-code.tsx.
+    const message = error instanceof Error ? error.message : String(error)
+    if (message.includes('already running')) {
+      useAppState.getState().setServerStatus('running')
+      return
+    }
     useAppState.getState().setServerStatus('stopped')
     throw error
   }

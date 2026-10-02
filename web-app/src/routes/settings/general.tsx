@@ -20,12 +20,14 @@ import ChangeDataFolderLocation from '@/containers/dialogs/ChangeDataFolderLocat
 import LocalModelLocationsCard from '@/containers/LocalModelLocationsCard'
 import { FactoryResetDialog } from '@/containers/dialogs'
 import { useServiceHub } from '@/hooks/useServiceHub'
+import { useExportLogs } from '@/hooks/useExportLogs'
 import {
   IconBrandDiscord,
   IconBrandGithub,
   IconExternalLink,
   IconFolder,
   IconLogs,
+  IconDownload,
   IconCopy,
   IconCopyCheck,
 } from '@tabler/icons-react'
@@ -56,6 +58,8 @@ function General() {
     setHuggingfaceToken,
     preloadModelOnStartup,
     setPreloadModelOnStartup,
+    legacyChatEngine,
+    setLegacyChatEngine,
     reasoningBudget,
     setReasoningBudget,
     codeLiveHighlight,
@@ -76,6 +80,7 @@ function General() {
     (state) => state.setGloballyEnabled
   )
   const serviceHub = useServiceHub()
+  const { exportLogs, exporting: exportingLogs } = useExportLogs()
   const { setProductAnalytic, productAnalytic } = useAnalytic()
 
   const openFileTitle = (): string => {
@@ -99,6 +104,7 @@ function General() {
   const [cliPath, setCliPath] = useState<string | null>(null)
   const [isCliLoading, setIsCliLoading] = useState(false)
   const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null)
+  const [coreVersion, setCoreVersion] = useState<string | undefined>()
   const canManageAutostart = IS_TAURI && !isDev()
 
   useEffect(() => {
@@ -108,6 +114,19 @@ function General() {
     }
 
     fetchDataFolder()
+  }, [serviceHub])
+
+  useEffect(() => {
+    let cancelled = false
+    serviceHub
+      .app()
+      .getCoreVersion()
+      .then((version) => {
+        if (!cancelled) setCoreVersion(version)
+      })
+    return () => {
+      cancelled = true
+    }
   }, [serviceHub])
 
   useEffect(() => {
@@ -169,7 +188,7 @@ function General() {
       await invoke('uninstall_jan_cli')
       setCliInstalled(false)
       setCliPath(null)
-      toast.success('Atomic Bot CLI uninstalled')
+      toast.success('Atomic Chat CLI uninstalled')
     } catch (e) {
       toast.error('Uninstall failed', { description: String(e) })
     } finally {
@@ -238,10 +257,15 @@ function General() {
             setIsDialogOpen(false)
           } catch (error) {
             console.error(error)
+            // A refused command arrives as the string Rust returned, which says
+            // what went wrong (no permission, no space, a folder inside the
+            // current one); only something else falls back to the general text.
             toast.error(
               error instanceof Error
                 ? error.message
-                : t('settings:general.failedToRelocateDataFolder')
+                : typeof error === 'string' && error
+                  ? error
+                  : t('settings:general.failedToRelocateDataFolder')
             )
           }
         }, 1000)
@@ -307,6 +331,16 @@ function General() {
                   </span>
                 }
               />
+              {coreVersion && (
+                <CardItem
+                  title={t('settings:general.coreVersion')}
+                  actions={
+                    <span className="text-foreground font-medium">
+                      v{coreVersion}
+                    </span>
+                  }
+                />
+              )}
               {!AUTO_UPDATER_DISABLED && (
                 <CardItem
                   title={t('settings:general.checkForUpdates')}
@@ -433,6 +467,16 @@ function General() {
                   <Switch
                     checked={notificationsGloballyEnabled}
                     onCheckedChange={setNotificationsGloballyEnabled}
+                  />
+                }
+              />
+              <CardItem
+                title={t('settings:chatBehavior.legacyChatEngine')}
+                description={t('settings:chatBehavior.legacyChatEngineDesc')}
+                actions={
+                  <Switch
+                    checked={legacyChatEngine}
+                    onCheckedChange={setLegacyChatEngine}
                   />
                 }
               />
@@ -601,7 +645,7 @@ function General() {
                 description={t('settings:dataFolder.appLogsDesc')}
                 className="items-start flex-row gap-y-2"
                 actions={
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <Button
                       variant="outline"
                       size="sm"
@@ -632,6 +676,19 @@ function General() {
                     >
                       <IconLogs size={12} className="text-muted-foreground" />
                       <span>{t('settings:general.openLogs')}</span>
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void exportLogs()}
+                      disabled={exportingLogs}
+                      title={t('settings:general.exportLogs')}
+                    >
+                      <IconDownload
+                        size={12}
+                        className="text-muted-foreground"
+                      />
+                      <span>{t('settings:general.exportLogs')}</span>
                     </Button>
                   </div>
                 }
@@ -710,8 +767,8 @@ function General() {
                 }
               />
               <CardItem
-                title="Reasoning budget (local models)"
-                description="Limits thinking tokens for llama.cpp / MLX. Off disables reasoning entirely."
+                title="Thinking effort (local models)"
+                description="Default effort for llama.cpp / MLX, also shown next to the chat input. Models with their own effort setting receive that; the rest get a thinking-token budget. Off disables thinking entirely."
                 actions={
                   <select
                     className="border-input bg-background rounded-md border px-2 py-1 text-sm"
@@ -723,10 +780,11 @@ function General() {
                     }
                   >
                     <option value="off">Off</option>
-                    <option value="low">Low (256)</option>
-                    <option value="medium">Medium (1024)</option>
-                    <option value="high">High (4096)</option>
-                    <option value="unlimited">Unlimited</option>
+                    <option value="low">Low (256 tokens)</option>
+                    <option value="medium">Medium (1024 tokens)</option>
+                    <option value="high">High (4096 tokens)</option>
+                    <option value="xhigh">Extra High (8192 tokens)</option>
+                    <option value="max">Max (no limit)</option>
                   </select>
                 }
               />
@@ -811,7 +869,7 @@ function General() {
               />
             </Card>
 
-            {/* Resources — закомментировано */}
+            {/* Resources — commented out */}
             {false && (
               <Card title={t('settings:general.resources')}>
                 <CardItem
@@ -849,7 +907,7 @@ function General() {
               </Card>
             )}
 
-            {/* Community — закомментировано */}
+            {/* Community — commented out */}
             {false && (
               <Card title={t('settings:general.community')}>
                 <CardItem
@@ -887,7 +945,7 @@ function General() {
               </Card>
             )}
 
-            {/* Support — закомментировано */}
+            {/* Support — commented out */}
             {false && (
               <Card title={t('settings:general.support')}>
                 <CardItem
@@ -908,7 +966,7 @@ function General() {
               </Card>
             )}
 
-            {/* Credits — закомментировано */}
+            {/* Credits — commented out */}
             {false && (
               <Card title={t('settings:general.credits')}>
                 <CardItem

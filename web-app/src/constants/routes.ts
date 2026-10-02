@@ -10,6 +10,8 @@ export const route = {
     providers: '/settings/providers/$providerName',
     general: '/settings/general',
     attachments: '/settings/attachments',
+    voice: '/settings/voice',
+    media: '/settings/media',
     interface: '/settings/interface',
     privacy: '/settings/privacy',
     shortcuts: '/settings/shortcuts',
@@ -17,17 +19,34 @@ export const route = {
     local_api_server: '/settings/local-api-server',
     mcp_servers: '/settings/mcp-servers',
     https_proxy: '/settings/https-proxy',
+    remote_lan: '/settings/remote-lan',
     hardware: '/settings/hardware',
     assistant: '/settings/assistant',
     claude_code: '/settings/claude-code',
     hermes_agent: '/settings/hermes-agent',
   },
+  cloud: {
+    index: '/cloud/',
+  },
   hub: {
     index: '/hub/',
     model: '/hub/$modelId',
   },
+  images: {
+    index: '/images/',
+    workflow: '/images/$workflow',
+  },
+  videos: {
+    index: '/videos/',
+  },
   launch: {
     index: '/launch/',
+  },
+  connectors: {
+    index: '/connectors/',
+  },
+  api: {
+    index: '/api/',
   },
   skills: {
     index: '/skills/',

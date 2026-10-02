@@ -8,6 +8,7 @@
 //! `set_telemetry_consent` command.
 
 pub mod commands;
+pub mod core_state;
 pub mod scrub;
 
 use std::collections::HashMap;
@@ -42,6 +43,18 @@ pub fn consent_enabled() -> bool {
     TELEMETRY_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Whether this build reports at all: `init` found a DSN and a non-development
+/// environment. A `tauri dev` session and a test run are not.
+static REPORTING_BUILD: AtomicBool = AtomicBool::new(false);
+
+/// What the app tells the core about its error reports: the user's consent, and
+/// only in a build that reports itself. The core reports by default otherwise
+/// (core ADR `2026-09-22-the-core-owns-its-error-reporting`), and a developer's
+/// session must not reach the production project through it.
+pub fn core_consent() -> bool {
+    consent_enabled() && REPORTING_BUILD.load(Ordering::Relaxed)
+}
+
 pub fn set_log_path(path: PathBuf) {
     let _ = LOG_PATH.set(path);
 }
@@ -64,6 +77,12 @@ pub fn init() -> Option<ClientInitGuard> {
         .filter(|s| !s.is_empty())
         .unwrap_or("production")
         .to_string();
+    // A developer's local `.env` pairs a real DSN with
+    // SENTRY_ENVIRONMENT=development, which sent every `tauri dev` session into
+    // the production project. Stay off entirely on such builds.
+    if environment == "development" {
+        return None;
+    }
 
     let options = ClientOptions {
         release: Some(release.into()),
@@ -95,7 +114,9 @@ pub fn init() -> Option<ClientInitGuard> {
         ..Default::default()
     };
 
-    Some(sentry::init((dsn, options)))
+    let guard = sentry::init((dsn, options));
+    REPORTING_BUILD.store(true, Ordering::Relaxed);
+    Some(guard)
 }
 
 /// Wrap the `tauri-plugin-log` logger so `log::error!` reaches Sentry (as

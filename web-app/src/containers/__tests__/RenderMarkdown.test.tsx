@@ -1,4 +1,4 @@
-import { render, waitFor } from '@testing-library/react'
+import { fireEvent, render, waitFor } from '@testing-library/react'
 import { describe, it, expect, vi } from 'vitest'
 import { RenderMarkdown } from '../RenderMarkdown'
 import { closeUnclosedCodeFence } from '@/lib/code-fence'
@@ -17,6 +17,58 @@ Object.assign(navigator, {
 })
 
 describe('RenderMarkdown', () => {
+  it('repairs whitespace just inside strong markers', () => {
+    const { container } = render(
+      <RenderMarkdown content="** uncensored-ai-models.pdf **" />
+    )
+
+    expect(
+      container.querySelector('[data-streamdown="strong"]')
+    ).toHaveTextContent('uncensored-ai-models.pdf')
+    expect(container.querySelector('.markdown')).not.toHaveTextContent('**')
+  })
+
+  it('does not repair strong markers inside inline or fenced code', async () => {
+    const content = [
+      'Rendered: ** answer **.',
+      '',
+      'Inline: `** inline **`',
+      '',
+      '```text',
+      '** fenced **',
+      '```',
+    ].join('\n')
+    const { container, findByText } = render(
+      <RenderMarkdown content={content} />
+    )
+
+    expect(
+      container.querySelector('[data-streamdown="strong"]')
+    ).toHaveTextContent('answer')
+    expect(container.querySelector('code')).toHaveTextContent('** inline **')
+    await findByText('** fenced **', { exact: false })
+    expect(
+      container.querySelector('[data-streamdown="code-block"]')
+    ).toHaveTextContent('** fenced **')
+  })
+
+  it('turns bare URLs into visibly styled links', () => {
+    const { container } = render(
+      <RenderMarkdown
+        content="Source: https://www.reuters.com/world/example"
+        enableHtmlPreview
+      />
+    )
+
+    const link = container.querySelector('a')
+    expect(link).toHaveAttribute(
+      'href',
+      'https://www.reuters.com/world/example'
+    )
+    expect(link).toHaveClass('text-blue-600', 'underline', 'underline-offset-2')
+    expect(link).toHaveAttribute('target', '_blank')
+  })
+
   it('preserves line breaks in model responses (when isUser == undefined)', () => {
     const modelResponseWithNewLines = `This is line 1
     This is line 2
@@ -484,5 +536,57 @@ describe('RenderMarkdown', () => {
     ).toBeTruthy()
     expect(container.textContent).toContain('<div>Hello</div>')
   })
-})
 
+  describe('streaming code blocks under enableHtmlPreview (#263)', () => {
+    const bodyText = (container: HTMLElement) =>
+      container.querySelector('[data-streamdown="code-block-body"]')
+        ?.textContent ?? ''
+
+    it('re-renders a delegated code block when only its last line grows', async () => {
+      const { container, rerender } = render(
+        <RenderMarkdown content={'```js\nconst first = 100\nconst value = 1'} enableHtmlPreview isStreaming />
+      )
+      await waitFor(() => expect(bodyText(container)).toContain('const value = 1'))
+
+      // Same start/end line+column for the rebuilt closed fence: only the
+      // last line grew, which is exactly what the position memo ignored.
+      rerender(
+        <RenderMarkdown content={'```js\nconst first = 100\nconst value = 12'} enableHtmlPreview isStreaming />
+      )
+      await waitFor(() => expect(bodyText(container)).toContain('const value = 12'))
+
+      // Same-length replacement — the case upstream streamdown documents.
+      rerender(
+        <RenderMarkdown content={'```js\nconst first = 100\nconst value = 34'} enableHtmlPreview isStreaming />
+      )
+      await waitFor(() => expect(bodyText(container)).toContain('const value = 34'))
+    })
+
+    it('copies the latest text once the stream has finished', async () => {
+      const { container, rerender } = render(
+        <RenderMarkdown content={'```\n{AAAAAAAA}\n{BBBB},{BBBB}\n{CCC},{CCCCC}\n('} enableHtmlPreview isStreaming />
+      )
+      await waitFor(() => expect(bodyText(container)).toContain('('))
+
+      rerender(
+        <RenderMarkdown content={'```\n{AAAAAAAA}\n{BBBB},{BBBB}\n{CCC},{CCCCC}\n(DDDDDDDD)\n```\n'} enableHtmlPreview />
+      )
+      await waitFor(() => expect(bodyText(container)).toContain('(DDDDDDDD)'))
+
+      const copyButton = container.querySelector(
+        '[data-streamdown="code-block-copy-button"]'
+      )
+      expect(copyButton).toBeTruthy()
+      fireEvent.click(copyButton as Element)
+      await waitFor(() =>
+        // streamdown hands the copy button the fence body, trailing newline
+        // included; what matters is that the last line is no longer `(`.
+        expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
+          expect.stringMatching(
+            /^\{AAAAAAAA\}\n\{BBBB\},\{BBBB\}\n\{CCC\},\{CCCCC\}\n\(DDDDDDDD\)\n*$/
+          )
+        )
+      )
+    })
+  })
+})

@@ -12,12 +12,20 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as SystemMonitorRouteImport } from './routes/system-monitor'
 import { Route as LogsRouteImport } from './routes/logs'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as VideosIndexRouteImport } from './routes/videos/index'
 import { Route as SkillsIndexRouteImport } from './routes/skills/index'
 import { Route as LaunchIndexRouteImport } from './routes/launch/index'
+import { Route as ImagesIndexRouteImport } from './routes/images/index'
 import { Route as HubIndexRouteImport } from './routes/hub/index'
+import { Route as ConnectorsIndexRouteImport } from './routes/connectors/index'
+import { Route as CloudIndexRouteImport } from './routes/cloud/index'
+import { Route as ApiIndexRouteImport } from './routes/api/index'
 import { Route as ThreadsThreadIdRouteImport } from './routes/threads/$threadId'
+import { Route as SettingsVoiceRouteImport } from './routes/settings/voice'
 import { Route as SettingsShortcutsRouteImport } from './routes/settings/shortcuts'
+import { Route as SettingsRemoteLanRouteImport } from './routes/settings/remote-lan'
 import { Route as SettingsPrivacyRouteImport } from './routes/settings/privacy'
+import { Route as SettingsMediaRouteImport } from './routes/settings/media'
 import { Route as SettingsMcpServersRouteImport } from './routes/settings/mcp-servers'
 import { Route as SettingsLocalApiServerRouteImport } from './routes/settings/local-api-server'
 import { Route as SettingsInterfaceRouteImport } from './routes/settings/interface'
@@ -31,6 +39,7 @@ import { Route as SettingsAttachmentsRouteImport } from './routes/settings/attac
 import { Route as SettingsAssistantRouteImport } from './routes/settings/assistant'
 import { Route as ProjectProjectIdRouteImport } from './routes/project/$projectId'
 import { Route as LocalApiServerLogsRouteImport } from './routes/local-api-server/logs'
+import { Route as ImagesWorkflowRouteImport } from './routes/images/$workflow'
 import { Route as HubModelIdRouteImport } from './routes/hub/$modelId'
 import { Route as SettingsProvidersIndexRouteImport } from './routes/settings/providers/index'
 import { Route as SettingsProvidersProviderNameRouteImport } from './routes/settings/providers/$providerName'
@@ -50,6 +59,11 @@ const IndexRoute = IndexRouteImport.update({
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const VideosIndexRoute = VideosIndexRouteImport.update({
+  id: '/videos/',
+  path: '/videos/',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const SkillsIndexRoute = SkillsIndexRouteImport.update({
   id: '/skills/',
   path: '/skills/',
@@ -60,9 +74,29 @@ const LaunchIndexRoute = LaunchIndexRouteImport.update({
   path: '/launch/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ImagesIndexRoute = ImagesIndexRouteImport.update({
+  id: '/images/',
+  path: '/images/',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const HubIndexRoute = HubIndexRouteImport.update({
   id: '/hub/',
   path: '/hub/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ConnectorsIndexRoute = ConnectorsIndexRouteImport.update({
+  id: '/connectors/',
+  path: '/connectors/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CloudIndexRoute = CloudIndexRouteImport.update({
+  id: '/cloud/',
+  path: '/cloud/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiIndexRoute = ApiIndexRouteImport.update({
+  id: '/api/',
+  path: '/api/',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ThreadsThreadIdRoute = ThreadsThreadIdRouteImport.update({
@@ -70,14 +104,29 @@ const ThreadsThreadIdRoute = ThreadsThreadIdRouteImport.update({
   path: '/threads/$threadId',
   getParentRoute: () => rootRouteImport,
 } as any)
+const SettingsVoiceRoute = SettingsVoiceRouteImport.update({
+  id: '/settings/voice',
+  path: '/settings/voice',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const SettingsShortcutsRoute = SettingsShortcutsRouteImport.update({
   id: '/settings/shortcuts',
   path: '/settings/shortcuts',
   getParentRoute: () => rootRouteImport,
 } as any)
+const SettingsRemoteLanRoute = SettingsRemoteLanRouteImport.update({
+  id: '/settings/remote-lan',
+  path: '/settings/remote-lan',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const SettingsPrivacyRoute = SettingsPrivacyRouteImport.update({
   id: '/settings/privacy',
   path: '/settings/privacy',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsMediaRoute = SettingsMediaRouteImport.update({
+  id: '/settings/media',
+  path: '/settings/media',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SettingsMcpServersRoute = SettingsMcpServersRouteImport.update({
@@ -145,6 +194,11 @@ const LocalApiServerLogsRoute = LocalApiServerLogsRouteImport.update({
   path: '/local-api-server/logs',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ImagesWorkflowRoute = ImagesWorkflowRouteImport.update({
+  id: '/images/$workflow',
+  path: '/images/$workflow',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const HubModelIdRoute = HubModelIdRouteImport.update({
   id: '/hub/$modelId',
   path: '/hub/$modelId',
@@ -167,6 +221,7 @@ export interface FileRoutesByFullPath {
   '/logs': typeof LogsRoute
   '/system-monitor': typeof SystemMonitorRoute
   '/hub/$modelId': typeof HubModelIdRoute
+  '/images/$workflow': typeof ImagesWorkflowRoute
   '/local-api-server/logs': typeof LocalApiServerLogsRoute
   '/project/$projectId': typeof ProjectProjectIdRoute
   '/settings/assistant': typeof SettingsAssistantRoute
@@ -180,12 +235,20 @@ export interface FileRoutesByFullPath {
   '/settings/interface': typeof SettingsInterfaceRoute
   '/settings/local-api-server': typeof SettingsLocalApiServerRoute
   '/settings/mcp-servers': typeof SettingsMcpServersRoute
+  '/settings/media': typeof SettingsMediaRoute
   '/settings/privacy': typeof SettingsPrivacyRoute
+  '/settings/remote-lan': typeof SettingsRemoteLanRoute
   '/settings/shortcuts': typeof SettingsShortcutsRoute
+  '/settings/voice': typeof SettingsVoiceRoute
   '/threads/$threadId': typeof ThreadsThreadIdRoute
+  '/api/': typeof ApiIndexRoute
+  '/cloud/': typeof CloudIndexRoute
+  '/connectors/': typeof ConnectorsIndexRoute
   '/hub/': typeof HubIndexRoute
+  '/images/': typeof ImagesIndexRoute
   '/launch/': typeof LaunchIndexRoute
   '/skills/': typeof SkillsIndexRoute
+  '/videos/': typeof VideosIndexRoute
   '/settings/providers/$providerName': typeof SettingsProvidersProviderNameRoute
   '/settings/providers/': typeof SettingsProvidersIndexRoute
 }
@@ -194,6 +257,7 @@ export interface FileRoutesByTo {
   '/logs': typeof LogsRoute
   '/system-monitor': typeof SystemMonitorRoute
   '/hub/$modelId': typeof HubModelIdRoute
+  '/images/$workflow': typeof ImagesWorkflowRoute
   '/local-api-server/logs': typeof LocalApiServerLogsRoute
   '/project/$projectId': typeof ProjectProjectIdRoute
   '/settings/assistant': typeof SettingsAssistantRoute
@@ -207,12 +271,20 @@ export interface FileRoutesByTo {
   '/settings/interface': typeof SettingsInterfaceRoute
   '/settings/local-api-server': typeof SettingsLocalApiServerRoute
   '/settings/mcp-servers': typeof SettingsMcpServersRoute
+  '/settings/media': typeof SettingsMediaRoute
   '/settings/privacy': typeof SettingsPrivacyRoute
+  '/settings/remote-lan': typeof SettingsRemoteLanRoute
   '/settings/shortcuts': typeof SettingsShortcutsRoute
+  '/settings/voice': typeof SettingsVoiceRoute
   '/threads/$threadId': typeof ThreadsThreadIdRoute
+  '/api': typeof ApiIndexRoute
+  '/cloud': typeof CloudIndexRoute
+  '/connectors': typeof ConnectorsIndexRoute
   '/hub': typeof HubIndexRoute
+  '/images': typeof ImagesIndexRoute
   '/launch': typeof LaunchIndexRoute
   '/skills': typeof SkillsIndexRoute
+  '/videos': typeof VideosIndexRoute
   '/settings/providers/$providerName': typeof SettingsProvidersProviderNameRoute
   '/settings/providers': typeof SettingsProvidersIndexRoute
 }
@@ -222,6 +294,7 @@ export interface FileRoutesById {
   '/logs': typeof LogsRoute
   '/system-monitor': typeof SystemMonitorRoute
   '/hub/$modelId': typeof HubModelIdRoute
+  '/images/$workflow': typeof ImagesWorkflowRoute
   '/local-api-server/logs': typeof LocalApiServerLogsRoute
   '/project/$projectId': typeof ProjectProjectIdRoute
   '/settings/assistant': typeof SettingsAssistantRoute
@@ -235,12 +308,20 @@ export interface FileRoutesById {
   '/settings/interface': typeof SettingsInterfaceRoute
   '/settings/local-api-server': typeof SettingsLocalApiServerRoute
   '/settings/mcp-servers': typeof SettingsMcpServersRoute
+  '/settings/media': typeof SettingsMediaRoute
   '/settings/privacy': typeof SettingsPrivacyRoute
+  '/settings/remote-lan': typeof SettingsRemoteLanRoute
   '/settings/shortcuts': typeof SettingsShortcutsRoute
+  '/settings/voice': typeof SettingsVoiceRoute
   '/threads/$threadId': typeof ThreadsThreadIdRoute
+  '/api/': typeof ApiIndexRoute
+  '/cloud/': typeof CloudIndexRoute
+  '/connectors/': typeof ConnectorsIndexRoute
   '/hub/': typeof HubIndexRoute
+  '/images/': typeof ImagesIndexRoute
   '/launch/': typeof LaunchIndexRoute
   '/skills/': typeof SkillsIndexRoute
+  '/videos/': typeof VideosIndexRoute
   '/settings/providers/$providerName': typeof SettingsProvidersProviderNameRoute
   '/settings/providers/': typeof SettingsProvidersIndexRoute
 }
@@ -251,6 +332,7 @@ export interface FileRouteTypes {
     | '/logs'
     | '/system-monitor'
     | '/hub/$modelId'
+    | '/images/$workflow'
     | '/local-api-server/logs'
     | '/project/$projectId'
     | '/settings/assistant'
@@ -264,12 +346,20 @@ export interface FileRouteTypes {
     | '/settings/interface'
     | '/settings/local-api-server'
     | '/settings/mcp-servers'
+    | '/settings/media'
     | '/settings/privacy'
+    | '/settings/remote-lan'
     | '/settings/shortcuts'
+    | '/settings/voice'
     | '/threads/$threadId'
+    | '/api/'
+    | '/cloud/'
+    | '/connectors/'
     | '/hub/'
+    | '/images/'
     | '/launch/'
     | '/skills/'
+    | '/videos/'
     | '/settings/providers/$providerName'
     | '/settings/providers/'
   fileRoutesByTo: FileRoutesByTo
@@ -278,6 +368,7 @@ export interface FileRouteTypes {
     | '/logs'
     | '/system-monitor'
     | '/hub/$modelId'
+    | '/images/$workflow'
     | '/local-api-server/logs'
     | '/project/$projectId'
     | '/settings/assistant'
@@ -291,12 +382,20 @@ export interface FileRouteTypes {
     | '/settings/interface'
     | '/settings/local-api-server'
     | '/settings/mcp-servers'
+    | '/settings/media'
     | '/settings/privacy'
+    | '/settings/remote-lan'
     | '/settings/shortcuts'
+    | '/settings/voice'
     | '/threads/$threadId'
+    | '/api'
+    | '/cloud'
+    | '/connectors'
     | '/hub'
+    | '/images'
     | '/launch'
     | '/skills'
+    | '/videos'
     | '/settings/providers/$providerName'
     | '/settings/providers'
   id:
@@ -305,6 +404,7 @@ export interface FileRouteTypes {
     | '/logs'
     | '/system-monitor'
     | '/hub/$modelId'
+    | '/images/$workflow'
     | '/local-api-server/logs'
     | '/project/$projectId'
     | '/settings/assistant'
@@ -318,12 +418,20 @@ export interface FileRouteTypes {
     | '/settings/interface'
     | '/settings/local-api-server'
     | '/settings/mcp-servers'
+    | '/settings/media'
     | '/settings/privacy'
+    | '/settings/remote-lan'
     | '/settings/shortcuts'
+    | '/settings/voice'
     | '/threads/$threadId'
+    | '/api/'
+    | '/cloud/'
+    | '/connectors/'
     | '/hub/'
+    | '/images/'
     | '/launch/'
     | '/skills/'
+    | '/videos/'
     | '/settings/providers/$providerName'
     | '/settings/providers/'
   fileRoutesById: FileRoutesById
@@ -333,6 +441,7 @@ export interface RootRouteChildren {
   LogsRoute: typeof LogsRoute
   SystemMonitorRoute: typeof SystemMonitorRoute
   HubModelIdRoute: typeof HubModelIdRoute
+  ImagesWorkflowRoute: typeof ImagesWorkflowRoute
   LocalApiServerLogsRoute: typeof LocalApiServerLogsRoute
   ProjectProjectIdRoute: typeof ProjectProjectIdRoute
   SettingsAssistantRoute: typeof SettingsAssistantRoute
@@ -346,12 +455,20 @@ export interface RootRouteChildren {
   SettingsInterfaceRoute: typeof SettingsInterfaceRoute
   SettingsLocalApiServerRoute: typeof SettingsLocalApiServerRoute
   SettingsMcpServersRoute: typeof SettingsMcpServersRoute
+  SettingsMediaRoute: typeof SettingsMediaRoute
   SettingsPrivacyRoute: typeof SettingsPrivacyRoute
+  SettingsRemoteLanRoute: typeof SettingsRemoteLanRoute
   SettingsShortcutsRoute: typeof SettingsShortcutsRoute
+  SettingsVoiceRoute: typeof SettingsVoiceRoute
   ThreadsThreadIdRoute: typeof ThreadsThreadIdRoute
+  ApiIndexRoute: typeof ApiIndexRoute
+  CloudIndexRoute: typeof CloudIndexRoute
+  ConnectorsIndexRoute: typeof ConnectorsIndexRoute
   HubIndexRoute: typeof HubIndexRoute
+  ImagesIndexRoute: typeof ImagesIndexRoute
   LaunchIndexRoute: typeof LaunchIndexRoute
   SkillsIndexRoute: typeof SkillsIndexRoute
+  VideosIndexRoute: typeof VideosIndexRoute
   SettingsProvidersProviderNameRoute: typeof SettingsProvidersProviderNameRoute
   SettingsProvidersIndexRoute: typeof SettingsProvidersIndexRoute
 }
@@ -379,6 +496,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/videos/': {
+      id: '/videos/'
+      path: '/videos'
+      fullPath: '/videos/'
+      preLoaderRoute: typeof VideosIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/skills/': {
       id: '/skills/'
       path: '/skills'
@@ -393,11 +517,39 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LaunchIndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/images/': {
+      id: '/images/'
+      path: '/images'
+      fullPath: '/images/'
+      preLoaderRoute: typeof ImagesIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/hub/': {
       id: '/hub/'
       path: '/hub'
       fullPath: '/hub/'
       preLoaderRoute: typeof HubIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/connectors/': {
+      id: '/connectors/'
+      path: '/connectors'
+      fullPath: '/connectors/'
+      preLoaderRoute: typeof ConnectorsIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/cloud/': {
+      id: '/cloud/'
+      path: '/cloud'
+      fullPath: '/cloud/'
+      preLoaderRoute: typeof CloudIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/': {
+      id: '/api/'
+      path: '/api'
+      fullPath: '/api/'
+      preLoaderRoute: typeof ApiIndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/threads/$threadId': {
@@ -407,6 +559,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ThreadsThreadIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/settings/voice': {
+      id: '/settings/voice'
+      path: '/settings/voice'
+      fullPath: '/settings/voice'
+      preLoaderRoute: typeof SettingsVoiceRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/settings/shortcuts': {
       id: '/settings/shortcuts'
       path: '/settings/shortcuts'
@@ -414,11 +573,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsShortcutsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/settings/remote-lan': {
+      id: '/settings/remote-lan'
+      path: '/settings/remote-lan'
+      fullPath: '/settings/remote-lan'
+      preLoaderRoute: typeof SettingsRemoteLanRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/settings/privacy': {
       id: '/settings/privacy'
       path: '/settings/privacy'
       fullPath: '/settings/privacy'
       preLoaderRoute: typeof SettingsPrivacyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings/media': {
+      id: '/settings/media'
+      path: '/settings/media'
+      fullPath: '/settings/media'
+      preLoaderRoute: typeof SettingsMediaRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/settings/mcp-servers': {
@@ -512,6 +685,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LocalApiServerLogsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/images/$workflow': {
+      id: '/images/$workflow'
+      path: '/images/$workflow'
+      fullPath: '/images/$workflow'
+      preLoaderRoute: typeof ImagesWorkflowRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/hub/$modelId': {
       id: '/hub/$modelId'
       path: '/hub/$modelId'
@@ -541,6 +721,7 @@ const rootRouteChildren: RootRouteChildren = {
   LogsRoute: LogsRoute,
   SystemMonitorRoute: SystemMonitorRoute,
   HubModelIdRoute: HubModelIdRoute,
+  ImagesWorkflowRoute: ImagesWorkflowRoute,
   LocalApiServerLogsRoute: LocalApiServerLogsRoute,
   ProjectProjectIdRoute: ProjectProjectIdRoute,
   SettingsAssistantRoute: SettingsAssistantRoute,
@@ -554,12 +735,20 @@ const rootRouteChildren: RootRouteChildren = {
   SettingsInterfaceRoute: SettingsInterfaceRoute,
   SettingsLocalApiServerRoute: SettingsLocalApiServerRoute,
   SettingsMcpServersRoute: SettingsMcpServersRoute,
+  SettingsMediaRoute: SettingsMediaRoute,
   SettingsPrivacyRoute: SettingsPrivacyRoute,
+  SettingsRemoteLanRoute: SettingsRemoteLanRoute,
   SettingsShortcutsRoute: SettingsShortcutsRoute,
+  SettingsVoiceRoute: SettingsVoiceRoute,
   ThreadsThreadIdRoute: ThreadsThreadIdRoute,
+  ApiIndexRoute: ApiIndexRoute,
+  CloudIndexRoute: CloudIndexRoute,
+  ConnectorsIndexRoute: ConnectorsIndexRoute,
   HubIndexRoute: HubIndexRoute,
+  ImagesIndexRoute: ImagesIndexRoute,
   LaunchIndexRoute: LaunchIndexRoute,
   SkillsIndexRoute: SkillsIndexRoute,
+  VideosIndexRoute: VideosIndexRoute,
   SettingsProvidersProviderNameRoute: SettingsProvidersProviderNameRoute,
   SettingsProvidersIndexRoute: SettingsProvidersIndexRoute,
 }

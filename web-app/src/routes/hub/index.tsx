@@ -7,18 +7,22 @@ import {
   useMemo,
   useRef,
   useState,
-  type ChangeEvent,
+  type ReactNode,
 } from 'react'
-import { IconSearch } from '@tabler/icons-react'
 import { Loader } from 'lucide-react'
 import HeaderPage from '@/containers/HeaderPage'
+import { DecisionHub } from '@/containers/hub/DecisionHub'
+import { HubCategorySelect } from '@/containers/hub/HubCategorySelect'
 import { HubFilters } from '@/containers/hub/HubFilters'
+import { HubNoResults, HubSearchInput } from '@/containers/hub/HubSearch'
+import { MediaHub } from '@/containers/hub/MediaHub'
 import { ModelDetailPanel } from '@/containers/hub/ModelDetailPanel'
 import { ModelListRow } from '@/containers/hub/ModelListRow'
 import { RECOMMENDED_MODEL_FALLBACKS } from '@/constants/models'
 import { route } from '@/constants/routes'
 import { useGeneralSetting } from '@/hooks/useGeneralSetting'
 import { useHardware } from '@/hooks/useHardware'
+import { useHuggingFaceFeed } from '@/hooks/useHuggingFaceFeed'
 import { useModelProvider } from '@/hooks/useModelProvider'
 import { useModelSources } from '@/hooks/useModelSources'
 import { useServiceHub } from '@/hooks/useServiceHub'
@@ -27,21 +31,36 @@ import { useTranslation } from '@/i18n/react-i18next-compat'
 import {
   applyHubFilters,
   hasLikeData,
+  huggingFaceQueries,
+  isUncensoredModel,
+  modelDownloadSizeText,
+  modelFitsBudget,
   readHubFilters,
   sortModels,
   writeHubFilters,
   type HubFilterState,
+  type HubSortKey,
 } from '@/lib/hub-filters'
 import {
   collectInstalledModels,
   filterInstalledBySearch,
+  withStaffPicks,
 } from '@/lib/hub-installed'
+import { isDecisionHostSupported } from '@/lib/decision/platform'
+import {
+  HUB_CATEGORIES,
+  isHubCategory,
+  type HubCategory,
+} from '@/lib/hub-media'
 import { getMemoryBudgetBytes } from '@/lib/model-card'
 import { extractModelName } from '@/lib/models'
+import { PlatformFeatures } from '@/lib/platform/const'
+import { PlatformFeature } from '@/lib/platform/types'
 import { cn } from '@/lib/utils'
 import { getModelSearchService } from '@/services/model-search'
 import { useModelCatalogStore } from '@/stores/model-catalog-store'
-import type { CatalogModel } from '@/services/models/types'
+import type { DiffusionModality } from '@/services/diffusion/types'
+import type { CatalogModel, HuggingFaceFeedSort } from '@/services/models/types'
 import type {
   StaffPick,
   StaffPickFormat,
@@ -53,8 +72,14 @@ type SearchParams = {
   repo?: string
   engine?: 'mlx' | 'gguf'
   q?: string
-  /** Repo id of the model shown in the right-hand detail panel. */
+  /**
+   * Repo id of the model shown in the right-hand detail panel; in the Images
+   * and Video categories, the id of the catalog family; in Decision, the
+   * catalog id of the model.
+   */
   model?: string
+  /** Absent means Chat: every link into the Hub from a chat asks for one. */
+  category?: HubCategory
 }
 
 /** A row in the left column, plus the provenance the row needs to render. */
@@ -62,7 +87,20 @@ type HubListItem = {
   model: CatalogModel
   pick?: StaffPick
   fromHuggingFace?: boolean
+  /** A heading painted above this row: the first row of a new section. */
+  sectionLabel?: string
 }
+
+/** The Hub's sort dropdown, in Hugging Face's own vocabulary. */
+const FEED_SORT_FOR: Record<HubSortKey, HuggingFaceFeedSort> = {
+  'recommended': 'trending',
+  'downloads': 'downloads',
+  'likes': 'likes',
+  'last-modified': 'lastModified',
+}
+
+/** How many rows before the end of the list the next page is asked for. */
+const FEED_PREFETCH_ROWS = 8
 
 // Base (non-instruction-tuned) Gemma 4 MLX builds (e.g.
 // `mlx-community/gemma-4-12B-4bit`, converted from `google/gemma-4-12B`)
@@ -97,6 +135,7 @@ export const Route = createFileRoute(route.hub.index as any)({
         : undefined,
     q: typeof search.q === 'string' ? search.q : undefined,
     model: typeof search.model === 'string' ? search.model : undefined,
+    category: isHubCategory(search.category) ? search.category : undefined,
   }),
 })
 
@@ -105,6 +144,166 @@ export const Route = createFileRoute(route.hub.index as any)({
 const hubScrollCache: { q: string; offset: number } = { q: '', offset: 0 }
 
 function HubContent() {
+  const navigate = useNavigate()
+  const { category: categorySearchParam } = Route.useSearch()
+  const decisionApiSupported = useServiceHub().decision().isSupported()
+  const cpuArch = useHardware((s) => s.hardwareData.cpu.arch)
+  // Image and video models need the local media engine, decision models a
+  // TurboQuant build for this machine; with neither the Hub stays the chat
+  // catalog it always was, switch and all.
+  const mediaSupported = PlatformFeatures[PlatformFeature.MEDIA_GENERATION]
+  const decisionSupported =
+    PlatformFeatures[PlatformFeature.LOCAL_INFERENCE] &&
+    decisionApiSupported &&
+    isDecisionHostSupported(cpuArch)
+  const categories = useMemo(
+    () =>
+      HUB_CATEGORIES.filter((c) =>
+        c === 'decision'
+          ? decisionSupported
+          : c === 'chat' || mediaSupported
+      ),
+    [mediaSupported, decisionSupported]
+  )
+  const category: HubCategory =
+    categorySearchParam && categories.includes(categorySearchParam)
+      ? categorySearchParam
+      : 'chat'
+
+  const changeCategory = useCallback(
+    (next: HubCategory) => {
+      void navigate({
+        to: route.hub.index,
+        // The selection belongs to the category it was made in.
+        search: (prev: SearchParams) => ({
+          ...prev,
+          category: next === 'chat' ? undefined : next,
+          model: undefined,
+          repo: undefined,
+        }),
+        replace: true,
+      })
+    },
+    [navigate]
+  )
+
+  const categoryTabs =
+    categories.length > 1 ? (
+      <HubCategorySelect
+        categories={categories}
+        value={category}
+        onChange={changeCategory}
+      />
+    ) : undefined
+
+  if (category === 'chat') return <ChatHub categoryTabs={categoryTabs} />
+  if (category === 'decision') {
+    return <DecisionHubContent categoryTabs={categoryTabs} />
+  }
+  return (
+    <MediaHubContent
+      key={category}
+      modality={category}
+      categoryTabs={categoryTabs}
+    />
+  )
+}
+
+function DecisionHubContent({ categoryTabs }: { categoryTabs?: ReactNode }) {
+  const navigate = useNavigate()
+  const { q: querySearchParam, model: modelSearchParam } = Route.useSearch()
+  const [query, setQuery] = useState(querySearchParam ?? getHubSearchQuery())
+
+  const changeQuery = useCallback(
+    (next: string) => {
+      setQuery(next)
+      setHubSearchQuery(next)
+      void navigate({
+        to: route.hub.index,
+        search: (prev: SearchParams) => ({
+          ...prev,
+          q: next.trim() || undefined,
+        }),
+        replace: true,
+      })
+    },
+    [navigate]
+  )
+
+  const selectModel = useCallback(
+    (modelId: string, options?: { replace?: boolean }) => {
+      void navigate({
+        to: route.hub.index,
+        search: (prev: SearchParams) => ({ ...prev, model: modelId }),
+        replace: options?.replace ?? false,
+      })
+    },
+    [navigate]
+  )
+
+  return (
+    <DecisionHub
+      categoryTabs={categoryTabs}
+      query={query}
+      onQueryChange={changeQuery}
+      selectedModelId={modelSearchParam ?? null}
+      onSelectModel={selectModel}
+    />
+  )
+}
+
+function MediaHubContent({
+  modality,
+  categoryTabs,
+}: {
+  modality: DiffusionModality
+  categoryTabs?: ReactNode
+}) {
+  const navigate = useNavigate()
+  const { q: querySearchParam, model: modelSearchParam } = Route.useSearch()
+  // One search box for every category: switching keeps what was typed.
+  const [query, setQuery] = useState(querySearchParam ?? getHubSearchQuery())
+
+  const changeQuery = useCallback(
+    (next: string) => {
+      setQuery(next)
+      setHubSearchQuery(next)
+      void navigate({
+        to: route.hub.index,
+        search: (prev: SearchParams) => ({
+          ...prev,
+          q: next.trim() || undefined,
+        }),
+        replace: true,
+      })
+    },
+    [navigate]
+  )
+
+  const selectFamily = useCallback(
+    (familyId: string, options?: { replace?: boolean }) => {
+      void navigate({
+        to: route.hub.index,
+        search: (prev: SearchParams) => ({ ...prev, model: familyId }),
+        replace: options?.replace ?? false,
+      })
+    },
+    [navigate]
+  )
+
+  return (
+    <MediaHub
+      modality={modality}
+      categoryTabs={categoryTabs}
+      query={query}
+      onQueryChange={changeQuery}
+      selectedFamilyId={modelSearchParam ?? null}
+      onSelectFamily={selectFamily}
+    />
+  )
+}
+
+function ChatHub({ categoryTabs }: { categoryTabs?: ReactNode }) {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const serviceHub = useServiceHub()
@@ -158,6 +357,7 @@ function HubContent() {
   const [filters, setFilters] = useState<HubFilterState>(() => readHubFilters())
   const [showOnlyDownloaded, setShowOnlyDownloaded] = useState(false)
   const [isSearching, setIsSearching] = useState(false)
+  const [hfSearching, setHfSearching] = useState(false)
   const [huggingFaceRepo, setHuggingFaceRepo] = useState<CatalogModel | null>(
     null
   )
@@ -220,7 +420,34 @@ function HubContent() {
       : 'gguf'
   const staffPickItems = useStaffPicks(sources, picksFormat)
 
-  const isSearchMode = debouncedSearchValue.length > 0 || showOnlyDownloaded
+  // Uncensored builds are a search of their own: the curated picks carry none,
+  // so the filter opens the whole catalog plus Hugging Face even with no query.
+  const isSearchMode =
+    debouncedSearchValue.length > 0 || showOnlyDownloaded || filters.uncensored
+
+  // Under the picks, the rest of Hugging Face in the order the sort dropdown
+  // names — its own trending score by default — a page at a time.
+  const feed = useHuggingFaceFeed(
+    picksFormat,
+    FEED_SORT_FOR[filters.sort],
+    !isSearchMode
+  )
+  const uncensoredQueries = useMemo(
+    () => huggingFaceQueries(debouncedSearchValue, true),
+    [debouncedSearchValue]
+  )
+  const uncensoredFeed = useHuggingFaceFeed(
+    picksFormat,
+    FEED_SORT_FOR[filters.sort],
+    filters.uncensored,
+    uncensoredQueries[0] ?? ''
+  )
+  const abliteratedFeed = useHuggingFaceFeed(
+    picksFormat,
+    FEED_SORT_FOR[filters.sort],
+    filters.uncensored && uncensoredQueries.length > 1,
+    uncensoredQueries[1] ?? ''
+  )
 
   // ---- Staff picks mode -------------------------------------------------
 
@@ -265,9 +492,19 @@ function HubContent() {
   //
   // Reading `providers` reactively (rather than via `getState()`) is what makes
   // a downloaded/deleted model appear or vanish immediately (ATO-180).
+  //
+  // The staff picks claim their downloads too: onboarding offers picks the
+  // catalog does not index, and the Hub must recognise the file it fetched.
+  const installedCatalog = useMemo(
+    () => withStaffPicks(sources, staffPickModels),
+    [sources, staffPickModels]
+  )
   const installedModels = useMemo(
-    () => (showOnlyDownloaded ? collectInstalledModels(sources, providers) : []),
-    [showOnlyDownloaded, sources, providers]
+    () =>
+      showOnlyDownloaded
+        ? collectInstalledModels(installedCatalog, providers)
+        : [],
+    [showOnlyDownloaded, installedCatalog, providers]
   )
 
   const installedResults = useMemo(
@@ -312,10 +549,18 @@ function HubContent() {
 
   // Long-tail Hugging Face fallback (Path B): fan out to HF's public search
   // when the curated catalog returns sparse hits for a non-trivial query.
+  // Uncensored has cursor-based feeds of its own above; keeping it out of this
+  // one-shot path removes the old 20-results-per-term ceiling.
   useEffect(() => {
     if (showOnlyDownloaded) {
       setHfCandidates([])
       hfCandidatesFetchedForRef.current = ''
+      return
+    }
+    if (filters.uncensored) {
+      setHfCandidates((current) => (current.length > 0 ? [] : current))
+      hfCandidatesFetchedForRef.current = ''
+      setHfSearching(false)
       return
     }
     const query = debouncedSearchValue.trim()
@@ -323,32 +568,53 @@ function HubContent() {
       if (catalogResults.length >= 5) setHfCandidates([])
       return
     }
-    const cacheKey = query.toLowerCase()
+    const queries = huggingFaceQueries(query, false)
+    const cacheKey = queries.join('\n').toLowerCase()
     if (hfCandidatesFetchedForRef.current === cacheKey) return
     hfCandidatesFetchedForRef.current = cacheKey
 
+    const limit = 10
     let cancelled = false
-    serviceHub
-      .models()
-      .searchHuggingFaceCandidates(query, huggingfaceToken, 10)
-      .then((candidates) => {
+    let settled = false
+    setHfSearching(true)
+    Promise.all(
+      queries.map((q) =>
+        serviceHub
+          .models()
+          .searchHuggingFaceCandidates(q, huggingfaceToken, limit)
+      )
+    )
+      .then((batches) => {
         if (cancelled) return
         const seen = new Set(catalogResults.map((m) => m.model_name))
         if (huggingFaceRepo) seen.add(huggingFaceRepo.model_name)
-        setHfCandidates(
-          candidates.filter((c) => c.model_name && !seen.has(c.model_name))
-        )
+        const merged: CatalogModel[] = []
+        for (const candidate of batches.flat()) {
+          if (!candidate.model_name || seen.has(candidate.model_name)) continue
+          seen.add(candidate.model_name)
+          merged.push(candidate)
+        }
+        setHfCandidates(merged)
       })
       .catch(() => {
         if (!cancelled) setHfCandidates([])
       })
+      .finally(() => {
+        settled = true
+        if (!cancelled) setHfSearching(false)
+      })
     return () => {
       cancelled = true
+      setHfSearching(false)
+      // A run superseded mid-flight (the catalog finished loading, say) drops
+      // its answer, so let the next run ask again instead of hitting the cache.
+      if (!settled) hfCandidatesFetchedForRef.current = ''
     }
   }, [
     debouncedSearchValue,
     catalogResults,
     showOnlyDownloaded,
+    filters.uncensored,
     serviceHub,
     huggingfaceToken,
     huggingFaceRepo,
@@ -360,7 +626,11 @@ function HubContent() {
     if (showOnlyDownloaded) {
       // The format and fit filters describe what to look for in the catalog;
       // applied here they would hide models the user already has on disk.
-      return sortModels(installedResults, filters.sort).map((model) => ({
+      // Uncensored is about the model itself, so it still narrows the list.
+      const installed = filters.uncensored
+        ? installedResults.filter(isUncensoredModel)
+        : installedResults
+      return sortModels(installed, filters.sort).map((model) => ({
         model,
         pick: pickByRepo.get(model.model_name),
       }))
@@ -371,10 +641,47 @@ function HubContent() {
         budgetBytes,
         applyFitFilter: true,
       })
-      return filtered.map((model) => ({
+      const picks: HubListItem[] = filtered.map((model, index) => ({
         model,
         pick: pickByRepo.get(model.model_name),
+        sectionLabel: index === 0 ? t('hub:staffPicks') : undefined,
       }))
+
+      // The feed is already in Hugging Face's order for this sort, so it is
+      // appended as a section rather than re-sorted into the picks. A repo
+      // the catalog knows is shown from the catalog, sizes included; one the
+      // user has scrolled to shows the card fetched for it; the rest stay
+      // lightweight until they come on screen.
+      const taken = new Set(
+        staffPickModels.map((m) => m.model_name.toLowerCase())
+      )
+      const bySource = new Map(
+        sources.map((m) => [m.model_name.toLowerCase(), m])
+      )
+      const feedRows: HubListItem[] = []
+      for (const entry of feed.models) {
+        const key = entry.model_name.toLowerCase()
+        if (taken.has(key)) continue
+        taken.add(key)
+        const model =
+          bySource.get(key) ?? feed.details.get(entry.model_name) ?? entry
+        if (isUnsupportedBaseGemmaMlx(model)) continue
+        // A size the row does not know yet cannot fail the fit filter.
+        if (
+          filters.onlyFitting &&
+          budgetBytes > 0 &&
+          modelDownloadSizeText(model) !== undefined &&
+          !modelFitsBudget(model, budgetBytes)
+        ) {
+          continue
+        }
+        feedRows.push({
+          model,
+          fromHuggingFace: true,
+          sectionLabel: feedRows.length === 0 ? t('hub:feedTitle') : undefined,
+        })
+      }
+      return [...picks, ...feedRows]
     }
 
     const seen = new Set(catalogResults.map((m) => m.model_name))
@@ -386,9 +693,27 @@ function HubContent() {
         : []
     for (const model of head) seen.add(model.model_name)
 
-    const tail = hfCandidates.filter(
-      (c) => !seen.has(c.model_name) && !isUnsupportedBaseGemmaMlx(c)
-    )
+    const pagedUncensored = filters.uncensored
+      ? [...uncensoredFeed.models, ...abliteratedFeed.models].map(
+          (model) => uncensoredFeed.details.get(model.model_name) ?? model
+        )
+      : []
+    // A search hit carries no file list, so the detail panel has nothing to
+    // offer for download until the card fetched for the selected row replaces
+    // it — the same swap the feed and the uncensored listing make.
+    const tailSource = filters.uncensored
+      ? pagedUncensored
+      : hfCandidates.map((model) => feed.details.get(model.model_name) ?? model)
+    const tail = tailSource.filter((candidate) => {
+      if (
+        seen.has(candidate.model_name) ||
+        isUnsupportedBaseGemmaMlx(candidate)
+      ) {
+        return false
+      }
+      seen.add(candidate.model_name)
+      return true
+    })
 
     const hfNames = new Set([
       ...head.map((m) => m.model_name),
@@ -401,9 +726,11 @@ function HubContent() {
       { budgetBytes, applyFitFilter: true }
     )
 
-    return filtered.map((model) => ({
+    return filtered.map((model, index) => ({
       model,
       fromHuggingFace: hfNames.has(model.model_name),
+      sectionLabel:
+        filters.uncensored && index === 0 ? t('hub:uncensored') : undefined,
     }))
   }, [
     isSearchMode,
@@ -414,8 +741,19 @@ function HubContent() {
     catalogResults,
     huggingFaceRepo,
     hfCandidates,
+    uncensoredFeed.models,
+    uncensoredFeed.details,
+    uncensoredFeed.detailsVersion,
+    abliteratedFeed.models,
+    abliteratedFeed.detailsVersion,
     filters,
     budgetBytes,
+    sources,
+    feed.models,
+    feed.details,
+    // The details map keeps its identity; its version is what changes.
+    feed.detailsVersion,
+    t,
   ])
 
   const showLikesSort = useMemo(
@@ -446,7 +784,8 @@ function HubContent() {
   // Deep link into a repo the catalog does not carry: resolve it from HF once.
   useEffect(() => {
     if (!selectedRepo || selectedItem) return
-    const fallback = RECOMMENDED_MODEL_FALLBACKS[repoSearchParam ?? selectedRepo]
+    const fallback =
+      RECOMMENDED_MODEL_FALLBACKS[repoSearchParam ?? selectedRepo]
     if (fallback) {
       setDeepLinkedModel(fallback)
       return
@@ -457,7 +796,9 @@ function HubContent() {
       .fetchHuggingFaceRepo(repoSearchParam ?? selectedRepo, huggingfaceToken)
       .then((repo) => {
         if (cancelled || !repo) return
-        setDeepLinkedModel(serviceHub.models().convertHfRepoToCatalogModel(repo))
+        setDeepLinkedModel(
+          serviceHub.models().convertHfRepoToCatalogModel(repo)
+        )
       })
       .catch((error) => {
         console.error('Failed to resolve deep-linked model:', error)
@@ -517,8 +858,7 @@ function HubContent() {
     })
   }, [debouncedSearchValue, querySearchParam, navigate])
 
-  const handleSearchChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const next = event.target.value
+  const handleSearchChange = (next: string) => {
     setIsSearching(false)
     setSearchValue(next)
     setHubSearchQuery(next)
@@ -573,8 +913,73 @@ function HubContent() {
     requestAnimationFrame(apply)
   }, [listItems.length, querySearchParam])
 
+  // The next page is asked for a few rows before the end, and the rows on
+  // screen that still lack a size get their card fetched — both from what the
+  // virtualizer is actually painting, so a fast scroll costs what it shows.
+  const virtualItems = rowVirtualizer.getVirtualItems()
+  const lastVisibleIndex = virtualItems[virtualItems.length - 1]?.index ?? -1
+  const visibleFeedRepos = useMemo(
+    () =>
+      virtualItems
+        .map((v) => listItems[v.index])
+        .filter(
+          (item): item is HubListItem =>
+            !!item?.fromHuggingFace &&
+            modelDownloadSizeText(item.model) === undefined
+        )
+        .map((item) => item.model.model_name)
+        .join('\n'),
+    // The virtual window is a new array every render; its contents are what
+    // matter, and `lastVisibleIndex` moves whenever they do.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [lastVisibleIndex, listItems]
+  )
+  useEffect(() => {
+    if (listItems.length === 0) return
+    if (filters.uncensored) {
+      if (lastVisibleIndex >= listItems.length - FEED_PREFETCH_ROWS) {
+        uncensoredFeed.loadMore()
+        abliteratedFeed.loadMore()
+      }
+      if (visibleFeedRepos) {
+        const repos = visibleFeedRepos.split('\n')
+        uncensoredFeed.ensureDetails(repos)
+        abliteratedFeed.ensureDetails(repos)
+      }
+      return
+    }
+    if (isSearchMode) return
+    if (lastVisibleIndex >= listItems.length - FEED_PREFETCH_ROWS) {
+      feed.loadMore()
+    }
+    if (visibleFeedRepos) feed.ensureDetails(visibleFeedRepos.split('\n'))
+  }, [
+    isSearchMode,
+    filters.uncensored,
+    listItems.length,
+    lastVisibleIndex,
+    visibleFeedRepos,
+    feed,
+    uncensoredFeed,
+    abliteratedFeed,
+  ])
+
+  // A selected feed row needs its card whether or not it is still on screen:
+  // the detail panel's download options come from it.
+  useEffect(() => {
+    const model = selectedItem?.model
+    if (!model || !('fromHuggingFace' in selectedItem)) return
+    if (!selectedItem.fromHuggingFace) return
+    if (modelDownloadSizeText(model) !== undefined) return
+    feed.ensureDetails([model.model_name])
+  }, [selectedItem, feed])
+
   const isEmpty = listItems.length === 0
-  const showSkeleton = loading && isEmpty && !isSearchMode
+  const uncensoredLoading =
+    filters.uncensored &&
+    (uncensoredFeed.loading || abliteratedFeed.loading)
+  const showSkeleton =
+    isEmpty && ((loading && !isSearchMode) || hfSearching || uncensoredLoading)
 
   return (
     <div className="grid h-svh w-full grid-cols-[minmax(320px,420px)_1fr] grid-rows-[auto_minmax(0,1fr)]">
@@ -588,24 +993,18 @@ function HubContent() {
             ? { 'data-tauri-drag-region': true }
             : {})}
         >
-          {isSearching ? (
-            <Loader className="size-4 shrink-0 animate-spin text-muted-foreground" />
-          ) : (
-            <IconSearch className="shrink-0 text-muted-foreground" size={14} />
-          )}
-          <input
-            placeholder={t('hub:searchPlaceholder')}
+          <HubSearchInput
             value={searchValue}
             onChange={handleSearchChange}
-            autoComplete="off"
-            aria-label={t('hub:searchPlaceholder')}
-            className="hub-models-search-input w-full min-w-0 flex-1 bg-transparent bg-clip-padding text-foreground shadow-none transition-none animate-none placeholder:text-muted-foreground focus:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
+            placeholder={t('hub:searchPlaceholder')}
+            busy={isSearching || hfSearching}
           />
         </div>
       </HeaderPage>
 
       <div className="col-start-1 row-start-2 flex min-h-0 min-w-0 flex-col border-r border-border">
         <div className="flex flex-col gap-2 border-b border-border p-3">
+          {categoryTabs}
           <HubFilters
             state={filters}
             onChange={updateFilters}
@@ -630,11 +1029,18 @@ function HubContent() {
               ))}
             </div>
           ) : isEmpty ? (
-            <p className="p-4 text-center text-sm text-muted-foreground">
-              {!isSearchMode && filters.onlyFitting
-                ? t('hub:noFittingPicks')
-                : t('hub:noModels')}
-            </p>
+            <HubNoResults
+              message={
+                !isSearchMode && filters.onlyFitting
+                  ? t('hub:noFittingPicks')
+                  : t('hub:noModels')
+              }
+              onClearSearch={
+                searchValue.length > 0
+                  ? () => handleSearchChange('')
+                  : undefined
+              }
+            />
           ) : (
             <div
               style={{
@@ -659,6 +1065,11 @@ function HubContent() {
                       paddingBottom: 4,
                     }}
                   >
+                    {item.sectionLabel && (
+                      <h2 className="px-2 pb-2 pt-4 text-base font-semibold text-foreground">
+                        {item.sectionLabel}
+                      </h2>
+                    )}
                     <ModelListRow
                       model={item.model}
                       pick={item.pick}
@@ -670,6 +1081,29 @@ function HubContent() {
                 )
               })}
             </div>
+          )}
+          {!isSearchMode && !isEmpty && feed.loading && (
+            <p
+              className="flex items-center justify-center gap-2 py-3 text-xs text-muted-foreground"
+              role="status"
+            >
+              <Loader className="size-3 animate-spin" />
+              {t('hub:feedLoading')}
+            </p>
+          )}
+          {filters.uncensored && !isEmpty && uncensoredLoading && (
+            <p
+              className="flex items-center justify-center gap-2 py-3 text-xs text-muted-foreground"
+              role="status"
+            >
+              <Loader className="size-3 animate-spin" />
+              {t('hub:feedLoading')}
+            </p>
+          )}
+          {!isSearchMode && !isEmpty && !feed.loading && feed.error && (
+            <p className="py-3 text-center text-xs text-muted-foreground">
+              {t('hub:feedFailed')}
+            </p>
           )}
         </div>
       </div>

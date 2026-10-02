@@ -2,6 +2,8 @@
   "assistants": "Assistants",
   "hardware": "Hardware",
   "mcp-servers": "MCP Servers",
+  "connectors": "Connectors",
+  "plugins": "Plugins",
   "local_api_server": "Local API Server",
   "remote_access": "Remote Access",
   "integrations": "Integrations",
@@ -9,8 +11,10 @@
   "claude_code": "Claude Code",
   "hermes_agent": "Hermes Agent",
   "https_proxy": "HTTPS Proxy",
+  "remote_lan": "Remote & LAN",
   "extensions": "Extensions",
   "attachments": "Attachments",
+  "voice": "Voice",
   "general": "General",
   "settings": "Settings",
   "modelProviders": "Model Providers",
@@ -34,8 +38,14 @@
   "recents": "Recents",
   "hub": "Hub",
   "models": "Models",
+  "modelHub": "Model Hub",
+  "images": "Images",
+  "video": "Video",
+  "media": "Media",
   "launch": "Integrations",
+  "api": "API",
   "skills": "Skills",
+  "cloud": "Cloud",
   "agentSkill": {
     "selected": "Skill: {{name}}",
     "remove": "Remove selected skill",
@@ -166,13 +176,110 @@
   "tools": "Tools",
   "webSearch": "Web Search",
   "reasoning": "Reasoning",
+  "webSearchToggleTooltip": "Web search",
+  "webSearchToggleEnabled": "Web search enabled",
+  "webSearchToggleDisabled": "Web search disabled",
+  "webSearchToggleConnecting": "Connecting web search…",
+  "webSearchToggleUnavailable": "Web search unavailable. Click to retry; if it still fails, check your search provider connection and MCP configuration.",
+  "webSearchTemporarilyUnavailable": "Web search is temporarily unavailable. Try again.",
   "reasoningToggleEnabled": "Reasoning enabled",
   "reasoningToggleDisabled": "Reasoning disabled",
+  "reasoningEffort": {
+    "title": "Effort",
+    "unavailable": "Unavailable for this model",
+    "ariaLabel": "Thinking effort: {{level}}",
+    "faster": "Faster",
+    "smarter": "Smarter",
+    "off": "Off",
+    "low": "Low",
+    "medium": "Medium",
+    "high": "High",
+    "xhigh": "Extra High",
+    "max": "Max"
+  },
+  "voiceInput": {
+    "start": "Start voice input",
+    "stop": "Stop and insert",
+    "cancel": "Discard recording",
+    "listening": "Listening…",
+    "preparing": "Preparing voice input…",
+    "starting": "Starting the voice model…",
+    "transcribing": "Transcribing…",
+    "placeholder": "Listening — start speaking",
+    "level": "Microphone level",
+    "elapsed": "Recording time",
+    "unavailableWhileStreaming": "Voice input is unavailable while a reply is streaming",
+    "keptOnCancel": "Recording stopped. The text already inserted was kept.",
+    "deviceFallback": "That microphone wasn't available, so the system default is being used.",
+    "errors": {
+      "permission": "Atomic Chat can't use the microphone",
+      "noDevice": "No microphone was found",
+      "deviceBusy": "The microphone is in use by another app",
+      "deviceDisconnected": "The microphone was disconnected",
+      "modelMissing": "The voice model isn't installed yet",
+      "engineFailed": "The voice model couldn't be started",
+      "transcriptionFailed": "That phrase couldn't be transcribed",
+      "transcriptionUnsupported": "This llama.cpp build can't run the voice model",
+      "transcriptionTimeout": "The voice model took too long to answer",
+      "internal": "Voice input ran into a problem"
+    },
+    "setup": {
+      "step": "Step {{current}} of {{total}}",
+      "back": "Back",
+      "next": "Next",
+      "done": "Done",
+      "intro": {
+        "title": "Talk instead of typing",
+        "description": "Dictate into the message box and your words appear as you speak.",
+        "bulletLive": "Each phrase lands as soon as you finish it.",
+        "bulletLocal": "Runs on this computer — audio never leaves it.",
+        "bulletAnywhere": "Works in chat and in agent mode."
+      },
+      "permission": {
+        "title": "Allow microphone access",
+        "description": "Nothing is recorded until you press the microphone button.",
+        "allow": "Allow microphone",
+        "requesting": "Waiting for your answer…",
+        "allowed": "Allowed",
+        "denied": "Microphone access was denied",
+        "deniedHelp": "Re-enable the microphone for Atomic Chat in your privacy settings.",
+        "openSystemSettings": "Open System Settings",
+        "checkAgain": "Check again",
+        "restartNote": "On macOS you may need to restart Atomic Chat after changing this.",
+        "unsupported": "This system handles microphone access outside the app.",
+        "rowTitle": "Microphone",
+        "rowDescription": "Required to capture your speech for transcription.",
+        "deniedShort": "Denied",
+        "unsupportedShort": "System-managed",
+        "privacyNote": "You can revoke access at any time in your system privacy settings.",
+        "allowShort": "Allow"
+      },
+      "model": {
+        "title": "Install the voice model",
+        "description": "Voxtral Mini transcribes locally. It is downloaded once.",
+        "meta": "{{size}} · llama.cpp · one-time download",
+        "installed": "Installed",
+        "progress": "{{percent}}% · {{current}} / {{total}} GB",
+        "failed": "The voice model download failed",
+        "diskNote": "Needs about {{gb}} GB of free disk space.",
+        "tagline": "Realtime multilingual transcription",
+        "sizeGb": "{{size}} GB"
+      },
+      "doneBlocked": "Allow the microphone and install the voice model to finish."
+    }
+  },
   "proactive": "Proactive",
-  "selectAModel": "Select a model",
+  "selectAModel": "Select Model",
+  "changeModel": "Change model",
   "downloadModel": "Download a model",
   "noToolsAvailable": "No tools available",
   "noModelsFoundFor": "No models found for \"{{searchValue}}\"",
+  "modelPicker": {
+    "downloadFromHuggingFace": "Download from Hugging Face",
+    "noRunnableModels": "No runnable models yet.",
+    "providerSettings": "Settings for {{provider}}",
+    "downloadSize": "Download {{size}}"
+  },
   "failedToLoadModels": "Failed to load models",
   "failedToLoadModelsTimeout": "Couldn't load models (timed out)",
   "retry": "Retry",
@@ -355,6 +462,10 @@
     "noAssistantAssigned": "No assistant assigned to this project",
     "files": "Files",
     "filesDescription": "Add PDFs, documents, or other text to reference in this project.",
+    "uploading": "Indexing…",
+    "uploadingHint": "The first upload also downloads the embedding model. Progress is in the downloads panel.",
+    "preparingIndexModel": "Downloading the document index model",
+    "filesLoadFailed": "Couldn't load the project's files",
     "deleteProjectDialog": {
       "title": "Delete Project",
       "permanentDelete": "This will permanently delete all threads.",
@@ -453,6 +564,9 @@
       "title": "Download Cancelled",
       "description": "The download process was cancelled"
     },
+    "downloadResumed": {
+      "title": "Download resumed"
+    },
     "downloadFailed": {
       "title": "Download Failed",
       "description": "{{item}} download failed"
@@ -505,6 +619,9 @@
       "title": "Upload Failed",
       "description": "Failed to upload file"
     },
+    "unsupportedFileType": {
+      "title": "Unsupported file type"
+    },
     "fileDeleted": {
       "title": "File Deleted",
       "description": "File has been removed from the project"
@@ -520,13 +637,143 @@
     "attachmentsDisabledInfo": {
       "title": "Attachments Disabled",
       "description": "Attachments are disabled in Settings"
+    },
+    "downloadDiskFull": {
+      "title": "Not enough disk space",
+      "description": "Free up space on the drive holding your Atomic Chat data folder, then start the download again."
+    },
+    "downloadDiskPermission": {
+      "title": "No permission to write the model",
+      "description": "The app cannot write to the Atomic Chat data folder. Check the folder permissions, or move the data folder somewhere writable."
+    },
+    "downloadDiskLocked": {
+      "title": "The file is in use by another program",
+      "description": "Antivirus or backup software is holding the file while it is being written. Add the Atomic Chat data folder to its exclusions and retry."
+    },
+    "downloadDiskPathTooLong": {
+      "title": "File path is too long",
+      "description": "Windows limits paths to 260 characters. Move the Atomic Chat data folder closer to the drive root and retry."
+    },
+    "downloadDiskDeviceLost": {
+      "title": "The drive is no longer available",
+      "description": "The external or network drive holding the Atomic Chat data folder disconnected. Reconnect it and resume the download."
+    },
+    "downloadWontFit": {
+      "title": "This model won't fit on your disk",
+      "description": "{{model}} needs {{needed}} free and this drive has {{available}}. Pick a smaller model or free up space."
+    },
+    "downloadProxyUnreachable": {
+      "title": "Could not reach the server through your proxy",
+      "description": "The download never got a connection through {{proxyUrl}}. Check that the proxy address is correct and the proxy is running, or turn the proxy off in Settings.",
+      "action": "Proxy settings"
+    },
+    "downloadNetworkUnreachable": {
+      "title": "Could not reach the download server",
+      "description": "The connection never got through. Check your internet connection, VPN or firewall, then start the download again."
     }
   },
   "errors": {
     "fileTooLarge": "File too large",
-    "fileTooLargeDescription": "{{fileName}} exceeds the {{maxFileSizeMB}}MB limit"
+    "fileTooLargeDescription": "{{fileName}} exceeds the {{maxFileSizeMB}}MB limit",
+    "fileReadFailed": "Could not read file",
+    "fileReadFailedDescription": "{{fileName}} could not be read from disk"
   },
   "files": {
     "chunksCount": "{{count}} chunks"
+  },
+  "connectorsMenu": {
+    "title": "Connectors",
+    "empty": "No connectors yet",
+    "manage": "Manage connectors",
+    "toolCount": "{{count}} tools",
+    "toggleFailed": "Couldn't start {{server}}",
+    "starting": "Starting {{server}}",
+    "stopping": "Stopping {{server}}",
+    "connecting": "Connecting…",
+    "disconnecting": "Disconnecting…",
+    "ready": "{{server}} is ready",
+    "stopped": "{{server}} is off",
+    "cost": "{{count}} tools · ≈{{tokens}} tokens",
+    "costShare": "{{count}} tools · ≈{{tokens}} tokens ({{share}}% of context)",
+    "heavy": "Heavy: these tool definitions alone take {{share}}% of the {{ctx}}-token context on every request.",
+    "muteForChat": "Turn off for this chat",
+    "unmuteForChat": "Turn on for this chat",
+    "mutedForChat": "Off for this chat",
+    "toolCountPartial": "{{enabled}} of {{count}} tools",
+    "costPartial": "{{enabled}} of {{count}} tools · ≈{{tokens}} tokens",
+    "costSharePartial": "{{enabled}} of {{count}} tools · ≈{{tokens}} tokens ({{share}}% of context)",
+    "configureTools": "Tools",
+    "systemServersAgentOnly": "Filesystem, Fetch and Sequential thinking only run in Agent mode",
+    "systemServersAgentOnlyHint": "Turn on Agent mode in the composer “+” menu to let the model use them."
+  },
+  "connectorTools": {
+    "title": "{{name}} tools",
+    "scopeChat": "Changes apply to this chat only.",
+    "scopeDefault": "Defaults for new chats. A chat with its own tool settings keeps them.",
+    "summary": "{{enabled}} of {{count}} tools on",
+    "onForChat": "On for this chat",
+    "onByDefault": "On for new chats",
+    "mutedHint": "Turn the connector on to switch its tools.",
+    "search": "Search tools",
+    "enableAll": "Turn all on",
+    "disableAll": "Turn all off",
+    "noTools": "No tools listed. Connect the server to load its tools.",
+    "noMatches": "No tools match"
+  },
+  "pluginsMenu": {
+    "title": "Plugins",
+    "emptySkills": "No skills yet",
+    "manageSkills": "Manage skills"
+  },
+  "toolCostHint": {
+    "title": "Tool definitions take ≈{{tokens}} of {{ctx}} context tokens",
+    "body": "Connected connectors ({{servers}}) add their tool definitions to every request, so answers from a local model get slow. Turn the ones you do not need off for this chat.",
+    "mute": "Turn off {{server}} for this chat",
+    "dismiss": "Keep as is"
+  },
+  "downloadPanel": {
+    "collapse": "Collapse downloads",
+    "expand": "Show downloads",
+    "preparing": "Starting…",
+    "connecting": "Connecting…",
+    "retrying": "Connection failed, retrying ({{attempt}}/{{maxAttempts}})…",
+    "stalled": "Stalled, reconnecting…",
+    "paused": "Paused",
+    "left": "{{eta}} left",
+    "appUpdate": "App update"
+  },
+  "inferenceStatus": {
+    "starting": "Starting {{model}}…",
+    "startingDetail": "The model is loading into memory. Chat will answer as soon as it is ready.",
+    "restarting": "Restarting for {{model}}…",
+    "restartingDetail": "The previous engine is being stopped and this one started. Chat is paused until the swap finishes.",
+    "ready": "{{model}} is loaded",
+    "notLoaded": "No model loaded — the first message will start one",
+    "retry": "Try again"
+  },
+  "modelLoad": {
+    "starting": "Starting Model",
+    "ready": "Model ready",
+    "loadedIntoMemory": "Loaded into memory",
+    "loadingIntoMemory": "Loading into memory",
+    "cancel": "Cancel",
+    "cancelling": "Cancelling…",
+    "dismiss": "Dismiss",
+    "indicator": {
+      "loaded": "{{model}} is loaded",
+      "unload": "Unload from memory",
+      "unloading": "Unloading {{model}}…",
+      "loading": "Loading {{model}}…",
+      "stopLoading": "Stop loading",
+      "notLoaded": "Not loaded — the first message will start it",
+      "failed": "Failed to load"
+    }
+  },
+  "desktopNotification": {
+    "modelReadyTitle": "Model downloaded",
+    "modelReadyBody": "{{name}} is ready to use.",
+    "engineReadyTitle": "Engine installed",
+    "chatEngineReadyBody": "llama.cpp is ready to run models.",
+    "mediaEngineReadyBody": "The image and video engine is ready."
   }
 }

@@ -5,8 +5,6 @@ import {
   ActivityDetail,
   AgentActivity,
 } from '@/components/ai-elements/agent-activity'
-import { Tool } from '@/components/ai-elements/tools/tool'
-import { ToolRenderer } from '@/components/ai-elements/tools/tool-renderer'
 
 describe('AgentActivity', () => {
   beforeAll(() => {
@@ -78,40 +76,46 @@ describe('AgentActivity', () => {
     expect(screen.getByText('Worked for 3 s')).toBeInTheDocument()
   })
 
-  it('keeps multiline tool parameters inside nested compact details', async () => {
-    const user = userEvent.setup()
-    const { container } = render(
+  it('starts expanded when asked, so a failed run shows its reason', () => {
+    render(
       <AgentActivity
         active={false}
         workingLabel="Working"
-        durationLabel="Worked for 2 s"
+        durationLabel="Worked for 1.1 s"
+        defaultOpen
       >
-        <ActivityDetail label="Called 1 tool">
-          <Tool state="output-available">
-            <ToolRenderer
-              state="output-available"
-              presentation={{
-                kind: 'generic',
-                title: 'Wrote file',
-                input: {
-                  path: 'src/example.ts',
-                  content: 'export const first = 1\nexport const second = 2',
-                },
-                output: { ok: true },
-              }}
-            />
-          </Tool>
-        </ActivityDetail>
+        <span>llm: model server returned HTTP 400</span>
       </AgentActivity>
     )
 
-    expect(screen.queryByText('Called 1 tool')).not.toBeInTheDocument()
-    expect(screen.queryByText('export const first = 1')).not.toBeInTheDocument()
+    expect(
+      screen.getByText('llm: model server returned HTTP 400')
+    ).toBeInTheDocument()
+  })
 
-    await user.click(screen.getByRole('button', { name: /worked for 2 s/i }))
-    await user.click(screen.getByRole('button', { name: /called 1 tool/i }))
-    await user.click(screen.getByRole('button', { name: /wrote file/i }))
+  // The block mounts when the turn starts, so the failure always arrives after
+  // the first render — a mount-only `defaultOpen` would never fire.
+  it('expands when a run that was already mounted turns out to have failed', () => {
+    const activity = (props: { defaultOpen: boolean }) => (
+      <AgentActivity
+        active={!props.defaultOpen}
+        workingLabel="Working"
+        durationLabel="Worked for 1.1 s"
+        hasDetails
+        defaultOpen={props.defaultOpen}
+      >
+        <span>llm: model server returned HTTP 400</span>
+      </AgentActivity>
+    )
 
-    expect(container).toHaveTextContent('export const first = 1')
+    const { rerender } = render(activity({ defaultOpen: false }))
+    expect(
+      screen.queryByText('llm: model server returned HTTP 400')
+    ).not.toBeInTheDocument()
+
+    rerender(activity({ defaultOpen: true }))
+    expect(
+      screen.getByText('llm: model server returned HTTP 400')
+    ).toBeInTheDocument()
   })
 })

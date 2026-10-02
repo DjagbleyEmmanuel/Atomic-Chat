@@ -3,8 +3,10 @@ import { persist, createJSONStorage } from 'zustand/middleware'
 import { localStorageKey } from '@/constants/localStorage'
 import { getServiceHub } from '@/hooks/useServiceHub'
 import { modelSettings } from '@/lib/predefined'
+import { DEFAULT_CTX_LEN } from '@janhq/core'
 import { LOCAL_LLAMACPP_PROVIDER } from '@/lib/utils'
 import { turboquantDefaultActive } from '@/lib/turboquantDefaultMigration'
+import { isCloudProvider, isProviderConnected } from '@/lib/cloud-providers'
 
 /**
  * Historical provider id retained for one-time migration logic. The
@@ -12,6 +14,16 @@ import { turboquantDefaultActive } from '@/lib/turboquantDefaultMigration'
  * desktop platform, so this id must never be aliased away.
  */
 const LEGACY_LLAMACPP_PROVIDER = 'llamacpp'
+
+/**
+ * Local engines the app withdrew. Their extension no longer registers them,
+ * but `setProviders` keeps every persisted provider it is not sent, so a copy
+ * an earlier version saved would stay in the picker and in Settings. Apple's
+ * on-device model since 2026-09-30 (ADR
+ * 2026-09-30-hide-the-apple-on-device-provider); drop it from here when its
+ * extension offers it again.
+ */
+const WITHDRAWN_PROVIDERS: ReadonlySet<string> = new Set(['foundation-models'])
 
 /**
  * Identity mapping for a local llama.cpp provider id.
@@ -26,6 +38,20 @@ const LEGACY_LLAMACPP_PROVIDER = 'llamacpp'
  */
 const aliasLocalLlamacppProvider = (providerName: string): string =>
   providerName
+
+/**
+ * Rebind an existing model selection to the provider's current model object.
+ * A cloud provider without credentials/catalogue is no longer selectable even
+ * if its last fetched models are still cached on the provider.
+ */
+const resolveSelectedModel = (
+  provider: ModelProvider | undefined,
+  selectedModel: Model
+): Model | null => {
+  if (!provider || provider.active === false) return null
+  if (isCloudProvider(provider) && !isProviderConnected(provider)) return null
+  return provider.models.find((model) => model.id === selectedModel.id) ?? null
+}
 
 type ModelProviderState = {
   providers: ModelProvider[]
@@ -43,6 +69,7 @@ type ModelProviderState = {
   addProvider: (provider: ModelProvider) => void
   deleteProvider: (providerName: string) => void
   deleteModel: (modelId: string) => void
+  clearDeletedModel: (modelId: string) => void
 }
 
 export const useModelProvider = create<ModelProviderState>()(
@@ -74,6 +101,7 @@ export const useModelProvider = create<ModelProviderState>()(
             // Filter out legacy cortex `llama.cpp` provider for migration
             // Can remove after a couple of releases
             .filter((e) => e.provider !== 'llama.cpp')
+            .filter((e) => !WITHDRAWN_PROVIDERS.has(e.provider))
             .map((provider) => {
               return {
                 ...provider,
@@ -190,18 +218,24 @@ export const useModelProvider = create<ModelProviderState>()(
             (provider) => provider.provider === state.selectedProvider
           )
           const nextSelectedModel = state.selectedModel?.id
-            ? (nextSelectedProvider?.models.find(
-                (model) => model.id === state.selectedModel?.id
-              ) ?? null)
+            ? resolveSelectedModel(nextSelectedProvider, state.selectedModel)
             : null
 
           return {
             providers: nextProviders,
+            // Keep the provider-only startup/migration state intact. Once a
+            // real selection existed, however, provider and model are one
+            // atomic selection and must be cleared together when invalidated.
+            selectedProvider:
+              state.selectedModel && !nextSelectedModel
+                ? ''
+                : state.selectedProvider,
             selectedModel: nextSelectedModel,
           }
         }),
       updateProvider: (providerName, data) => {
         set((state) => {
+          let nextSelectedProvider = state.selectedProvider
           let nextSelectedModel = state.selectedModel
 
           const nextProviders = state.providers.map((provider) => {
@@ -218,10 +252,11 @@ export const useModelProvider = create<ModelProviderState>()(
               state.selectedProvider === providerName &&
               state.selectedModel?.id
             ) {
-              nextSelectedModel =
-                updatedProvider.models.find(
-                  (model) => model.id === state.selectedModel?.id
-                ) ?? null
+              nextSelectedModel = resolveSelectedModel(
+                updatedProvider,
+                state.selectedModel
+              )
+              if (!nextSelectedModel) nextSelectedProvider = ''
             }
 
             return updatedProvider
@@ -229,6 +264,7 @@ export const useModelProvider = create<ModelProviderState>()(
 
           return {
             providers: nextProviders,
+            selectedProvider: nextSelectedProvider,
             selectedModel: nextSelectedModel,
           }
         })
@@ -262,7 +298,7 @@ export const useModelProvider = create<ModelProviderState>()(
         // `selectedProvider` rendering, model lookups) see the canonical
         // local llama.cpp provider for this OS, not the legacy alias.
         set({
-          selectedProvider: resolvedName,
+          selectedProvider: modelObject ? resolvedName : '',
           selectedModel: modelObject || null,
         })
 
@@ -286,8 +322,22 @@ export const useModelProvider = create<ModelProviderState>()(
               }
             }),
             deletedModels: [...currentDeletedModels, modelId],
+            ...(state.selectedModel?.id === modelId
+              ? { selectedProvider: '', selectedModel: null }
+              : {}),
           }
         })
+      },
+      // Re-downloading a model has to lift its tombstone, or `setProviders`
+      // keeps filtering the fresh id out of every engine listing and the model
+      // stays invisible until the store is wiped.
+      clearDeletedModel: (modelId: string) => {
+        set((state) => ({
+          deletedModels: (Array.isArray(state.deletedModels)
+            ? state.deletedModels
+            : []
+          ).filter((id) => id !== modelId),
+        }))
       },
       addProvider: (provider: ModelProvider) => {
         set((state) => ({
@@ -295,11 +345,17 @@ export const useModelProvider = create<ModelProviderState>()(
         }))
       },
       deleteProvider: (providerName: string) => {
-        set((state) => ({
-          providers: state.providers.filter(
-            (provider) => provider.provider !== providerName
-          ),
-        }))
+        set((state) => {
+          const clearsSelection = state.selectedProvider === providerName
+          return {
+            providers: state.providers.filter(
+              (provider) => provider.provider !== providerName
+            ),
+            ...(clearsSelection
+              ? { selectedProvider: '', selectedModel: null }
+              : {}),
+          }
+        })
       },
     }),
     {
@@ -613,14 +669,15 @@ export const useModelProvider = create<ModelProviderState>()(
                 if (model.settings?.ctx_len?.controller_props) {
                   const current = model.settings.ctx_len.controller_props.value
                   if (current === 8192 || current === '8192') {
-                    model.settings.ctx_len.controller_props.value = 16384
+                    model.settings.ctx_len.controller_props.value =
+                      DEFAULT_CTX_LEN
                   }
                   if (
                     model.settings.ctx_len.controller_props.placeholder ===
                     '8192'
                   ) {
                     model.settings.ctx_len.controller_props.placeholder =
-                      '16384'
+                      String(DEFAULT_CTX_LEN)
                   }
                 }
               })
@@ -682,9 +739,33 @@ export const useModelProvider = create<ModelProviderState>()(
           state.selectedProvider = LOCAL_LLAMACPP_PROVIDER
         }
 
+        // v15 — cloud providers first registered by a build that defaulted
+        // them to `active: false` stayed off forever: `setProviders` keeps
+        // whatever was persisted, so connecting one on the Cloud page left it
+        // out of the model picker *and* out of `syncRemoteProviders` (which
+        // registers the proxy route). The result was a provider the Cloud page
+        // calls connected and nothing else can use, with no UI saying why.
+        //
+        // Only providers the user actually connected are re-enabled — an
+        // untouched one keeps its flag, so nothing the user deliberately
+        // switched off before ever setting it up is resurrected. This runs
+        // once per install, so the Settings toggle still has the last word
+        // afterwards.
+        if (version <= 14 && state?.providers) {
+          state.providers.forEach((provider) => {
+            if (
+              !provider.active &&
+              isCloudProvider(provider) &&
+              isProviderConnected(provider)
+            ) {
+              provider.active = true
+            }
+          })
+        }
+
         return state
       },
-      version: 14,
+      version: 15,
     }
   )
 )

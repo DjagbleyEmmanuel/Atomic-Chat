@@ -1,14 +1,8 @@
 import { useControllableState } from '@radix-ui/react-use-controllable-state'
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from '@/components/ui/collapsible'
+import { Collapsible, CollapsibleContent } from '@/components/ui/collapsible'
 import { cn } from '@/lib/utils'
 import { useAutoScrollToBottom } from '@/hooks/useAutoScrollToBottom'
 import type { ToolUIPart } from 'ai'
-import { ChevronDownIcon, Loader2, RotateCcw, Square, WrenchIcon } from 'lucide-react'
-import { Button } from '@/components/ui/button'
 import type { ComponentProps, ReactNode } from 'react'
 import {
   createContext,
@@ -46,16 +40,6 @@ export type ToolProps = ComponentProps<typeof Collapsible> & {
   open?: boolean
   defaultOpen?: boolean
   onOpenChange?: (open: boolean) => void
-  // Feature I: cancel+retry a single tool call.
-  toolCallId?: string
-  toolName?: string
-  input?: unknown
-  onCancel?: (toolCallId: string) => void
-  onRetry?: (
-    toolCallId: string,
-    toolName: string,
-    input: unknown
-  ) => void | Promise<void>
 }
 
 export const Tool = memo(
@@ -66,11 +50,6 @@ export const Tool = memo(
     defaultOpen = false,
     onOpenChange,
     children,
-    toolCallId,
-    toolName,
-    input,
-    onCancel,
-    onRetry,
     ...props
   }: ToolProps) => {
     const [isOpen, setIsOpen] = useControllableState({
@@ -93,152 +72,11 @@ export const Tool = memo(
         >
           {children}
         </Collapsible>
-        {toolCallId && (onCancel || onRetry) && (
-          <ToolActions
-            state={state}
-            toolCallId={toolCallId}
-            toolName={toolName ?? ''}
-            input={input}
-            onCancel={onCancel}
-            onRetry={onRetry}
-          />
-        )}
       </ToolContext.Provider>
     )
   }
 )
 
-const ToolActions = memo(
-  ({
-    state,
-    toolCallId,
-    toolName,
-    input,
-    onCancel,
-    onRetry,
-  }: {
-    state: ToolUIPart['state']
-    toolCallId: string
-    toolName: string
-    input: unknown
-    onCancel?: (toolCallId: string) => void
-    onRetry?: (
-      toolCallId: string,
-      toolName: string,
-      input: unknown
-    ) => void | Promise<void>
-  }) => {
-    const isRunning = state === 'input-streaming' || state === 'input-available'
-    const hasError = state === 'output-error'
-    const [retrying, setRetrying] = useState(false)
-
-    if (!isRunning && !hasError) return null
-
-    const actionClasses =
-      'h-6 px-2 text-xs transition-all active:scale-[0.97] disabled:pointer-events-none disabled:opacity-60'
-
-    return (
-      <div className="mt-1 flex items-center gap-2">
-        {isRunning && onCancel && (
-          <Button
-            variant="ghost"
-            size="sm"
-            type="button"
-            className={cn(actionClasses, 'text-muted-foreground')}
-            onClick={() => onCancel(toolCallId)}
-          >
-            <Square size={12} className="mr-1" />
-            Cancel
-          </Button>
-        )}
-        {hasError && onRetry && toolName && (
-          <Button
-            variant="ghost"
-            size="sm"
-            type="button"
-            disabled={retrying}
-            className={cn(actionClasses, 'text-muted-foreground')}
-            onClick={() => {
-              setRetrying(true)
-              Promise.resolve(
-                onRetry?.(toolCallId, toolName, input)
-              ).finally(() => {
-                setRetrying(false)
-              })
-            }}
-          >
-            {retrying ? (
-              <Loader2 size={12} className="mr-1 animate-spin" />
-            ) : (
-              <RotateCcw size={12} className="mr-1" />
-            )}
-            {retrying ? 'Retrying…' : 'Retry'}
-          </Button>
-        )}
-      </div>
-    )
-  }
-)
-
-export type ToolHeaderProps = {
-  title?: string
-  subtitle?: string
-  state: ToolUIPart['state']
-  type: ToolUIPart['type']
-  className?: string
-}
-
-const getStatusText = (status: ToolUIPart['state'], toolName: string) => {
-  const isRunning = status === 'input-streaming' || status === 'input-available'
-  // @ts-expect-error state only available in AI SDK v6
-  const hasError = status === 'output-error' || status === 'output-denied'
-
-  if (isRunning) {
-    return `Running ${toolName.replaceAll('_', ' ')}...`
-  }
-  if (hasError) {
-    return `${toolName.replaceAll('_', ' ')} failed`
-  }
-  return `Used ${toolName.replaceAll('_', ' ')}`
-}
-
-export const ToolHeader = memo(
-  ({ className, title, subtitle, state, type }: ToolHeaderProps) => {
-    const { isOpen } = useTool()
-    const toolName = title ?? type.split('-').slice(1).join('-')
-    const isRunning = state === 'input-streaming' || state === 'input-available'
-    const Icon = isRunning ? Loader2 : WrenchIcon
-
-    return (
-      <CollapsibleTrigger
-        className={cn(
-          'flex w-full items-center gap-2 text-muted-foreground text-sm transition-colors text-left',
-          className
-        )}
-      >
-        <Icon className={cn('size-4 shrink-0', isRunning && 'animate-spin')} />
-
-        <div className="flex-1 min-w-0">
-          <div className="break-words">
-            {title ?? getStatusText(state, toolName)}
-          </div>
-          {subtitle && (
-            <div className="text-xs text-muted-foreground/70 truncate mt-0.5">
-              {subtitle}
-            </div>
-          )}
-        </div>
-
-        <ChevronDownIcon
-          className={cn(
-            'size-4 shrink-0 transition-transform',
-            isOpen ? 'rotate-180' : 'rotate-0'
-          )}
-        />
-      </CollapsibleTrigger>
-    )
-  }
-)
 
 export type ToolContentProps = ComponentProps<typeof CollapsibleContent>
 
@@ -246,13 +84,14 @@ export const ToolContent = memo(
   ({ className, children, ...props }: ToolContentProps) => (
     <CollapsibleContent
       className={cn(
-        'mt-4 text-sm relative',
+        'mt-1 mb-3 text-sm relative',
         'data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-top-2 data-[state=open]:slide-in-from-top-2 text-muted-foreground outline-none data-[state=closed]:animate-out data-[state=open]:animate-in',
         className
       )}
       {...props}
     >
-      <div className="ml-2 pl-4 border-l-2 border-dotted">{children}</div>
+      {/* The rule lines up under the row's 14px icon. */}
+      <div className="ml-1.5 border-l border-border pl-4">{children}</div>
     </CollapsibleContent>
   )
 )
@@ -282,7 +121,7 @@ const STREAM_TAIL_LINES = 200
 /// stick-to-bottom logic reads as the reader scrolling away — following then
 /// stops dead on that line. Wrapping keeps the container's width stable.
 const HIGHLIGHT_SURFACE =
-  '[&>pre]:m-0 [&>pre]:bg-transparent! [&>pre]:p-4 [&>pre]:text-sm [&>pre]:whitespace-pre-wrap [&>pre]:wrap-break-word [&_code]:font-mono [&_code]:text-sm'
+  '[&>pre]:m-0 [&>pre]:bg-transparent! [&>pre]:p-4 [&>pre]:text-sm [&>pre]:whitespace-pre-wrap [&>pre]:wrap-anywhere [&_code]:block [&_code]:font-mono [&_code]:text-sm [&_code]:whitespace-pre-wrap [&_code]:wrap-anywhere [&_span]:whitespace-pre-wrap [&_span]:wrap-anywhere'
 
 /**
  * A multiline string parameter (e.g. the `content` of a file write) rendered
@@ -405,7 +244,7 @@ const ToolTextBlock = memo(
           initial="instant"
           resize={streaming ? 'instant' : 'smooth'}
         >
-          <StickToBottom.Content>
+          <StickToBottom.Content scrollClassName="overflow-x-hidden overflow-y-auto">
             {/* While streaming, always render the current raw text so the
                 preview never falls behind; the highlight swaps in once the
                 write settles. */}
@@ -421,7 +260,7 @@ const ToolTextBlock = memo(
                 />
               </>
             ) : (
-              <pre className="m-0 whitespace-pre-wrap wrap-break-word p-4 font-mono text-sm text-foreground">
+              <pre className="m-0 whitespace-pre-wrap wrap-anywhere p-4 font-mono text-sm text-foreground">
                 {displayText}
               </pre>
             )}
@@ -700,7 +539,7 @@ export const ToolOutput = memo(
     }
 
     return (
-      <div className={cn('space-y-2 mt-4', className)} {...props}>
+      <div className={cn('mt-3 space-y-2', className)} {...props}>
         <h4 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
           {errorText ? 'Error' : 'Result'}
         </h4>
@@ -718,7 +557,6 @@ export const ToolOutput = memo(
 )
 
 Tool.displayName = 'Tool'
-ToolHeader.displayName = 'ToolHeader'
 ToolContent.displayName = 'ToolContent'
 ToolInput.displayName = 'ToolInput'
 ToolOutput.displayName = 'ToolOutput'

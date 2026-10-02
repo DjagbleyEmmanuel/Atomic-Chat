@@ -1,7 +1,6 @@
 use super::types::GgufMetadata;
 use super::utils::{estimate_kv_cache_internal, read_gguf_metadata_internal};
-use crate::gguf::types::{KVCacheError, KVCacheEstimate, ModelSupportStatus};
-use std::collections::HashMap;
+use crate::gguf::types::ModelSupportStatus;
 use std::fs;
 use tauri_plugin_hardware::get_system_info;
 /// Read GGUF metadata from a model file
@@ -10,16 +9,8 @@ pub async fn read_gguf_metadata(path: String) -> Result<GgufMetadata, String> {
     return read_gguf_metadata_internal(path).await;
 }
 
-#[tauri::command]
-pub async fn estimate_kv_cache_size(
-    meta: HashMap<String, String>,
-    ctx_size: Option<u64>,
-) -> Result<KVCacheEstimate, KVCacheError> {
-    estimate_kv_cache_internal(meta, ctx_size).await
-}
-
-#[tauri::command]
-pub async fn get_model_size(path: String) -> Result<u64, String> {
+/// Size of a local or remote model file, for `is_model_supported`.
+async fn get_model_size(path: String) -> Result<u64, String> {
     if path.starts_with("https://") {
         // Handle remote URL
         let client = reqwest::Client::new();
@@ -48,8 +39,12 @@ pub async fn get_model_size(path: String) -> Result<u64, String> {
 }
 
 /// Headroom left to the OS, the app, and llama.cpp's own allocations on top of
-/// the weights + KV cache we account for.
-const RESERVE_BYTES: u64 = 2288490189;
+/// the weights + KV cache we account for: ~2.13 GiB, per memory pool.
+///
+/// Inherited, not measured — it predates the load-success telemetry. Kept as
+/// is until ATO-463's memory-fit data replaces it; the value is named here so
+/// it stops looking like a typo.
+const RESERVE_BYTES: u64 = 2_288_490_189;
 
 /// One GPU's contribution to the memory a model can be loaded into.
 #[derive(Debug, Clone, Copy)]
@@ -119,6 +114,8 @@ pub(crate) fn memory_budget(total_ram_bytes: u64, gpus: &[GpuMemory]) -> MemoryB
 pub async fn is_model_supported(
     path: String,
     ctx_size: Option<u32>,
+    cache_type_k: Option<String>,
+    cache_type_v: Option<String>,
 ) -> Result<ModelSupportStatus, String> {
     // Get model size
     let model_size = get_model_size(path.clone()).await?;
@@ -132,18 +129,18 @@ pub async fn is_model_supported(
     let gguf = read_gguf_metadata(path.clone()).await?;
 
     // Calculate KV cache size
-    let kv_cache_size = if let Some(ctx_size) = ctx_size {
+    if let Some(ctx_size) = ctx_size {
         log::info!("Using ctx_size: {}", ctx_size);
-        estimate_kv_cache_internal(gguf.metadata, Some(ctx_size as u64))
-            .await
-            .map_err(|e| e.to_string())?
-            .size
-    } else {
-        estimate_kv_cache_internal(gguf.metadata, None)
-            .await
-            .map_err(|e| e.to_string())?
-            .size
-    };
+    }
+    let kv_cache_size = estimate_kv_cache_internal(
+        gguf.metadata,
+        ctx_size.map(|c| c as u64),
+        cache_type_k.as_deref(),
+        cache_type_v.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .size;
 
     // Total memory consumption = model weights + kvcache
     let total_required = model_size + kv_cache_size;

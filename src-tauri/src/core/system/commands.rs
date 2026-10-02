@@ -1,15 +1,19 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
-use tauri_plugin_llamacpp::cleanup_llama_processes;
 
 use crate::core::app::commands::{
     default_data_folder_path, get_app_configurations, get_jan_data_folder_path,
     update_app_configuration,
 };
-use crate::core::app::constants::{JAN_DATA_FILES, JAN_DATA_SUBDIRS};
+use crate::core::app::constants::{
+    BACKEND_PRESERVING_PROVIDERS, JAN_DATA_FILES, JAN_DATA_SUBDIRS,
+};
 use crate::core::app::models::AppConfiguration;
 use crate::core::mcp::helpers::{stop_mcp_servers_with_context, ShutdownContext};
+use crate::core::process_env::sanitize_std_command;
+#[cfg(any(target_os = "linux", test))]
+use crate::core::process_env::{strip_appimage_std_command, APPIMAGE_RUNTIME_ENV_VARS};
 use crate::core::state::AppState;
 
 fn is_safe_to_delete(path: &std::path::Path) -> bool {
@@ -62,6 +66,47 @@ fn remove_jan_data_contents(data_folder: &std::path::Path) {
             if let Err(e) = fs::remove_file(&path) {
                 log::warn!("Failed to remove {}: {e}", path.display());
             }
+        }
+    }
+}
+
+/// Move each preserving provider's `backends` folder out of the data folder, into `aside`.
+/// Returns what was moved, as (provider, where it is now).
+fn set_backends_aside(
+    data_folder: &std::path::Path,
+    aside: &std::path::Path,
+) -> Vec<(&'static str, std::path::PathBuf)> {
+    let mut moved = Vec::new();
+    for provider in BACKEND_PRESERVING_PROVIDERS {
+        let backends = data_folder.join(provider).join("backends");
+        if !backends.is_dir() {
+            continue;
+        }
+        let parked = aside.join(format!("atomic-chat-backends-preserve-{provider}"));
+        if parked.exists() {
+            let _ = fs::remove_dir_all(&parked);
+        }
+        match fs::rename(&backends, &parked) {
+            Ok(()) => {
+                log::info!("Preserved {provider} backends to temp dir");
+                moved.push((*provider, parked));
+            }
+            Err(e) => log::warn!("Failed to preserve {provider} backends: {e}"),
+        }
+    }
+    moved
+}
+
+fn put_backends_back(
+    data_folder: &std::path::Path,
+    preserved: Vec<(&'static str, std::path::PathBuf)>,
+) {
+    for (provider, parked) in preserved {
+        let provider_dir = data_folder.join(provider);
+        let _ = fs::create_dir_all(&provider_dir);
+        match fs::rename(&parked, provider_dir.join("backends")) {
+            Ok(()) => log::info!("Restored {provider} backends after factory reset"),
+            Err(e) => log::warn!("Failed to restore {provider} backends: {e}"),
         }
     }
 }
@@ -142,9 +187,11 @@ pub async fn factory_reset<R: Runtime>(
     if let Err(e) = cleanup_own_locks(&app_handle) {
         log::warn!("Failed to cleanup lock files: {}", e);
     }
-    // Clean up both llama.cpp providers' process maps.
-    let _ = cleanup_llama_processes(app_handle.clone()).await;
-    let _ = tauri_plugin_llamacpp_upstream::cleanup_llama_processes(app_handle.clone()).await;
+    // The core owns every model process and holds the data folder open (its lock, journal and
+    // logs live inside it): stop it before the folder is deleted, or it keeps serving from a folder
+    // that no longer exists and the next launch attaches to a stale owner.
+    #[cfg(desktop)]
+    crate::core::atomic_core::commands::shutdown(&app_handle).await;
 
     // Windows needs time to release file handles after TerminateProcess
     #[cfg(windows)]
@@ -159,38 +206,13 @@ pub async fn factory_reset<R: Runtime>(
             return Ok(());
         }
 
-        // Preserve downloaded llamacpp backends across factory reset so the user
-        // doesn't have to re-download CUDA/Vulkan binaries (can be hundreds of MB).
-        let backends_dir = data_folder.join("llamacpp").join("backends");
-        let temp_backends = std::env::temp_dir().join("atomic-chat-backends-preserve");
-        let backends_preserved = if backends_dir.is_dir() {
-            if temp_backends.exists() {
-                let _ = fs::remove_dir_all(&temp_backends);
-            }
-            match fs::rename(&backends_dir, &temp_backends) {
-                Ok(()) => {
-                    log::info!("Preserved llamacpp backends to temp dir");
-                    true
-                }
-                Err(e) => {
-                    log::warn!("Failed to preserve llamacpp backends: {e}");
-                    false
-                }
-            }
-        } else {
-            false
-        };
+        // Preserve downloaded backends across factory reset so the user doesn't have to
+        // re-download CUDA/Vulkan binaries (can be hundreds of MB).
+        let preserved = set_backends_aside(&data_folder, &std::env::temp_dir());
 
         remove_jan_data_contents(&data_folder);
 
-        if backends_preserved {
-            let llamacpp_dir = data_folder.join("llamacpp");
-            let _ = fs::create_dir_all(&llamacpp_dir);
-            match fs::rename(&temp_backends, &backends_dir) {
-                Ok(()) => log::info!("Restored llamacpp backends after factory reset"),
-                Err(e) => log::warn!("Failed to restore llamacpp backends: {e}"),
-            }
-        }
+        put_backends_back(&data_folder, preserved);
     }
 
     // Reset the configuration
@@ -199,47 +221,27 @@ pub async fn factory_reset<R: Runtime>(
     default_config.autostart_preference = autostart_preference;
     let _ = update_app_configuration(app_handle.clone(), default_config);
 
-    restart_app(&app_handle)
+    restart_app(&app_handle);
+    Ok(())
 }
-
-#[cfg(any(target_os = "linux", test))]
-const APPIMAGE_RUNTIME_ENV_VARS: &[&str] = &[
-    "APPDIR",
-    "APPIMAGE",
-    "ARGV0",
-    "OWD",
-    "LD_LIBRARY_PATH",
-    "LD_PRELOAD",
-    "GDK_PIXBUF_MODULE_FILE",
-    "GDK_PIXBUF_MODULEDIR",
-    "GIO_EXTRA_MODULES",
-    "GIO_MODULE_DIR",
-    "GSETTINGS_SCHEMA_DIR",
-    "GST_PLUGIN_SCANNER",
-    "GST_PLUGIN_SYSTEM_PATH",
-    "GST_PLUGIN_SYSTEM_PATH_1_0",
-    "GTK_DATA_PREFIX",
-    "GTK_EXE_PREFIX",
-    "GTK_IM_MODULE_FILE",
-    "GTK_PATH",
-    "PERLLIB",
-    "PYTHONHOME",
-    "PYTHONPATH",
-    "QT_PLUGIN_PATH",
-];
 
 #[cfg(any(target_os = "linux", test))]
 fn sanitized_appimage_restart_command(appimage: &std::ffi::OsStr) -> std::process::Command {
     let mut command = std::process::Command::new(appimage);
     command.args(std::env::args_os().skip(1));
-    for variable in APPIMAGE_RUNTIME_ENV_VARS {
-        command.env_remove(variable);
-    }
+    strip_appimage_std_command(&mut command);
     command
 }
 
 /// Restart without leaking AppRun's environment into host launchers.
-fn restart_app<R: Runtime>(app: &AppHandle<R>) -> ! {
+///
+/// The restart is *requested*, not performed here: `AppHandle::restart` called on the main thread
+/// — where a synchronous command such as `relaunch` runs — replaces the process without
+/// `RunEvent::Exit`, and that handler is the only place that stops the app's core and cleans up
+/// its MCP servers. A core left running keeps the data folder's lock, and the app that comes up
+/// next — after an update, a backend change, a data-folder move — has to wait out the vanished
+/// app's client lease (about 45 s) before it can replace it.
+fn restart_app<R: Runtime>(app: &AppHandle<R>) {
     #[cfg(target_os = "linux")]
     if let Some(appimage) = std::env::var_os("APPIMAGE") {
         app.cleanup_before_exit();
@@ -250,7 +252,7 @@ fn restart_app<R: Runtime>(app: &AppHandle<R>) -> ! {
             ),
         }
     }
-    app.restart()
+    app.request_restart();
 }
 
 #[tauri::command]
@@ -757,9 +759,22 @@ pub fn install_jan_cli_sync<R: Runtime>(
     #[cfg(windows)]
     {
         if bundled.exists() {
-            if let Err(e) = std::fs::rename(&bundled, &dest) {
-                log::warn!("Could not rename jan-cli.exe to atomic-chat-cli.exe: {}", e);
+            let staged = dest.with_extension("exe.atomic-new");
+            std::fs::copy(&bundled, &staged)
+                .map_err(|e| format!("Could not stage the Atomic Chat CLI update: {e}"))?;
+            if dest.exists() {
+                std::fs::remove_file(&dest).map_err(|e| {
+                    let _ = std::fs::remove_file(&staged);
+                    format!(
+                        "Could not update {} because the installed binary is in use: {e}",
+                        dest.display()
+                    )
+                })?;
             }
+            std::fs::rename(&staged, &dest).map_err(|e| {
+                let _ = std::fs::remove_file(&staged);
+                format!("Could not activate the Atomic Chat CLI update: {e}")
+            })?;
         }
         // Older builds put `jan.exe` on PATH here; drop it so it stops shadowing Jan.ai.
         remove_legacy_cli_binary(&resource_bin_dir);
@@ -776,18 +791,23 @@ pub fn install_jan_cli_sync<R: Runtime>(
         std::fs::create_dir_all(&install_dir).map_err(|e| e.to_string())?;
         let dest = install_dir.join(dest_bin_name);
 
-        std::fs::copy(&bundled, &dest).map_err(|e| {
+        let staged = install_dir.join(format!(".{dest_bin_name}.atomic-new"));
+        std::fs::copy(&bundled, &staged).map_err(|e| {
             format!(
                 "Failed to copy {} to {}: {}",
                 CLI_COMMAND_NAME,
-                dest.display(),
+                staged.display(),
                 e
             )
         })?;
 
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| e.to_string())?;
+        std::fs::rename(&staged, &dest).map_err(|e| {
+            let _ = std::fs::remove_file(&staged);
+            format!("Failed to activate {}: {e}", dest.display())
+        })?;
 
         // Older builds installed this binary as plain `jan` in the same directory.
         remove_legacy_cli_binary(&install_dir);
@@ -1722,11 +1742,76 @@ fn strip_atomic_managed_block(content: &str) -> String {
     result
 }
 
+/// Parse a leading `major.minor.patch` out of a `--version` line, tolerating a
+/// `v` prefix and a `-beta.1` / `+build` suffix.
+fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+    let core = text.trim().trim_start_matches('v');
+    let core = core.split(['-', '+', ' ']).next()?;
+    let mut parts = core.split('.');
+    let major: u64 = parts.next()?.parse().ok()?;
+    let minor: u64 = parts.next().unwrap_or("0").parse().ok()?;
+    let patch: u64 = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Run `<tool> --version` against the user's real PATH and parse the result.
+///
+/// Windows routes through `cmd /C` because `npm` there is `npm.cmd`, a batch
+/// shim `CreateProcessW` refuses to execute directly (rust-lang/rust#37519) —
+/// the same reason the npm installer below does it.
+fn tool_version(tool: &str) -> Option<(u64, u64, u64)> {
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", tool, "--version"]);
+        c
+    } else {
+        let mut c = std::process::Command::new(tool);
+        c.arg("--version");
+        c
+    };
+    apply_login_path(&mut cmd);
+    apply_runtime_path(&mut cmd);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// npm gained per-package lifecycle-script approval (`--allow-scripts=<pkg>`)
+/// in 11.16; older npm rejects it as an unknown flag, so it has to be
+/// version-gated rather than always passed. OpenClaw's install docs make the
+/// same split ("On npm 11.15 and earlier, omit `--allow-scripts=openclaw`").
+const NPM_ALLOW_SCRIPTS_MIN: (u64, u64, u64) = (11, 16, 0);
+
+/// OpenClaw's published `engines`: `>=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0`.
+/// npm only *warns* on an engines mismatch, so on an unsupported Node the
+/// install "succeeds" and every later `openclaw` invocation fails instead —
+/// which reads as a broken integration rather than a Node problem.
+fn node_meets_openclaw_engines((major, minor, patch): (u64, u64, u64)) -> bool {
+    match major {
+        ..=21 => false,
+        22 => (minor, patch) >= (22, 3),
+        23 => false, // explicitly unsupported, not merely old
+        24 => minor >= 15,
+        25 => minor >= 9,
+        _ => true,
+    }
+}
+
 /// Installer spec for an agent: (program, args, prerequisite_binary, docs_url).
 /// Verified against each vendor's official install path:
 ///   - Claude Code / Codex / OpenCode / OpenClaw ship as global npm packages.
 ///   - Hermes is a Python project installed via its official shell / PowerShell
 ///     bootstrap script (NOT npm).
+///
+/// Unix installers that pipe `curl` into a shell use Bash `pipefail`; otherwise
+/// a download failure is hidden by the trailing shell's successful empty input.
 fn agent_install_spec(
     agent_id: &str,
 ) -> Result<(String, Vec<String>, &'static str, &'static str), String> {
@@ -1862,10 +1947,10 @@ fn agent_install_spec(
                 )
             } else {
                 (
-                    "sh".to_string(),
+                    "bash".to_string(),
                     vec![
                         "-c".to_string(),
-                        "curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash".to_string(),
+                        "set -o pipefail; curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash".to_string(),
                     ],
                 )
             };
@@ -1890,10 +1975,11 @@ fn agent_install_spec(
                 )
             } else {
                 (
-                    "sh".to_string(),
+                    "bash".to_string(),
                     vec![
                         "-c".to_string(),
-                        "curl -fsSL https://atomicagent.io/install | sh".to_string(),
+                        "set -o pipefail; curl -fsSL https://atomicagent.io/install | sh"
+                            .to_string(),
                     ],
                 )
             };
@@ -1923,10 +2009,10 @@ fn agent_install_spec(
                 )
             } else {
                 (
-                    "sh".to_string(),
+                    "bash".to_string(),
                     vec![
                         "-c".to_string(),
-                        "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --skip-setup --non-interactive".to_string(),
+                        "set -o pipefail; curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --skip-setup --non-interactive".to_string(),
                     ],
                 )
             };
@@ -1972,10 +2058,10 @@ fn agent_install_spec(
                 )
             } else {
                 (
-                    "sh".to_string(),
+                    "bash".to_string(),
                     vec![
                         "-c".to_string(),
-                        "curl -fsSL https://downloads.poolside.ai/pool/install.sh | POOL_INSTALL_ACCEPT_EULA=1 POOL_INSTALL_UPDATE_PATH=1 sh".to_string(),
+                        "set -o pipefail; curl -fsSL https://downloads.poolside.ai/pool/install.sh | POOL_INSTALL_ACCEPT_EULA=1 POOL_INSTALL_UPDATE_PATH=1 sh".to_string(),
                     ],
                 )
             };
@@ -2002,15 +2088,39 @@ fn agent_install_spec(
                 ))
             } else {
                 Ok((
-                    "sh".to_string(),
+                    "bash".to_string(),
                     vec![
                         "-c".to_string(),
-                        "curl -fsSL https://zed.dev/install.sh | sh".to_string(),
+                        "set -o pipefail; curl -fsSL https://zed.dev/install.sh | sh".to_string(),
                     ],
                     "curl",
                     "https://zed.dev/docs/getting-started",
                 ))
             }
+        }
+        "muse" => {
+            // Meta ships Muse Code through an official shell installer only --
+            // there is no PowerShell or npm equivalent (`/install.ps1` on the
+            // same host is a 404). Windows users install it inside WSL and run
+            // it from that shell, so fail with that instruction rather than
+            // spawning an installer that cannot work.
+            if cfg!(windows) {
+                return Err(
+                    "Muse Code has no native Windows installer. Install it inside WSL with \
+                     'curl -fsSL https://dev.meta.ai/install.sh | sh' and run it from your \
+                     WSL shell: https://developer.meta.com/ai/products/muse-code/"
+                        .to_string(),
+                );
+            }
+            Ok((
+                "bash".to_string(),
+                vec![
+                    "-c".to_string(),
+                    "set -o pipefail; curl -fsSL https://dev.meta.ai/install.sh | sh".to_string(),
+                ],
+                "curl",
+                "https://developer.meta.com/ai/products/muse-code/",
+            ))
         }
         other => Err(format!("Unknown or non-installable agent id: {}", other)),
     }
@@ -2037,10 +2147,10 @@ fn login_shell_path() -> Option<String> {
             // `-l` sources login files (.zprofile/.bash_profile, where Homebrew
             // shellenv usually lives); `-i` sources interactive rc files
             // (.zshrc/.bashrc, where nvm usually lives).
-            let out = std::process::Command::new(&shell)
-                .args(["-lic", "printf '__OCPATH__%s__OCEND__' \"$PATH\""])
-                .output()
-                .ok()?;
+            let mut command = std::process::Command::new(&shell);
+            command.args(["-lic", "printf '__OCPATH__%s__OCEND__' \"$PATH\""]);
+            sanitize_std_command(&mut command);
+            let out = command.output().ok()?;
             if !out.status.success() {
                 return None;
             }
@@ -2062,6 +2172,7 @@ fn login_shell_path() -> Option<String> {
 /// on Windows, where processes inherit the registry (user/system) PATH.
 #[cfg(not(windows))]
 fn apply_login_path(cmd: &mut std::process::Command) {
+    sanitize_std_command(cmd);
     if let Some(path) = login_shell_path() {
         cmd.env("PATH", path);
     }
@@ -2298,14 +2409,89 @@ fn output_indicates_network_failure(output: &str) -> bool {
     .any(|sig| lower.contains(sig))
 }
 
+/// Launcher locations an agent's installer can write to without ever putting
+/// the binary on `PATH`, keyed by detect binary.
+///
+/// OpenClaw is the case that forced this. Its prefix installer (`install-cli.sh`)
+/// writes the launcher to `<prefix>/bin/openclaw` and leaves `PATH` alone, and
+/// the macOS app runs exactly that installer during its own onboarding — so
+/// *every* user who installed the desktop app rather than the npm package has a
+/// working OpenClaw that `which openclaw` cannot see. The git method of
+/// `install.sh` / `install.ps1` lands in `~/.local/bin` for the same reason.
+/// Without these candidates the Launch page reports OpenClaw as missing and
+/// offers to install a second copy on top of the app's.
+///
+/// ZCode is a desktop app that never touches `PATH` outside Linux, so its
+/// candidates are the app executables its installers write
+/// ([`zcode_app_candidates`]).
+///
+/// Returns an empty vector for every other agent: they all install onto `PATH`,
+/// and guessing locations for them would only produce false positives.
+pub fn off_path_candidates(bin: &str) -> Vec<PathBuf> {
+    match bin {
+        "openclaw" => openclaw_off_path_candidates(),
+        "zcode" => zcode_app_candidates(),
+        _ => Vec::new(),
+    }
+}
+
+fn openclaw_off_path_candidates() -> Vec<PathBuf> {
+    let Ok(home) = agent_home_dir() else {
+        return Vec::new();
+    };
+    let home = PathBuf::from(home);
+
+    // `--prefix` / `OPENCLAW_PREFIX` relocates the whole install, so honour an
+    // explicit prefix before falling back to the installer's defaults.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(prefix) = std::env::var("OPENCLAW_PREFIX")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+    {
+        roots.push(PathBuf::from(prefix));
+    }
+    roots.push(home.join(".openclaw"));
+    roots.push(home.join(".local"));
+
+    // Windows launchers are `.cmd` shims; POSIX ones are extensionless.
+    let names: &[&str] = if cfg!(windows) {
+        &["openclaw.cmd", "openclaw.exe", "openclaw"]
+    } else {
+        &["openclaw"]
+    };
+
+    let mut out = Vec::with_capacity(roots.len() * names.len());
+    for root in roots {
+        for name in names {
+            out.push(root.join("bin").join(name));
+        }
+    }
+    out
+}
+
+/// First [`off_path_candidates`] entry that exists on disk.
+pub fn resolve_off_path(bin: &str) -> Option<PathBuf> {
+    off_path_candidates(bin).into_iter().find(|p| p.is_file())
+}
+
 /// Result of probing whether an external CLI agent is reachable.
+///
+/// `rename_all` matters: the Launch page reads `viaWsl`, and without it serde
+/// emits `via_wsl`, so the "Installed (WSL)" badge never rendered.
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentDetection {
     /// Whether the binary was found (native PATH, WSL, or a user-supplied path).
     pub installed: bool,
     /// True only when the binary was found inside a WSL distribution (Windows),
     /// where it is reachable via `wsl.exe` but not from the native Win32 PATH.
     pub via_wsl: bool,
+    /// Absolute path to the launcher when it was found *off* `PATH` — either a
+    /// user-supplied custom path or one of
+    /// [`integrations::off_path_candidates`]. `None` when the bare name
+    /// resolves on `PATH`, so callers keep opening terminals with the short
+    /// command instead of an absolute path nobody wants to read.
+    pub path: Option<String>,
 }
 
 /// Probe whether a CLI binary is reachable on the native PATH (`which`/`where`).
@@ -2372,9 +2558,11 @@ pub async fn detect_agent_installed(bin: String, custom_path: Option<String>) ->
         .map(str::trim)
         .filter(|p| !p.is_empty())
     {
+        let installed = std::path::Path::new(path).is_file();
         return AgentDetection {
-            installed: std::path::Path::new(path).is_file(),
+            installed,
             via_wsl: false,
+            path: installed.then(|| path.to_string()),
         };
     }
 
@@ -2382,6 +2570,18 @@ pub async fn detect_agent_installed(bin: String, custom_path: Option<String>) ->
         return AgentDetection {
             installed: true,
             via_wsl: false,
+            path: None,
+        };
+    }
+
+    // Prefix installers (the one the macOS OpenClaw app runs during its own
+    // onboarding included) never touch PATH, so probe their known locations
+    // before declaring the agent missing and offering to install a second copy.
+    if let Some(found) = resolve_off_path(&bin) {
+        return AgentDetection {
+            installed: true,
+            via_wsl: false,
+            path: Some(found.to_string_lossy().into_owned()),
         };
     }
 
@@ -2391,6 +2591,7 @@ pub async fn detect_agent_installed(bin: String, custom_path: Option<String>) ->
             return AgentDetection {
                 installed: true,
                 via_wsl: true,
+                path: None,
             };
         }
     }
@@ -2398,6 +2599,7 @@ pub async fn detect_agent_installed(bin: String, custom_path: Option<String>) ->
     AgentDetection {
         installed: false,
         via_wsl: false,
+        path: None,
     }
 }
 
@@ -2514,7 +2716,7 @@ pub async fn install_agent<R: Runtime>(
     agent_id: String,
     proxy: Option<ProxyEnv>,
 ) -> Result<(), String> {
-    let (program, args, prereq, docs) = agent_install_spec(&agent_id)?;
+    let (program, mut args, prereq, docs) = agent_install_spec(&agent_id)?;
 
     let event = format!("agent_install_log:{}", agent_id);
 
@@ -2538,6 +2740,35 @@ pub async fn install_agent<R: Runtime>(
                  then restart Atomic Chat and try again: {}",
                 prereq, docs
             ));
+        }
+    }
+
+    // OpenClaw pins a narrow set of Node releases and ships its npm install
+    // behind npm's script-approval flag. Both are checked here, after the npm
+    // prerequisite (and any winget bootstrap) has settled, so we read the Node
+    // that will actually run the agent.
+    if agent_id == "openclaw" {
+        let node = tokio::task::spawn_blocking(|| tool_version("node"))
+            .await
+            .unwrap_or(None);
+        // A missing/unparsable version is not treated as a failure: npm was
+        // found, so Node exists, and guessing wrong here would block a working
+        // install.
+        if let Some(version) = node.filter(|v| !node_meets_openclaw_engines(*v)) {
+            return Err(format!(
+                "OpenClaw requires Node.js 22.22.3+, 24.15+ or 25.9+ (Node 23 is not supported), \
+                 but v{}.{}.{} is on your PATH. Update Node from https://nodejs.org, \
+                 then restart Atomic Chat and try again: {}",
+                version.0, version.1, version.2, docs
+            ));
+        }
+        let allow_scripts = tokio::task::spawn_blocking(
+            || matches!(tool_version("npm"), Some(v) if v >= NPM_ALLOW_SCRIPTS_MIN),
+        )
+        .await
+        .unwrap_or(false);
+        if allow_scripts {
+            args.push("--allow-scripts=openclaw".to_string());
         }
     }
 
@@ -2682,7 +2913,9 @@ pub fn configure_codex(
     let final_content = if cleaned.trim().is_empty() {
         format!("{}\n{}", head, block)
     } else {
-        format!("{}\n{}\n{}", head, cleaned.trim_end(), block)
+        // `trim`, not `trim_end`: stripping the previous head block leaves its line break at the
+        // front of what remains, and keeping it made the file two lines longer on every run.
+        format!("{}\n{}\n{}", head, cleaned.trim(), block)
     };
 
     std::fs::write(&path, final_content)
@@ -3211,53 +3444,666 @@ pub fn launch_zed() -> Result<(), String> {
     Err("Could not launch Zed. Is it installed and on your PATH?".to_string())
 }
 
-/// Configure OpenClaw by upserting `models.providers.atomic` plus the
-/// `agents.defaults.models` allowlist entry in `~/.openclaw/openclaw.json`.
+// --- ZCode ------------------------------------------------------------------
+//
+// ZCode (github.com/zai-org/ZCode) is Z.ai's Electron desktop app. It ignores
+// OPENAI_BASE_URL and friends: the only source of custom providers is
+// `<dataBase>/.zcode/v2/provider_config.json`, shared by the desktop app, its
+// web UI and its CLI, and polled once a second — so writing that file is the
+// whole integration, and a running ZCode picks the change up by itself.
+//
+// The file is validated with strict Zod schemas, and an invalid file is not
+// rejected loudly: ZCode treats it as empty, so every custom provider the user
+// has silently disappears until it is fixed. Hence the care below — patch only
+// the entries we own, refuse rather than guess on anything unexpected, and write
+// under ZCode's own lock with a rename.
+
+/// Provider id we own inside `provider_config.json`. Personal providers may use
+/// any id that does not start with `account:`.
+const ZCODE_PROVIDER_ID: &str = "atomic-chat";
+const ZCODE_PROVIDER_NAME: &str = "Atomic Chat";
+/// ZCode only admits a provider whose API key is non-blank; the local server
+/// ignores it when auth is off.
+const ZCODE_KEY_PLACEHOLDER: &str = "atomic";
+/// ZCode assumes 200K of context for any model it does not recognise — a wild
+/// over-claim for a local model, which then never compacts and overflows mid-
+/// turn. Declare what `DSH_CONTEXT_WINDOW` declares for the same reason.
+const ZCODE_CONTEXT_WINDOW: u64 = 65536;
+const ZCODE_MAX_OUTPUT_TOKENS: u64 = 8192;
+/// ZCode's default request mapping for `openai-chat-completions` sends
+/// `thinking`, `enable_thinking`, `reasoning_effort` and `reasoning`, none of
+/// which llama-server reads, so its reasoning toggle would do nothing. llama-server
+/// does read `chat_template_kwargs`, and `enable_thinking` is the switch the
+/// Qwen3 / GLM / DeepSeek templates expose; templates without it ignore it.
+const ZCODE_REASONING_MAP: &str =
+    r#"{"chat_template_kwargs": {"enable_thinking": reasoningLevel == "enabled"}}"#;
+/// `max_completion_tokens` (ZCode's default) is an OpenAI-only alias;
+/// `max_tokens` is what every local backend understands.
+const ZCODE_MAX_TOKENS_MAP: &str = "{'max_tokens': maxOutputTokens}";
+/// ZCode's own writers wait up to 8 s for the lock.
+const ZCODE_LOCK_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+/// A ZCode write holds the lock for milliseconds. One this old was left behind
+/// by a process that died holding it.
+const ZCODE_LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// ZCode's `.zcode/v2` directory, resolved the way the desktop app does it:
+/// `dataBaseDir` from `~/.zcode/v2/setting.json` (set when the user moves the
+/// data folder in ZCode's settings), then `$ZCODE_DATA_BASE_DIR`, then home.
+fn zcode_config_dir(home: &Path, env_base: Option<&str>) -> PathBuf {
+    let from_setting = std::fs::read_to_string(home.join(".zcode").join("v2").join("setting.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|v| {
+            v.get("dataBaseDir")
+                .and_then(|d| d.as_str())
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(PathBuf::from)
+        });
+    let base = from_setting
+        .or_else(|| {
+            env_base
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| home.to_path_buf());
+    base.join(".zcode").join("v2")
+}
+
+/// Borrow `parent[key]` as a JSON array, creating it when absent. A value of the
+/// wrong type means the file is already invalid for ZCode; we refuse to paper
+/// over that.
+fn zcode_array<'a>(
+    parent: &'a mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    path: &str,
+) -> Result<&'a mut Vec<serde_json::Value>, String> {
+    parent
+        .entry(key)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| format!("{path} in provider_config.json is not an array"))
+}
+
+/// Borrow `parent[key]` as a JSON object, creating it when absent.
+fn zcode_object<'a>(
+    parent: &'a mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    path: &str,
+) -> Result<&'a mut serde_json::Map<String, serde_json::Value>, String> {
+    parent
+        .entry(key)
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| format!("{path} in provider_config.json is not an object"))
+}
+
+/// Apply Atomic Chat's provider, its model rule and the default selection to a
+/// parsed `provider_config.json` (`None` when the file does not exist yet).
+///
+/// Only entries whose `providerId` is ours are replaced; every other provider,
+/// rule and key is carried over untouched. Split out from
+/// [`configure_zcode_in`] so the merge rules are testable without the disk.
+fn zcode_patch_provider_config(
+    existing: Option<serde_json::Value>,
+    api_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("ZCode needs a model: load one in a chat first.".to_string());
+    }
+    let key = api_key
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .unwrap_or(ZCODE_KEY_PLACEHOLDER);
+
+    let mut root = existing.unwrap_or_else(|| serde_json::json!({ "schemaVersion": 1 }));
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| "provider_config.json is not a JSON object".to_string())?;
+    // ZCode refuses a file without a version, and one newer than it knows. We
+    // know exactly one shape, so anything else is left for ZCode to handle.
+    match root_obj.get("schemaVersion").and_then(|v| v.as_u64()) {
+        Some(1) => {}
+        Some(v) => {
+            return Err(format!(
+                "ZCode's provider_config.json uses schemaVersion {v}, which this version of \
+                 Atomic Chat does not know. Update Atomic Chat, or add the provider in \
+                 ZCode's Model Settings."
+            ))
+        }
+        None => {
+            return Err(
+                "ZCode's provider_config.json has no schemaVersion, so ZCode is ignoring it. \
+                 Open Model Settings in ZCode to repair it, then try again."
+                    .to_string(),
+            )
+        }
+    }
+    let config = zcode_object(root_obj, "config", "config")?;
+
+    let provider = serde_json::json!({
+        "providerId": ZCODE_PROVIDER_ID,
+        "providerName": ZCODE_PROVIDER_NAME,
+        "enabled": true,
+        "config": {
+            "group": "standard-personal",
+            "access": { "type": "api-key", "apiKey": key },
+            "api": {
+                "type": "openai-chat-completions",
+                "baseUrl": api_url,
+                "headers": null
+            },
+            // Local servers expose no model catalogue ZCode can discover, so
+            // the provider lists exactly the model Run was pressed for.
+            "personalModelIds": [model],
+            "modelOrder": [model]
+        }
+    });
+    let provider_rules = zcode_array(
+        zcode_object(config, "providerConfigRules", "config.providerConfigRules")?,
+        "providerRules",
+        "config.providerConfigRules.providerRules",
+    )?;
+    match provider_rules
+        .iter()
+        .position(|rule| rule["providerId"] == ZCODE_PROVIDER_ID)
+    {
+        Some(i) => provider_rules[i] = provider,
+        None => provider_rules.push(provider),
+    }
+
+    // `providerOrder` is optional; ZCode appends unlisted providers itself, so
+    // only an existing list needs us added — at the top, where Run expects us.
+    if config.contains_key("providerOrder") {
+        let order = zcode_array(config, "providerOrder", "config.providerOrder")?;
+        if !order.iter().any(|id| *id == ZCODE_PROVIDER_ID) {
+            order.insert(0, serde_json::json!(ZCODE_PROVIDER_ID));
+        }
+    }
+
+    let model_rules = zcode_object(config, "modelConfigRules", "config.modelConfigRules")?;
+    // ZCode rejects the whole file when one provider/model pair has both a
+    // regular and a manual rule — and a manual rule is what its Advanced model
+    // settings write. So a rule of ours can only live in one of the two lists:
+    // drop our old rules from both before adding the new one.
+    let manual = zcode_array(
+        model_rules,
+        "manualProviderModelRules",
+        "config.modelConfigRules.manualProviderModelRules",
+    )?;
+    manual.retain(|rule| rule["providerId"] != ZCODE_PROVIDER_ID);
+    let rules = zcode_array(
+        model_rules,
+        "providerModelRules",
+        "config.modelConfigRules.providerModelRules",
+    )?;
+    rules.retain(|rule| rule["providerId"] != ZCODE_PROVIDER_ID);
+    rules.push(serde_json::json!({
+        "providerId": ZCODE_PROVIDER_ID,
+        "modelId": model,
+        "config": {
+            "properties": {
+                "contextWindow": ZCODE_CONTEXT_WINDOW,
+                // A model id that happens to match one of ZCode's built-in
+                // vision patterns would otherwise inherit image input a
+                // text-only GGUF cannot take.
+                "inputFormat": { "supportsImage": false }
+            },
+            "optionSpecs": {
+                "maxOutputTokens": {
+                    "max": ZCODE_MAX_OUTPUT_TOKENS,
+                    "map": ZCODE_MAX_TOKENS_MAP
+                },
+                "reasoningLevel": {
+                    "values": ["disabled", "enabled"],
+                    "map": ZCODE_REASONING_MAP
+                }
+            }
+        }
+    }));
+
+    // A selection has to name a reasoning level the model allows. `enabled` is
+    // what ZCode itself picks for a newly chosen model (the highest level).
+    config.insert(
+        "defaultModelSelection".to_string(),
+        serde_json::json!({
+            "providerId": ZCODE_PROVIDER_ID,
+            "modelId": model,
+            "options": { "reasoningLevel": "enabled" }
+        }),
+    );
+
+    Ok(root)
+}
+
+/// ZCode's lock around a config file (`packages/shared/src/node/atomicFileLock.ts`):
+/// a `<file>.lock` directory holding one `owner-<token>.json`. Taking it keeps a
+/// Run from interleaving with a save made in ZCode's own settings at that moment.
+/// Released on drop.
+struct ZcodeFileLock {
+    dir: PathBuf,
+    owner: PathBuf,
+}
+
+impl Drop for ZcodeFileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.owner);
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+/// Whether a lock directory was left behind: judged by its newest entry, so a
+/// lock that was just re-taken by someone else is never reclaimed.
+fn zcode_lock_is_stale(dir: &Path, stale_after: std::time::Duration) -> bool {
+    let mut newest = std::fs::metadata(dir).and_then(|m| m.modified()).ok();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+                newest = Some(newest.map_or(modified, |n| n.max(modified)));
+            }
+        }
+    }
+    // A timestamp in the future (clock skew, coarse filesystem clocks) reads as
+    // brand new rather than as abandoned.
+    newest
+        .map(|n| n.elapsed().unwrap_or_default())
+        .is_some_and(|age| age >= stale_after)
+}
+
+/// Remove an abandoned lock directory, reporting whether it is gone.
+fn zcode_remove_lock(dir: &Path) -> bool {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    std::fs::remove_dir(dir).is_ok()
+}
+
+fn acquire_zcode_lock(
+    file: &Path,
+    max_wait: std::time::Duration,
+    stale_after: std::time::Duration,
+) -> Result<ZcodeFileLock, String> {
+    const RETRY_DELAYS_MS: [u64; 5] = [25, 50, 100, 200, 400];
+
+    let mut dir = file.as_os_str().to_owned();
+    dir.push(".lock");
+    let dir = PathBuf::from(dir);
+    let started = std::time::Instant::now();
+    let mut attempt = 0;
+
+    loop {
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                let created_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or_default();
+                let token = format!("{}-{}-atomic-chat", std::process::id(), created_at);
+                let owner = dir.join(format!("owner-{token}.json"));
+                let payload = serde_json::json!({
+                    "pid": std::process::id(),
+                    "createdAt": created_at,
+                    "token": token,
+                });
+                let lock = ZcodeFileLock {
+                    dir: dir.clone(),
+                    owner: owner.clone(),
+                };
+                std::fs::write(&owner, format!("{payload}\n"))
+                    .map_err(|e| format!("Failed to write {}: {}", owner.display(), e))?;
+                return Ok(lock);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A lock we cannot remove falls through to the timeout below
+                // instead of being retried in a tight loop.
+                if zcode_lock_is_stale(&dir, stale_after) && zcode_remove_lock(&dir) {
+                    log::warn!("Reclaimed a stale ZCode lock at {}", dir.display());
+                    continue;
+                }
+                if started.elapsed() >= max_wait {
+                    return Err(
+                        "ZCode is saving its model settings right now. Try again in a moment."
+                            .to_string(),
+                    );
+                }
+                let delay = RETRY_DELAYS_MS[attempt.min(RETRY_DELAYS_MS.len() - 1)];
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            Err(e) => return Err(format!("Failed to lock {}: {}", file.display(), e)),
+        }
+    }
+}
+
+/// Filesystem half of [`configure_zcode`], taking the resolved `.zcode/v2`
+/// directory so it is testable.
+fn configure_zcode_in(
+    dir: &Path,
+    api_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    let path = dir.join("provider_config.json");
+
+    // ZCode imports the providers from its pre-3.x `config.json` exactly once:
+    // on the first start that finds no `provider_config.json`. Creating that
+    // file first would skip the import for good and the user's old providers
+    // would never come back. Let ZCode migrate them before we write anything.
+    if !path.exists() && dir.join("config.json").exists() {
+        return Err(
+            "Open ZCode once so it can import your existing model providers, then click \
+             Run again."
+                .to_string(),
+        );
+    }
+
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
+    let _lock = acquire_zcode_lock(&path, ZCODE_LOCK_MAX_WAIT, ZCODE_LOCK_STALE_AFTER)?;
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("Failed to read {}: {}", path.display(), e)),
+    };
+    let existing = if text.trim().is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+                format!(
+                    "Could not parse {}: {}. ZCode ignores the file while it is invalid, so fix \
+                     or remove it and try again.",
+                    path.display(),
+                    e
+                )
+            })?,
+        )
+    };
+
+    let patched = zcode_patch_provider_config(existing, api_url, model, api_key)?;
+    let mut serialized = serde_json::to_string_pretty(&patched).map_err(|e| e.to_string())?;
+    serialized.push('\n');
+
+    // A file ZCode cannot validate costs the user every custom provider they
+    // have, so keep the pre-Atomic version once. It holds their API keys too,
+    // hence owner-only like the file itself.
+    if !text.trim().is_empty() {
+        let backup = dir.join("provider_config.json.atomic-backup");
+        if !backup.exists() && std::fs::write(&backup, &text).is_ok() {
+            restrict_to_owner(&backup);
+        }
+    }
+
+    write_atomically(&path, serialized.as_bytes())?;
+    restrict_to_owner(&path);
+
+    log::info!(
+        "ZCode configured: baseUrl={}, model={}, file={}",
+        api_url,
+        model,
+        path.display()
+    );
+    Ok(())
+}
+
+/// Point ZCode at the local server by upserting an "Atomic Chat" provider, a
+/// rule for the running model and the default model selection in its
+/// `provider_config.json`. ZCode polls that file, so no restart is needed.
 #[tauri::command]
-pub fn configure_openclaw(
+pub fn configure_zcode(
     api_url: String,
     model: String,
     api_key: Option<String>,
 ) -> Result<(), String> {
     let home = agent_home_dir()?;
-    let config_path = std::env::var("OPENCLAW_CONFIG_PATH")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(&home).join(".openclaw").join("openclaw.json"));
+    let env_base = std::env::var("ZCODE_DATA_BASE_DIR").ok();
+    let dir = zcode_config_dir(Path::new(&home), env_base.as_deref());
+    configure_zcode_in(&dir, &api_url, &model, api_key.as_deref())
+}
 
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+/// Where each ZCode installer puts the desktop app's executable. The app puts
+/// nothing on `PATH` except on Linux, where the deb/rpm packages also link
+/// `/usr/bin/zcode`, so without these the Launch page reports ZCode missing.
+fn zcode_app_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        out.push(PathBuf::from(
+            "/Applications/ZCode.app/Contents/MacOS/ZCode",
+        ));
+        if let Ok(home) = agent_home_dir() {
+            out.push(PathBuf::from(home).join("Applications/ZCode.app/Contents/MacOS/ZCode"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        // NSIS installs per user under `%LOCALAPPDATA%\Programs` and for all
+        // users under `%ProgramFiles%`; both are the installer's defaults.
+        for (var, sub) in [
+            ("LOCALAPPDATA", "Programs\\ZCode"),
+            ("ProgramFiles", "ZCode"),
+        ] {
+            if let Some(root) = std::env::var(var).ok().filter(|v| !v.is_empty()) {
+                out.push(PathBuf::from(root).join(sub).join("ZCode.exe"));
+            }
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        out.push(PathBuf::from("/opt/ZCode/zcode"));
+    }
+    out
+}
+
+/// The `.app` bundle an executable at `X.app/Contents/MacOS/<exe>` belongs to.
+fn macos_app_bundle(exe: &Path) -> Option<PathBuf> {
+    let bundle = exe.parent()?.parent()?.parent()?;
+    (bundle.extension()? == "app").then(|| bundle.to_path_buf())
+}
+
+/// Whether ZCode's desktop app is installed, and whether we brought it up.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZcodeAppStatus {
+    pub installed: bool,
+    pub launched: bool,
+}
+
+/// Open ZCode after [`configure_zcode`], if it is installed.
+///
+/// Best effort by design: the config is already written and ZCode reads it
+/// whenever it next runs, so a missing app is reported rather than failed.
+/// `path` is the launcher the Launch page detected off `PATH` (a custom binary
+/// path, or one of [`zcode_app_candidates`]).
+#[tauri::command]
+#[cfg_attr(feature = "e2e", allow(unreachable_code))]
+pub fn launch_zcode(path: Option<String>) -> ZcodeAppStatus {
+    use std::process::{Command, Stdio};
+
+    let exe = path
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(|| resolve_off_path("zcode"));
+    let found = exe.is_some();
+
+    // An end-to-end build must not open a desktop app on the machine of whoever runs the tests;
+    // like `open_agent_terminal`, it writes down what it would have opened.
+    #[cfg(feature = "e2e")]
+    {
+        let program = exe
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "zcode".to_string());
+        let _ = crate::core::e2e::record_terminal(
+            &crate::core::e2e::data_root(),
+            &format!("zcode {program}"),
+        );
+        return ZcodeAppStatus {
+            installed: found,
+            launched: found,
+        };
     }
 
-    // OpenClaw reads this file as JSON5 (comments, unquoted keys, trailing
-    // commas), so we must parse with the same leniency or we reject configs
-    // OpenClaw happily accepts (ATO-87). json5 deserializes into the same
-    // serde_json::Value, and we always re-serialize as strict JSON on write,
-    // which normalizes (and silently drops comments from) the file.
-    let mut root: serde_json::Value = if config_path.exists() {
-        let text = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
-        if text.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            json5::from_str(&text).map_err(|e| {
-                format!(
-                    "Could not parse {}: {}. Fix the reported location and try again.",
-                    config_path.display(),
-                    e
-                )
-            })?
+    let mut cmd = match exe {
+        Some(exe) => match macos_app_bundle(&exe).filter(|_| cfg!(target_os = "macos")) {
+            // Through LaunchServices, which also just focuses a running instance.
+            Some(bundle) => {
+                let mut c = Command::new("open");
+                c.arg("-a").arg(bundle);
+                c
+            }
+            None => Command::new(exe),
+        },
+        // Linux packages link `/usr/bin/zcode`, which the login PATH resolves.
+        None if cfg!(all(unix, not(target_os = "macos"))) => Command::new("zcode"),
+        None => {
+            return ZcodeAppStatus {
+                installed: false,
+                launched: false,
+            }
         }
-    } else {
-        serde_json::json!({})
     };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    apply_login_path(&mut cmd);
 
+    match cmd.spawn() {
+        Ok(_) => {
+            log::info!("Launched ZCode");
+            ZcodeAppStatus {
+                installed: true,
+                launched: true,
+            }
+        }
+        // For the bare Linux name, a failed spawn just means it is not there.
+        Err(e) => {
+            log::warn!("Could not launch ZCode: {e}");
+            ZcodeAppStatus {
+                installed: found,
+                launched: false,
+            }
+        }
+    }
+}
+
+/// Whether OpenClaw's desktop app is installed, and whether we brought it up.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenclawAppStatus {
+    /// The desktop app is present on this machine.
+    pub installed: bool,
+    /// We were able to bring it to the front. False with `installed: true` means
+    /// the user has to open it themselves.
+    pub launched: bool,
+}
+
+/// Report (and on macOS, open) OpenClaw's desktop app.
+///
+/// The app and the CLI share `~/.openclaw/openclaw.json`, and the Gateway
+/// watches that file and hot-reloads it, so `configure_openclaw` is the whole
+/// integration for app users too — this only saves them from going to find the
+/// app afterwards, the way `launch_zed` does for Zed.
+///
+/// macOS ships `OpenClaw.app`, which `open -a` addresses by path. Windows Hub
+/// ("OpenClaw Companion") installs per-user with no documented install path or
+/// AUMID to launch it by, so there we only *detect* it — via its state
+/// directory, which is the one location the docs pin down — and let the UI point
+/// the user at the tray icon. Guessing a Start-menu path would break silently on
+/// every install that does not match the guess.
+#[tauri::command]
+pub fn launch_openclaw_app() -> OpenclawAppStatus {
+    #[cfg(target_os = "macos")]
+    {
+        let mut candidates = vec![PathBuf::from("/Applications/OpenClaw.app")];
+        if let Ok(home) = agent_home_dir() {
+            candidates.push(PathBuf::from(home).join("Applications/OpenClaw.app"));
+        }
+        let Some(app) = candidates.into_iter().find(|p| p.exists()) else {
+            return OpenclawAppStatus {
+                installed: false,
+                launched: false,
+            };
+        };
+        let launched = std::process::Command::new("open")
+            .arg("-a")
+            .arg(&app)
+            .spawn()
+            .is_ok();
+        if launched {
+            log::info!("Launched {}", app.display());
+        } else {
+            log::warn!("Found {} but could not open it", app.display());
+        }
+        return OpenclawAppStatus {
+            installed: true,
+            launched,
+        };
+    }
+
+    #[cfg(windows)]
+    {
+        // `%LOCALAPPDATA%\OpenClawTray` is the Hub's own state directory (its
+        // setup logs live under it), so its presence is a reliable marker even
+        // though the install root is not.
+        let installed = std::env::var("LOCALAPPDATA")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(|local| PathBuf::from(local).join("OpenClawTray"))
+            .is_some_and(|dir| dir.is_dir());
+        return OpenclawAppStatus {
+            installed,
+            launched: false,
+        };
+    }
+
+    #[allow(unreachable_code)]
+    OpenclawAppStatus {
+        installed: false,
+        launched: false,
+    }
+}
+
+/// Provider id we own inside `openclaw.json`. Model refs are `<provider>/<id>`,
+/// so this is also the prefix of every ref we write.
+const OPENCLAW_PROVIDER_ID: &str = "atomic";
+
+/// Whether an `agents.defaults.modelPolicy.allow` list already permits
+/// `model_ref`. OpenClaw matches exact refs plus trailing prefix wildcards
+/// (`provider/*`, `provider/namespace/*`), so both forms are honoured here.
+fn model_policy_allows(list: &[serde_json::Value], model_ref: &str) -> bool {
+    list.iter()
+        .filter_map(|entry| entry.as_str())
+        .any(|entry| match entry.strip_suffix('*') {
+            Some(prefix) => model_ref.starts_with(prefix),
+            None => entry == model_ref,
+        })
+}
+
+/// Apply Atomic Chat's provider, primary model and policy edits to a parsed
+/// `openclaw.json`, returning the updated document.
+///
+/// Split out from [`configure_openclaw`] so the merge rules — which of the
+/// user's keys we overwrite, which we only seed, and how an existing
+/// `modelPolicy.allow` is widened — are testable without touching the disk.
+fn openclaw_patch_config(
+    mut root: serde_json::Value,
+    api_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Result<serde_json::Value, String> {
     let obj = root
         .as_object_mut()
         .ok_or_else(|| "openclaw.json is not a JSON object".to_string())?;
 
-    let model_ref = format!("atomic/{}", model);
+    let model_ref = format!("{}/{}", OPENCLAW_PROVIDER_ID, model);
     let key_val = api_key
         .as_deref()
         .filter(|k| !k.is_empty())
@@ -3280,7 +4126,7 @@ pub fn configure_openclaw(
     // OpenClaw builds the model ref as `<providerId>/<id>` (= `model_ref`), so
     // prefixing here would double it to `atomic/atomic/...` and break lookup.
     providers_obj.insert(
-        "atomic".to_string(),
+        OPENCLAW_PROVIDER_ID.to_string(),
         serde_json::json!({
             "baseUrl": api_url,
             "apiKey": key_val,
@@ -3331,10 +4177,11 @@ pub fn configure_openclaw(
     defaults_obj
         .entry("timeoutSeconds")
         .or_insert_with(|| serde_json::json!(240));
-    // Point the agent at our model via `model.primary` (object form; current
-    // OpenClaw rejects a plain string). Preserve sibling `model.*` keys and heal
-    // a stale string written by older builds. Run is explicit "use this", so we
-    // overwrite primary to keep it synced with the active model.
+    // Point the agent at our model via `model.primary`. Preserve sibling
+    // `model.*` keys and normalize a plain string (both forms are accepted, but
+    // only the object form has room for the fallbacks OpenClaw writes itself).
+    // Run is explicit "use this", so we overwrite primary to keep it synced with
+    // the active model.
     let model_entry = defaults_obj
         .entry("model")
         .or_insert_with(|| serde_json::json!({}));
@@ -3342,16 +4189,92 @@ pub fn configure_openclaw(
         *model_entry = serde_json::json!({});
     }
     model_entry["primary"] = serde_json::json!(model_ref.clone());
-    let allow = defaults_obj
+    // `agents.defaults.models` holds aliases and per-model settings. It used to
+    // double as the allowlist, and pre-migration OpenClaw builds still read it
+    // that way, so keep seeding an entry — but it no longer restricts anything
+    // on current builds ("adding an entry does not restrict model overrides").
+    let settings = defaults_obj
         .entry("models")
         .or_insert_with(|| serde_json::json!({}));
-    let allow_obj = allow
+    let settings_obj = settings
         .as_object_mut()
         .ok_or_else(|| "agents.defaults.models is not a JSON object".to_string())?;
-    allow_obj
-        .entry(model_ref)
+    settings_obj
+        .entry(model_ref.clone())
         .or_insert_with(|| serde_json::json!({}));
+    // The allowlist that actually gates model selection is
+    // `agents.defaults.modelPolicy.allow`: when it is non-empty it governs
+    // `/model`, session overrides and `--model`, and anything outside it is
+    // rejected before a reply is generated. So a user who restricted their agent
+    // to a cloud provider would watch Run "succeed" and then be told our model
+    // is not allowed. Widen an existing policy with a provider wildcard.
+    //
+    // Only when the user actually has one: an absent key or `[]` already means
+    // "allow any model", and writing a list there would *introduce* a
+    // restriction nobody asked for. Per-agent `agents.entries.*.modelPolicy`
+    // replaces this default for that agent and is deliberately left alone —
+    // those are explicit per-agent decisions, not the default Run targets.
+    if let Some(list) = defaults_obj
+        .get_mut("modelPolicy")
+        .and_then(|policy| policy.as_object_mut())
+        .and_then(|policy| policy.get_mut("allow"))
+        .and_then(|allow| allow.as_array_mut())
+    {
+        if !list.is_empty() && !model_policy_allows(list, &model_ref) {
+            list.push(serde_json::json!(format!("{}/*", OPENCLAW_PROVIDER_ID)));
+        }
+    }
 
+    Ok(root)
+}
+
+/// Configure OpenClaw by upserting `models.providers.atomic`, the agent's
+/// primary model, and its per-model settings entry in `~/.openclaw/openclaw.json`.
+///
+/// The desktop apps (macOS `OpenClaw.app`, Windows Hub) read the same file
+/// through the same Gateway, and the Gateway watches it and hot-reloads, so
+/// this one write covers both the CLI and the app with no restart.
+#[tauri::command]
+pub fn configure_openclaw(
+    api_url: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    let home = agent_home_dir()?;
+    let config_path = std::env::var("OPENCLAW_CONFIG_PATH")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&home).join(".openclaw").join("openclaw.json"));
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+
+    // OpenClaw reads this file as JSON5 (comments, unquoted keys, trailing
+    // commas), so we must parse with the same leniency or we reject configs
+    // OpenClaw happily accepts (ATO-87). json5 deserializes into the same
+    // serde_json::Value, and we always re-serialize as strict JSON on write,
+    // which normalizes (and silently drops comments from) the file.
+    let root: serde_json::Value = if config_path.exists() {
+        let text = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
+        if text.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            json5::from_str(&text).map_err(|e| {
+                format!(
+                    "Could not parse {}: {}. Fix the reported location and try again.",
+                    config_path.display(),
+                    e
+                )
+            })?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    let root = openclaw_patch_config(root, &api_url, &model, api_key.as_deref())?;
     let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     std::fs::write(&config_path, pretty + "\n")
         .map_err(|e| format!("Failed to write {}: {}", config_path.display(), e))?;
@@ -3863,12 +4786,12 @@ fn dsh_home_dir() -> Result<PathBuf, String> {
 /// disk cannot leave a truncated file behind.
 ///
 /// The existing `configure_*` commands use a plain `std::fs::write`, which is
-/// tolerable for a config file we are the sole author of. `settings.yaml` is
-/// shared with every other harness plugin, so a half-written file destroys
-/// configuration we do not own. Symlinks are resolved first: renaming onto a
-/// link would replace it with a regular file and silently detach a dotfile
-/// managed by stow/chezmoi.
-fn dsh_write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// tolerable for a config file we are the sole author of. DeepSeek Harness's
+/// `settings.yaml` and ZCode's `provider_config.json` hold configuration we do
+/// not own, so a half-written file destroys it. Symlinks are resolved first:
+/// renaming onto a link would replace it with a regular file and silently
+/// detach a dotfile managed by stow/chezmoi.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
 
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -3894,13 +4817,13 @@ fn dsh_write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Restrict a credential-bearing file to its owner. Best-effort: a permissions
 /// failure must not fail the configure.
 #[cfg(unix)]
-fn dsh_restrict_to_owner(path: &Path) {
+fn restrict_to_owner(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
 
 #[cfg(not(unix))]
-fn dsh_restrict_to_owner(_path: &Path) {}
+fn restrict_to_owner(_path: &Path) {}
 
 /// Reject a value no dotenv line can carry.
 ///
@@ -3970,8 +4893,8 @@ fn dsh_write_managed_env(path: &Path, vars: &[(&str, &str)]) -> Result<(), Strin
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
     }
-    dsh_write_atomically(path, out.as_bytes())?;
-    dsh_restrict_to_owner(path);
+    write_atomically(path, out.as_bytes())?;
+    restrict_to_owner(path);
     Ok(())
 }
 
@@ -4034,7 +4957,7 @@ fn configure_dsh_at(
         }
     }
 
-    dsh_write_atomically(&settings_path, serialized.as_bytes())?;
+    write_atomically(&settings_path, serialized.as_bytes())?;
 
     // The secret itself never enters settings.yaml. dsh resolves the reference
     // from, in order: the inherited environment, `$DSH_HOME/.credentials.yaml`,
@@ -4367,6 +5290,64 @@ pub fn configure_poolside(
     log::info!(
         "Poolside configured: base_url={}, model={}, rc={}",
         standalone_base,
+        model,
+        env_file_path
+    );
+    Ok(())
+}
+
+/// Environment Muse Code needs before it will talk to a non-Meta endpoint.
+///
+/// Muse Code is the one agent here with no writable endpoint configuration:
+/// `~/.config/muse/settings.json` holds UI, tool and MCP preferences, while the
+/// provider is chosen per invocation with `--provider meta --base-url <url>
+/// --model <id>` (see `cli::integrations::dynamic_run_args`). The credential is
+/// the only piece that persists, and Muse only checks that `META_API_KEY` is
+/// present -- the upstream call goes to whatever `--base-url` points at -- so
+/// the local server's own key satisfies both ends.
+pub fn muse_env_vars(_api_url: &str, _model: &str, api_key: Option<&str>) -> Vec<(String, String)> {
+    let key_val = api_key.filter(|k| !k.is_empty()).unwrap_or("atomic");
+    vec![("META_API_KEY".to_string(), key_val.to_string())]
+}
+
+/// Configure Muse Code by persisting `META_API_KEY`.
+///
+/// `api_url` and `model` are accepted for symmetry with the other
+/// `configure_*` commands the Launch page invokes, but Muse takes both as
+/// launch flags rather than configuration, so only the key is written here.
+#[tauri::command]
+pub fn configure_muse(
+    api_url: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    let env_vars = muse_env_vars(&api_url, &model, api_key.as_deref());
+
+    const MARKER: &str = "# Atomic Chat - Muse Code Config";
+
+    if cfg!(target_os = "windows") {
+        for (key, value) in &env_vars {
+            let output = std::process::Command::new("setx")
+                .arg(key)
+                .arg(value)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("Failed to set env var {}: {}", key, stderr));
+            }
+        }
+        log::info!("Muse Code configured (Windows env): base_url={}", api_url);
+        return Ok(());
+    }
+
+    let home = agent_home_dir()?;
+    let is_macos = cfg!(target_os = "macos");
+    let (_shell, env_file_path) = detect_shell_env_file(&home, is_macos);
+    write_marked_env_to_shell(&env_file_path, MARKER, "META_", &env_vars)?;
+    log::info!(
+        "Muse Code configured: base_url={}, model={}, rc={}",
+        api_url,
         model,
         env_file_path
     );
@@ -4779,11 +5760,17 @@ pub fn configure_atomic_agent(
 /// using a just-configured agent in one click. The terminal stays open after
 /// the command (it launches an interactive TUI agent like codex/claude).
 #[tauri::command]
+#[cfg_attr(feature = "e2e", allow(unreachable_code, unused_variables))]
 pub fn open_agent_terminal(command: String, proxy: Option<ProxyEnv>) -> Result<(), String> {
     let command = command.trim().to_string();
     if command.is_empty() {
         return Err("Empty terminal command".to_string());
     }
+
+    // An end-to-end build must not open terminal windows on the desktop of
+    // whoever runs the tests; it writes down what it would have run instead.
+    #[cfg(feature = "e2e")]
+    return crate::core::e2e::record_terminal(&crate::core::e2e::data_root(), &command);
 
     #[cfg(target_os = "macos")]
     {
@@ -5125,6 +6112,24 @@ mod tests {
             assert!(
                 !removed.iter().any(|key| key == variable),
                 "{variable} must be preserved"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn curl_agent_installers_propagate_download_failures() {
+        for agent_id in ["goose", "atomic-agent", "hermes", "poolside", "zed", "muse"] {
+            let (program, arguments, prerequisite, _) =
+                agent_install_spec(agent_id).expect("known install spec");
+            assert_eq!(program, "bash", "{agent_id} must support pipefail");
+            assert_eq!(prerequisite, "curl");
+            assert_eq!(arguments.first().map(String::as_str), Some("-c"));
+            assert!(
+                arguments
+                    .get(1)
+                    .is_some_and(|argument| argument.starts_with("set -o pipefail; curl -fsSL ")),
+                "{agent_id} must fail when curl fails: {arguments:?}"
             );
         }
     }
@@ -5653,5 +6658,545 @@ mod atomic_agent_tests {
     #[test]
     fn rejects_a_config_file_that_is_not_an_object() {
         assert!(atomic_agent_patch_config(serde_json::json!([]), URL, "m", None).is_err());
+    }
+}
+
+/// Config-merge and environment-probe rules for the OpenClaw integration. The
+/// desktop apps and the CLI share one `openclaw.json`, so these rules decide
+/// what both of them end up running.
+#[cfg(test)]
+mod openclaw_tests {
+    use super::*;
+
+    const OC_URL: &str = "http://127.0.0.1:1337/v1";
+
+    fn patch_openclaw(root: serde_json::Value) -> serde_json::Value {
+        openclaw_patch_config(root, OC_URL, "gemma-4", Some("atomic")).expect("patch must succeed")
+    }
+
+    #[test]
+    fn openclaw_seeds_provider_and_primary_model() {
+        let out = patch_openclaw(serde_json::json!({}));
+        assert_eq!(out["models"]["providers"]["atomic"]["baseUrl"], OC_URL);
+        assert_eq!(
+            out["models"]["providers"]["atomic"]["api"],
+            "openai-completions"
+        );
+        // The catalog id stays bare; OpenClaw builds the ref as provider/id.
+        assert_eq!(
+            out["models"]["providers"]["atomic"]["models"][0]["id"],
+            "gemma-4"
+        );
+        assert_eq!(
+            out["agents"]["defaults"]["model"]["primary"],
+            "atomic/gemma-4"
+        );
+        assert!(out["agents"]["defaults"]["models"]["atomic/gemma-4"].is_object());
+    }
+
+    /// A non-empty `modelPolicy.allow` gates `/model`, session overrides and
+    /// `--model`, so without widening it our model is rejected at use time even
+    /// though the write "succeeded".
+    #[test]
+    fn openclaw_widens_a_restrictive_model_policy() {
+        let out = patch_openclaw(serde_json::json!({
+            "agents": { "defaults": { "modelPolicy": { "allow": ["anthropic/*"] } } }
+        }));
+        let allow = out["agents"]["defaults"]["modelPolicy"]["allow"]
+            .as_array()
+            .expect("allow stays an array");
+        assert_eq!(
+            allow,
+            &vec![
+                serde_json::json!("anthropic/*"),
+                serde_json::json!("atomic/*"),
+            ]
+        );
+    }
+
+    /// Absent or `[]` already means "allow any model". Writing a list into
+    /// either would introduce a restriction the user never asked for.
+    #[test]
+    fn openclaw_does_not_invent_a_model_policy() {
+        let out = patch_openclaw(serde_json::json!({}));
+        assert!(out["agents"]["defaults"].get("modelPolicy").is_none());
+
+        let out = patch_openclaw(serde_json::json!({
+            "agents": { "defaults": { "modelPolicy": { "allow": [] } } }
+        }));
+        assert_eq!(
+            out["agents"]["defaults"]["modelPolicy"]["allow"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn openclaw_leaves_a_policy_that_already_covers_us_untouched() {
+        for existing in [
+            serde_json::json!(["atomic/*"]),
+            serde_json::json!(["atomic/gemma-4"]),
+            serde_json::json!(["openai/gpt-5.4", "atomic/*"]),
+        ] {
+            let before = existing.as_array().unwrap().len();
+            let out = patch_openclaw(serde_json::json!({
+                "agents": { "defaults": { "modelPolicy": { "allow": existing } } }
+            }));
+            assert_eq!(
+                out["agents"]["defaults"]["modelPolicy"]["allow"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                before,
+                "an allow list that already covers us must not grow"
+            );
+        }
+    }
+
+    /// Both `model` shapes are valid OpenClaw config; older builds of ours wrote
+    /// the plain string. Normalize to the object form without losing siblings.
+    #[test]
+    fn openclaw_normalizes_a_plain_string_model() {
+        let out = patch_openclaw(serde_json::json!({
+            "agents": { "defaults": { "model": "atomic/stale-model" } }
+        }));
+        assert_eq!(
+            out["agents"]["defaults"]["model"]["primary"],
+            "atomic/gemma-4"
+        );
+
+        let out = patch_openclaw(serde_json::json!({
+            "agents": { "defaults": { "model": { "fallbacks": ["anthropic/claude"] } } }
+        }));
+        assert_eq!(
+            out["agents"]["defaults"]["model"]["primary"],
+            "atomic/gemma-4"
+        );
+        assert_eq!(
+            out["agents"]["defaults"]["model"]["fallbacks"][0],
+            "anthropic/claude"
+        );
+    }
+
+    /// Gateway keys are seeded for a fresh loopback setup but never overwritten:
+    /// a user on a remote gateway or token auth must keep it.
+    #[test]
+    fn openclaw_preserves_deliberate_gateway_settings() {
+        let out = patch_openclaw(serde_json::json!({}));
+        assert_eq!(out["gateway"]["mode"], "local");
+        assert_eq!(out["gateway"]["auth"]["mode"], "none");
+
+        let out = patch_openclaw(serde_json::json!({
+            "gateway": { "mode": "remote", "auth": { "mode": "token" } }
+        }));
+        assert_eq!(out["gateway"]["mode"], "remote");
+        assert_eq!(out["gateway"]["auth"]["mode"], "token");
+    }
+
+    #[test]
+    fn model_policy_matching_handles_exact_refs_and_wildcards() {
+        let list = vec![
+            serde_json::json!("anthropic/claude-opus-4-6"),
+            serde_json::json!("openai/*"),
+        ];
+        assert!(model_policy_allows(&list, "anthropic/claude-opus-4-6"));
+        assert!(model_policy_allows(&list, "openai/gpt-5.4"));
+        assert!(!model_policy_allows(&list, "anthropic/claude-sonnet-4-6"));
+        assert!(!model_policy_allows(&list, "atomic/gemma-4"));
+
+        // Multi-segment refs and namespace wildcards.
+        let ns = vec![serde_json::json!("atomic/vendor/*")];
+        assert!(model_policy_allows(&ns, "atomic/vendor/gemma-4"));
+        assert!(!model_policy_allows(&ns, "atomic/gemma-4"));
+    }
+
+    /// OpenClaw's engines: `>=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0`.
+    #[test]
+    fn node_engine_gate_matches_openclaws_ranges() {
+        assert!(node_meets_openclaw_engines((22, 22, 3)));
+        assert!(node_meets_openclaw_engines((22, 23, 0)));
+        assert!(!node_meets_openclaw_engines((22, 22, 2)));
+        assert!(!node_meets_openclaw_engines((20, 19, 0)));
+        // 23 is explicitly unsupported, not merely old.
+        assert!(!node_meets_openclaw_engines((23, 11, 0)));
+        assert!(!node_meets_openclaw_engines((24, 14, 9)));
+        assert!(node_meets_openclaw_engines((24, 15, 0)));
+        assert!(!node_meets_openclaw_engines((25, 8, 9)));
+        assert!(node_meets_openclaw_engines((25, 9, 0)));
+        assert!(node_meets_openclaw_engines((26, 0, 0)));
+    }
+
+    #[test]
+    fn version_parsing_tolerates_prefixes_and_prereleases() {
+        assert_eq!(parse_version("v22.22.3\n"), Some((22, 22, 3)));
+        assert_eq!(parse_version("11.16.0"), Some((11, 16, 0)));
+        assert_eq!(parse_version("12.0.0-beta.1"), Some((12, 0, 0)));
+        assert_eq!(parse_version("13"), Some((13, 0, 0)));
+        assert_eq!(parse_version("not a version"), None);
+    }
+
+    /// Only OpenClaw's launcher and ZCode's desktop app live off PATH; guessing
+    /// paths for the other agents would only produce false positives.
+    #[test]
+    fn off_path_candidates_cover_only_openclaw_and_zcode() {
+        assert!(off_path_candidates("claude").is_empty());
+        assert!(off_path_candidates("codex").is_empty());
+
+        let candidates = off_path_candidates("openclaw");
+        assert!(!candidates.is_empty());
+        assert!(
+            candidates
+                .iter()
+                .all(|p| p.parent().is_some_and(|d| d.ends_with("bin"))),
+            "every candidate must sit in a <prefix>/bin directory"
+        );
+        // The macOS app's own installer default has to be covered.
+        assert!(candidates
+            .iter()
+            .any(|p| p.to_string_lossy().contains(".openclaw")));
+    }
+}
+
+#[cfg(test)]
+mod zcode_tests {
+    use super::*;
+    use serde_json::json;
+
+    const URL: &str = "http://127.0.0.1:1337/v1";
+
+    fn patch(existing: Option<serde_json::Value>, model: &str) -> serde_json::Value {
+        zcode_patch_provider_config(existing, URL, model, None).expect("patch must succeed")
+    }
+
+    fn providers(root: &serde_json::Value) -> &Vec<serde_json::Value> {
+        root["config"]["providerConfigRules"]["providerRules"]
+            .as_array()
+            .expect("providerRules must be an array")
+    }
+
+    fn model_rules<'a>(root: &'a serde_json::Value, list: &str) -> &'a Vec<serde_json::Value> {
+        root["config"]["modelConfigRules"][list]
+            .as_array()
+            .expect("model rule lists must be arrays")
+    }
+
+    fn ours(rules: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        rules
+            .iter()
+            .filter(|r| r["providerId"] == ZCODE_PROVIDER_ID)
+            .collect()
+    }
+
+    /// A user's own provider as ZCode's Model Settings writes it.
+    fn user_file() -> serde_json::Value {
+        json!({
+            "schemaVersion": 1,
+            "config": {
+                "providerOrder": ["new-provider"],
+                "providerConfigRules": { "providerRules": [{
+                    "providerId": "new-provider",
+                    "providerName": "OpenRouter",
+                    "enabled": true,
+                    "config": {
+                        "group": "standard-personal",
+                        "access": { "type": "api-key", "apiKey": "sk-user" },
+                        "api": { "type": "openai-chat-completions", "baseUrl": "https://openrouter.ai/api/v1" },
+                        "personalModelIds": ["glm-5"]
+                    }
+                }] },
+                "modelConfigRules": {
+                    "providerModelRules": [
+                        { "providerId": "new-provider", "modelId": "glm-5", "config": { "enabled": true } }
+                    ],
+                    "manualProviderModelRules": []
+                },
+                "defaultModelSelection": { "providerId": "new-provider", "modelId": "glm-5" }
+            }
+        })
+    }
+
+    /// The file ZCode creates has to validate on its own: both model rule lists
+    /// are required, the provider needs a group, a non-blank key and an API.
+    #[test]
+    fn seeds_a_complete_file_from_nothing() {
+        let out = patch(None, "qwen3-4b");
+        assert_eq!(out["schemaVersion"], 1);
+
+        let provider = &providers(&out)[0];
+        assert_eq!(provider["providerId"], ZCODE_PROVIDER_ID);
+        assert_eq!(provider["enabled"], true);
+        let config = &provider["config"];
+        assert_eq!(config["group"], "standard-personal");
+        assert_eq!(config["access"]["type"], "api-key");
+        assert_eq!(config["access"]["apiKey"], ZCODE_KEY_PLACEHOLDER);
+        assert_eq!(config["api"]["type"], "openai-chat-completions");
+        assert_eq!(config["api"]["baseUrl"], URL);
+        assert_eq!(config["personalModelIds"], json!(["qwen3-4b"]));
+
+        assert!(model_rules(&out, "manualProviderModelRules").is_empty());
+        let rule = &model_rules(&out, "providerModelRules")[0];
+        assert_eq!(rule["modelId"], "qwen3-4b");
+        assert_eq!(
+            rule["config"]["properties"]["contextWindow"],
+            ZCODE_CONTEXT_WINDOW
+        );
+        assert_eq!(
+            rule["config"]["optionSpecs"]["reasoningLevel"]["map"],
+            ZCODE_REASONING_MAP
+        );
+        assert_eq!(
+            out["config"]["defaultModelSelection"],
+            json!({
+                "providerId": ZCODE_PROVIDER_ID,
+                "modelId": "qwen3-4b",
+                "options": { "reasoningLevel": "enabled" }
+            })
+        );
+        // A file ZCode never had gets no order list invented for it.
+        assert!(out["config"].get("providerOrder").is_none());
+    }
+
+    #[test]
+    fn uses_the_server_key_when_there_is_one() {
+        let out = zcode_patch_provider_config(None, URL, "m", Some(" sk-local ")).unwrap();
+        assert_eq!(providers(&out)[0]["config"]["access"]["apiKey"], "sk-local");
+    }
+
+    #[test]
+    fn keeps_the_users_providers_and_rules() {
+        let out = patch(Some(user_file()), "qwen3-4b");
+
+        let all = providers(&out);
+        assert_eq!(all.len(), 2);
+        assert_eq!(
+            all[0],
+            user_file()["config"]["providerConfigRules"]["providerRules"][0]
+        );
+
+        let rules = model_rules(&out, "providerModelRules");
+        assert!(rules.iter().any(|r| r["providerId"] == "new-provider"));
+        assert_eq!(
+            out["config"]["providerOrder"],
+            json!([ZCODE_PROVIDER_ID, "new-provider"])
+        );
+        // Run means "use this model": the default moves to ours.
+        assert_eq!(
+            out["config"]["defaultModelSelection"]["providerId"],
+            ZCODE_PROVIDER_ID
+        );
+    }
+
+    #[test]
+    fn running_again_or_switching_model_leaves_one_entry_of_ours() {
+        let once = patch(Some(user_file()), "qwen3-4b");
+        let twice = patch(Some(once.clone()), "qwen3-4b");
+        assert_eq!(once, twice, "a repeated Run must not change the file");
+
+        let switched = patch(Some(twice), "gemma-4");
+        assert_eq!(ours(providers(&switched)).len(), 1);
+        assert_eq!(
+            ours(providers(&switched))[0]["config"]["personalModelIds"],
+            json!(["gemma-4"])
+        );
+        let rules = ours(model_rules(&switched, "providerModelRules"));
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["modelId"], "gemma-4");
+        let order = switched["config"]["providerOrder"].as_array().unwrap();
+        assert_eq!(
+            order.iter().filter(|id| **id == ZCODE_PROVIDER_ID).count(),
+            1
+        );
+    }
+
+    /// ZCode rejects the whole file when a provider/model pair has both a
+    /// regular and a manual rule; its Advanced model settings write the manual one.
+    #[test]
+    fn drops_our_manual_rule_so_the_file_stays_valid() {
+        let mut file = user_file();
+        file["config"]["modelConfigRules"]["manualProviderModelRules"] = json!([
+            { "providerId": ZCODE_PROVIDER_ID, "modelId": "qwen3-4b", "config": {} },
+            { "providerId": "new-provider", "modelId": "glm-5", "config": {} }
+        ]);
+        let out = patch(Some(file), "qwen3-4b");
+        let manual = model_rules(&out, "manualProviderModelRules");
+        assert_eq!(manual.len(), 1);
+        assert_eq!(manual[0]["providerId"], "new-provider");
+    }
+
+    #[test]
+    fn refuses_files_it_does_not_understand() {
+        for bad in [
+            json!({ "schemaVersion": 2, "config": {} }),
+            json!({ "config": {} }),
+            json!([]),
+            json!({ "schemaVersion": 1, "config": { "providerConfigRules": { "providerRules": {} } } }),
+            json!({ "schemaVersion": 1, "config": { "providerOrder": "atomic-chat" } }),
+        ] {
+            assert!(
+                zcode_patch_provider_config(Some(bad.clone()), URL, "m", None).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        assert!(zcode_patch_provider_config(None, URL, "  ", None).is_err());
+    }
+
+    #[test]
+    fn config_dir_follows_zcodes_own_resolution_order() {
+        let home = tempfile::tempdir().unwrap();
+        let v2 = home.path().join(".zcode").join("v2");
+
+        assert_eq!(zcode_config_dir(home.path(), None), v2);
+        assert_eq!(
+            zcode_config_dir(home.path(), Some("/data")),
+            Path::new("/data").join(".zcode").join("v2")
+        );
+
+        std::fs::create_dir_all(&v2).unwrap();
+        std::fs::write(v2.join("setting.json"), r#"{"dataBaseDir":"  "}"#).unwrap();
+        assert_eq!(zcode_config_dir(home.path(), None), v2);
+
+        std::fs::write(v2.join("setting.json"), r#"{"dataBaseDir":"/moved"}"#).unwrap();
+        assert_eq!(
+            zcode_config_dir(home.path(), Some("/data")),
+            Path::new("/moved").join(".zcode").join("v2")
+        );
+    }
+
+    #[test]
+    fn waits_for_zcode_to_import_its_legacy_config_first() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+
+        let err = configure_zcode_in(dir.path(), URL, "m", None).unwrap_err();
+        assert!(err.contains("Open ZCode once"), "{err}");
+        assert!(!dir.path().join("provider_config.json").exists());
+
+        // Once ZCode has migrated, the legacy file is only a rollback copy.
+        std::fs::write(
+            dir.path().join("provider_config.json"),
+            user_file().to_string(),
+        )
+        .unwrap();
+        configure_zcode_in(dir.path(), URL, "m", None).unwrap();
+    }
+
+    #[test]
+    fn writes_the_file_and_backs_up_the_users_version_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider_config.json");
+        let original = user_file().to_string();
+        std::fs::write(&path, &original).unwrap();
+
+        configure_zcode_in(dir.path(), URL, "qwen3-4b", None).unwrap();
+        configure_zcode_in(dir.path(), URL, "gemma-4", None).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written["config"]["defaultModelSelection"]["modelId"],
+            "gemma-4"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("provider_config.json.atomic-backup")).unwrap(),
+            original
+        );
+        assert!(!dir.path().join("provider_config.json.lock").exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn leaves_an_unparseable_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider_config.json");
+        std::fs::write(&path, "{ not json").unwrap();
+
+        assert!(configure_zcode_in(dir.path(), URL, "m", None).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn respects_a_live_lock_and_reclaims_an_abandoned_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("provider_config.json");
+        let lock_dir = dir.path().join("provider_config.json.lock");
+        std::fs::create_dir(&lock_dir).unwrap();
+        std::fs::write(lock_dir.join("owner-1-2-x.json"), "{}").unwrap();
+
+        let short = std::time::Duration::from_millis(60);
+        let err = acquire_zcode_lock(&file, short, std::time::Duration::from_secs(60))
+            .err()
+            .expect("a fresh lock must be waited for");
+        assert!(err.contains("Try again"), "{err}");
+        assert!(lock_dir.exists());
+
+        let lock = acquire_zcode_lock(&file, short, std::time::Duration::ZERO)
+            .expect("an abandoned lock must be reclaimed");
+        assert_eq!(std::fs::read_dir(&lock_dir).unwrap().count(), 1);
+        drop(lock);
+        assert!(!lock_dir.exists());
+    }
+
+    #[test]
+    fn finds_the_bundle_of_a_macos_app_executable() {
+        assert_eq!(
+            macos_app_bundle(Path::new("/Applications/ZCode.app/Contents/MacOS/ZCode")),
+            Some(PathBuf::from("/Applications/ZCode.app"))
+        );
+        assert_eq!(macos_app_bundle(Path::new("/usr/bin/zcode")), None);
+    }
+}
+
+#[cfg(test)]
+mod factory_reset_tests {
+    use super::{put_backends_back, remove_jan_data_contents, set_backends_aside};
+    use std::fs;
+
+    #[test]
+    fn a_reset_removes_the_cores_keys_and_keeps_both_providers_backends() {
+        let data = tempfile::tempdir().unwrap();
+        let aside = tempfile::tempdir().unwrap();
+        let root = data.path();
+        for dir in [
+            "threads/t1",
+            "atomic-core",
+            "db",
+            "llamacpp/backends/b1/macos-arm64",
+            "llamacpp/models/m",
+            "llamacpp-upstream/backends/b2/macos-arm64",
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("atomic-core/credentials.json"), "{\"openai\":\"sk-secret\"}").unwrap();
+        fs::write(root.join("atomic-chatgpt-auth.json"), "{\"refresh_token\":\"secret\"}").unwrap();
+        fs::write(root.join("local-api-server.json"), "{}").unwrap();
+        fs::write(root.join("llamacpp-upstream/backends/b2/macos-arm64/llama-server"), "bin").unwrap();
+        fs::write(root.join("users-own-file.txt"), "not the app's to delete").unwrap();
+
+        let preserved = set_backends_aside(root, aside.path());
+        remove_jan_data_contents(root);
+        put_backends_back(root, preserved);
+
+        for gone in [
+            "threads",
+            "db",
+            "atomic-core",
+            "atomic-chatgpt-auth.json",
+            "local-api-server.json",
+            "llamacpp/models",
+        ] {
+            assert!(!root.join(gone).exists(), "{gone} survived the reset");
+        }
+        assert!(root.join("llamacpp/backends/b1/macos-arm64").is_dir());
+        assert!(root.join("llamacpp-upstream/backends/b2/macos-arm64/llama-server").is_file());
+        assert!(root.join("users-own-file.txt").is_file());
+        assert_eq!(fs::read_dir(aside.path()).unwrap().count(), 0);
     }
 }

@@ -4,15 +4,55 @@
 
 import { invoke } from '@tauri-apps/api/core'
 import { type AppConfiguration, type AutostartPreference } from '@janhq/core'
-import { localStorageKey } from '@/constants/localStorage'
-import type { LogEntry } from './types'
+import {
+  BACKEND_PRESERVE_KEYS,
+  localStorageKey,
+} from '@/constants/localStorage'
+import type { LogEntry, LogExport, UnifiedLogEntry } from './types'
 import { DefaultAppService } from './default'
+import { normalizeRemoteAccessStatus } from '@/lib/remoteLan'
+import { logExportFileName } from '@/lib/log-time'
+import type { RemoteAccessStatus } from '@/types/remoteAccess'
+
+/**
+ * One relayed control call. A `REMOTE_ACCESS_*` refusal from the core carries
+ * the reason the page has always parsed (`server_stopped`, …) in `details`;
+ * it is rethrown bare so `parseRemoteAccessRejection` reads it as before.
+ */
+async function coreCall<T = unknown>(
+  method: 'GET' | 'POST',
+  path: string
+): Promise<T> {
+  try {
+    return await invoke<T>('atomic_core_call', { method, path, body: null })
+  } catch (error) {
+    const record =
+      error && typeof error === 'object'
+        ? (error as { code?: unknown; details?: unknown })
+        : null
+    if (
+      record &&
+      typeof record.code === 'string' &&
+      record.code.startsWith('REMOTE_ACCESS_') &&
+      typeof record.details === 'string'
+    ) {
+      throw record.details
+    }
+    throw error
+  }
+}
+
+/**
+ * A reply that is not a status is a contract break, not "off": reject with a
+ * code so the card reports it instead of showing a tunnel state it made up.
+ */
+function expectRemoteAccessStatus(raw: unknown): RemoteAccessStatus {
+  const status = normalizeRemoteAccessStatus(raw)
+  if (!status) throw new Error('malformed_status')
+  return status
+}
 
 export class TauriAppService extends DefaultAppService {
-  private static readonly BACKEND_PRESERVE_KEYS = [
-    'llama_cpp_backend_type',
-  ]
-
   async factoryReset(): Promise<void> {
     const { EngineManager } = await import('@janhq/core')
     for (const [, engine] of EngineManager.instance().engines) {
@@ -23,7 +63,7 @@ export class TauriAppService extends DefaultAppService {
     }
 
     const savedBackend: Record<string, string> = {}
-    for (const key of TauriAppService.BACKEND_PRESERVE_KEYS) {
+    for (const key of BACKEND_PRESERVE_KEYS) {
       const val = window.localStorage.getItem(key)
       if (val) savedBackend[key] = val
     }
@@ -43,12 +83,45 @@ export class TauriAppService extends DefaultAppService {
     return logData.split('\n').map(this.parseLogLine)
   }
 
+  async readUnifiedLogs(): Promise<UnifiedLogEntry[]> {
+    return (await invoke<UnifiedLogEntry[]>('read_unified_logs')) ?? []
+  }
+
+  async exportLogs(): Promise<LogExport | null> {
+    const path = await invoke<string | null>('save_dialog', {
+      options: {
+        defaultPath: logExportFileName(new Date()),
+        filters: [{ name: 'Log', extensions: ['log'] }],
+      },
+    })
+    if (!path) return null
+    return await invoke<LogExport>('export_logs', { path })
+  }
+
   async getInstallerType(): Promise<string | undefined> {
     try {
       const value = (await invoke('get_installer_type')) as string | null
       return value ?? undefined
     } catch (error) {
       console.debug('get_installer_type unavailable:', error)
+      return undefined
+    }
+  }
+
+  /**
+   * The core may still be starting when Settings opens; the pin is what it
+   * will attach as, since the supervisor refuses a core of another version.
+   * Mobile registers no `atomic_core_status`, so the invoke rejects there.
+   */
+  async getCoreVersion(): Promise<string | undefined> {
+    try {
+      const status = await invoke<{
+        expected_version?: string | null
+        attached?: { version?: string } | null
+      }>('atomic_core_status')
+      return status?.attached?.version || status?.expected_version || undefined
+    } catch (error) {
+      console.debug('atomic_core_status unavailable:', error)
       return undefined
     }
   }
@@ -113,5 +186,33 @@ export class TauriAppService extends DefaultAppService {
 
   async readYaml<T = unknown>(path: string): Promise<T> {
     return await invoke<T>('read_yaml', { path })
+  }
+
+  // Desktop-only, served by the core; `PlatformFeature.LOCAL_API_SERVER`
+  // gates every caller, so mobile never reaches them.
+  async getRemoteAccessStatus(): Promise<RemoteAccessStatus> {
+    return expectRemoteAccessStatus(await coreCall('GET', '/remote-access'))
+  }
+
+  async startRemoteAccess(): Promise<RemoteAccessStatus> {
+    return expectRemoteAccessStatus(
+      await coreCall('POST', '/remote-access/start')
+    )
+  }
+
+  async stopRemoteAccess(): Promise<RemoteAccessStatus> {
+    return expectRemoteAccessStatus(
+      await coreCall('POST', '/remote-access/stop')
+    )
+  }
+
+  async getLanAddresses(): Promise<string[]> {
+    const reply = await coreCall<{ addresses?: unknown }>('GET', '/lan-addresses')
+    const addresses = reply && typeof reply === 'object' ? reply.addresses : null
+    return Array.isArray(addresses)
+      ? addresses.filter(
+          (address): address is string => typeof address === 'string'
+        )
+      : []
   }
 }

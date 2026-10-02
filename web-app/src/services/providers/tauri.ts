@@ -3,8 +3,13 @@
  */
 
 import { ensureRegistryLoaded } from '@/stores/provider-registry-store'
+import { DEFAULT_CTX_LEN } from '@janhq/core'
 import { providerModels } from '@/constants/models'
-import { EngineManager, SettingComponentProps } from '@janhq/core'
+import {
+  EngineManager,
+  ReasoningControls,
+  SettingComponentProps,
+} from '@janhq/core'
 import { ModelCapabilities } from '@/types/models'
 import { modelSettings } from '@/lib/predefined'
 import { ExtensionManager } from '@/lib/extension'
@@ -88,6 +93,19 @@ function extractModelIds(rawText: string, providerLabel: string): string[] {
     // Alternative shape: { models: [...] }
     ids = (obj.models as unknown[]).map(idOf).filter(Boolean)
   } else {
+    // An error envelope served with a 2xx (some gateways do this for an
+    // invalid token) used to read as "this server has no models" (#293).
+    // Say what the server actually said instead.
+    const envelope = obj?.error
+    const message =
+      envelope && typeof envelope === 'object' && 'message' in envelope
+        ? String((envelope as { message?: unknown }).message ?? '')
+        : typeof envelope === 'string'
+          ? envelope
+          : ''
+    if (message) {
+      throw new Error(`${providerLabel} returned an error: ${message}`)
+    }
     console.warn('Unexpected response format from provider API:', data)
     return []
   }
@@ -95,6 +113,66 @@ function extractModelIds(rawText: string, providerLabel: string): string[] {
   // Some aggregators (e.g. AIML API) list the same model id more than once —
   // dedupe so the UI doesn't show identical rows. Preserve first-seen order.
   return Array.from(new Set(ids))
+}
+
+/** A context length worth keeping: a positive number, or a string of one. */
+const isUsableCtxLen = (value: unknown): boolean => {
+  const n = typeof value === 'string' ? parseInt(value, 10) : value
+  return typeof n === 'number' && Number.isFinite(n) && n > 0
+}
+
+type ModelProbe = { tools: boolean; reasoning?: ReasoningControls }
+type ProbedEngine = {
+  isToolSupported: (modelId: string) => Promise<boolean>
+  getReasoningControls: (modelId: string) => Promise<ReasoningControls>
+}
+
+const PROBE_TTL_MS = 60_000
+const probeCache = new Map<string, { at: number; result: Promise<ModelProbe> }>()
+
+/** Test hook: forget every cached probe. */
+export const resetModelProbeCache = () => probeCache.clear()
+
+/**
+ * Whether a model takes tools and which reasoning controls it has. Both are read
+ * out of the model file by the engine, and `getProviders()` asks for every model
+ * of every engine on each call — every three seconds while the provider page
+ * waits for a backend to be configured. One answer per model per minute, a
+ * failure included: a file that cannot be parsed is reported once, not on
+ * every poll. The size is part of the key so that a replaced file is asked anew.
+ */
+export function probeModel(
+  providerName: string,
+  engine: ProbedEngine,
+  model: { id: string; sizeBytes?: number },
+  want: { tools: boolean; reasoning: boolean }
+): Promise<ModelProbe> {
+  const key = JSON.stringify([providerName, model.id, model.sizeBytes ?? null, want])
+  const cached = probeCache.get(key)
+  if (cached && Date.now() - cached.at < PROBE_TTL_MS) return cached.result
+
+  const result = (async (): Promise<ModelProbe> => {
+    const probe: ModelProbe = { tools: false }
+    if (want.tools) {
+      try {
+        probe.tools = Boolean(await engine.isToolSupported(model.id))
+      } catch (error) {
+        console.warn(`Failed to check tool support for model ${model.id}:`, error)
+        // Continue without tool capabilities if check fails
+      }
+    }
+    if (want.reasoning) {
+      try {
+        probe.reasoning = await engine.getReasoningControls(model.id)
+      } catch (error) {
+        console.warn(`Failed to detect reasoning controls for model ${model.id}:`, error)
+        // Continue without an effort selector if detection fails
+      }
+    }
+    return probe
+  })()
+  probeCache.set(key, { at: Date.now(), result })
+  return result
 }
 
 export class TauriProvidersService extends DefaultProvidersService {
@@ -167,25 +245,21 @@ export class TauriProvidersService extends DefaultProvidersService {
               if ('capabilities' in model && Array.isArray(model.capabilities)) {
                 capabilities = [...(model.capabilities as string[])]
               }
-              if (!capabilities.includes(ModelCapabilities.TOOLS)) {
-                try {
-                  const toolSupported = await value.isToolSupported(model.id)
-                  if (toolSupported) {
-                    capabilities.push(ModelCapabilities.TOOLS)
-                  }
-                } catch (error) {
-                  console.warn(
-                    `Failed to check tool support for model ${model.id}:`,
-                    error
-                  )
-                  // Continue without tool capabilities if check fails
-                }
-              }
+              // Both answers come from the model file; see `probeModel`.
+              const probe = await probeModel(providerName, value, model, {
+                tools: !capabilities.includes(ModelCapabilities.TOOLS),
+                reasoning: !model.embedding,
+              })
+              if (probe.tools) capabilities.push(ModelCapabilities.TOOLS)
 
               // Add embeddings capability for embedding models
               if (model.embedding && !capabilities.includes(ModelCapabilities.EMBEDDINGS)) {
                 capabilities = [...capabilities, ModelCapabilities.EMBEDDINGS]
               }
+
+              // Which reasoning knobs the model's chat template understands.
+              // Drives the effort selector in the chat input.
+              const reasoning = probe.reasoning
 
               return {
                 id: model.id,
@@ -193,9 +267,16 @@ export class TauriProvidersService extends DefaultProvidersService {
                 name: model.name,
                 description: model.description,
                 capabilities,
+                reasoning,
                 embedding: model.embedding, // Preserve embedding flag for filtering in UI
-                // Origin of an imported model, for the UI badge.
+                // Origin of an imported model, for the UI badge — and for
+                // `model_load.import_source`, which is the only way to tell an
+                // imported model from a re-load of one downloaded earlier.
                 source: (model as { source?: Model['source'] }).source,
+                // On-disk size, summed across shards when the engine imported
+                // it. Dropped here until now, which is why `model_load` had no
+                // size at all and `size_bucket` existed only on downloads.
+                sizeBytes: (model as { sizeBytes?: number }).sizeBytes,
                 // Broken-link flag: keep out of auto-start, flag in the UI.
                 missing: (model as { missing?: boolean }).missing,
                 // Absolute weights path, for deduping scan candidates.
@@ -204,8 +285,12 @@ export class TauriProvidersService extends DefaultProvidersService {
                 settings: Object.values(modelSettings).reduce(
                   (acc, setting) => {
                     let value = setting.controller_props.value
-                    if (setting.key === 'ctx_len') {
-                      value = 16384 // Default context length for Llama.cpp models
+                    // A missing or unusable context length gets the default;
+                    // a value the user set is theirs. This used to overwrite
+                    // every model's `ctx_len` with 16384 on every load, so
+                    // the setting could be edited but never kept (ATO-465).
+                    if (setting.key === 'ctx_len' && !isUsableCtxLen(value)) {
+                      value = DEFAULT_CTX_LEN
                     }
                     acc[setting.key] = {
                       ...setting,
@@ -317,8 +402,11 @@ export class TauriProvidersService extends DefaultProvidersService {
           )
 
           // HTTP status errors (404/401/403/5xx) are deterministic — retrying
-          // the same URL won't help, so stop the retry loop.
-          if (msg.startsWith('HTTP ')) break
+          // the same URL won't help, so stop the retry loop. So is an IPC
+          // command that does not exist on this platform: retrying that just
+          // burned ~0.9s before failing anyway (#293).
+          if (msg.startsWith('HTTP ') || /not found|not allowed/i.test(msg))
+            break
           // Transport errors (connection reset, stale pooled socket, body
           // read) are worth a quick retry with a fresh request.
           if (attempt < MAX_ATTEMPTS) {

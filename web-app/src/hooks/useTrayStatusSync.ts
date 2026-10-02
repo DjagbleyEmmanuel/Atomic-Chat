@@ -6,6 +6,7 @@ import { useShallow } from 'zustand/react/shallow'
 import { useAppState } from '@/hooks/useAppState'
 import { useLocalApiServer } from '@/hooks/useLocalApiServer'
 import { createSafeUnlisten } from '@/lib/tauriEvent'
+import { setLocalApiServerRunning } from '@/utils/localApiServerControl'
 
 type SystemUsage = {
   cpu: number
@@ -13,13 +14,15 @@ type SystemUsage = {
   total_memory: number
 }
 
-type MlxSession = {
+/** One entry of `list_local_sessions`: a model `atomic-chat-core` is serving right now. */
+type LocalSession = {
   pid: number
   port: number
   model_id: string
   model_path: string
   is_embedding: boolean
   api_key: string
+  provider: string
 }
 
 type TrayStatusPayload = {
@@ -74,13 +77,15 @@ export function useTrayStatusSync(): void {
           invoke<SystemUsage>('plugin:hardware|get_system_usage').catch(
             () => null
           ),
-          invoke<MlxSession[]>('plugin:mlx|get_mlx_all_sessions').catch(
-            () => [] as MlxSession[]
+          invoke<LocalSession[]>('list_local_sessions').catch(
+            () => [] as LocalSession[]
           ),
         ])
 
-        // Prefer an active MLX session (authoritative: a running inference process),
-        // fall back to `activeModels` which also tracks non-MLX engines.
+        // Prefer the sessions the core is serving (authoritative: running inference
+        // processes of llama.cpp, llama.cpp upstream and MLX), fall back to
+        // `activeModels`, which also tracks engines the resolver does not list
+        // (Foundation Models).
         const modelLabel = (() => {
           const nonEmbedding = sessions.filter((s) => !s.is_embedding)
           if (nonEmbedding.length === 1) return nonEmbedding[0].model_id
@@ -130,7 +135,8 @@ export function useTrayStatusSync(): void {
   // back from Rust, and reuses the same `startServer` / `stopServer` service
   // calls the Local API Server settings page already uses.
   //
-  // Note: the start path here mirrors `local-api-server.tsx` minus the
+  // Note: this deliberately calls the plain `setLocalApiServerRunning`
+  // util rather than `useLocalApiServerControl`, so it skips the
   // `ensureModelForServer(...)` step. Auto-loading a default model from a
   // tray-only context would surface UI (toasts, error dialogs) that the user
   // can't see without opening the app first; the assumption is that anyone
@@ -155,48 +161,19 @@ export function useTrayStatusSync(): void {
 
     register(
       listen<unknown>('tray-stop-server', () => {
-        const { setServerStatus } = useAppState.getState()
-        setServerStatus('pending')
-        window.core?.api
-          ?.stopServer()
-          .then(() => setServerStatus('stopped'))
-          .catch((error: unknown) => {
-            console.error('[tray] stop server failed', error)
-            // Reset to stopped so the tray button doesn't get stuck in a
-            // permanently-pending state if teardown errored partway through.
-            setServerStatus('stopped')
-          })
+        // `setLocalApiServerRunning` also resets the status to 'stopped' on
+        // failure, so the tray button can't get stuck permanently pending.
+        setLocalApiServerRunning(false).catch((error: unknown) => {
+          console.error('[tray] stop server failed', error)
+        })
       })
     )
 
     register(
       listen<unknown>('tray-start-server', () => {
-        const { setServerStatus } = useAppState.getState()
-        const cfg = useLocalApiServer.getState()
-        setServerStatus('pending')
-        window.core?.api
-          ?.startServer({
-            host: cfg.serverHost,
-            port: cfg.serverPort,
-            prefix: cfg.apiPrefix,
-            apiKey: cfg.apiKey,
-            trustedHosts: cfg.trustedHosts,
-            isCorsEnabled: cfg.corsEnabled,
-            isVerboseEnabled: cfg.verboseLogs,
-            proxyTimeout: cfg.proxyTimeout,
-          })
-          .then((actualPort: number) => {
-            // Mobile uses port 0 (auto-assign) so persist whatever port the
-            // proxy actually bound to — same handling as the settings page.
-            if (actualPort && actualPort !== cfg.serverPort) {
-              useLocalApiServer.getState().setServerPort(actualPort)
-            }
-            setServerStatus('running')
-          })
-          .catch((error: unknown) => {
-            console.error('[tray] start server failed', error)
-            setServerStatus('stopped')
-          })
+        setLocalApiServerRunning(true).catch((error: unknown) => {
+          console.error('[tray] start server failed', error)
+        })
       })
     )
 

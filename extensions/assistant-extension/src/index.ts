@@ -1,30 +1,11 @@
 import { Assistant, AssistantExtension, fs, joinPath } from '@janhq/core'
-
-/**
- * Atomic Chat default assistant instructions.
- *
- * Deliberately does NOT ask the model to narrate its thought process: models
- * that follow that instruction dump their reasoning as plain text, which then
- * renders as a normal message (outside the reasoning UI) and can crowd out the
- * actual answer. Reasoning is requested internally via the backend thinking
- * flag instead, and the model is told to output only its final answer.
- */
-const ATOMIC_CHAT_INSTRUCTIONS = `You are Atomic Chat, a helpful AI assistant who assists users with their requests. Atomic Chat is trained by Atomic Chat (https://atomic.chat).
-
-You must output your response in the exact language used in the latest user message. Do not provide translations or switch languages unless explicitly instructed to do so. If the input is mostly English, respond in English.
-
-Reason through requests before responding, but keep your reasoning internal — never narrate or show your thought process. Output only your final answer.
-
-You have tools to search for and access real-time, up-to-date data. Use them whenever the answer requires current or external information. Search before stating that you can't or don't know.
-
-Current date: {{current_date}}`
-
+import { priorDefaultInstructions } from './legacy-default-instructions'
 /**
  * JanAssistantExtension is an AssistantExtension implementation that provides
  * functionality for managing assistants.
  */
 export default class JanAssistantExtension extends AssistantExtension {
-  private readonly CURRENT_MIGRATION_VERSION = 3
+  private readonly CURRENT_MIGRATION_VERSION = 4
   private readonly MIGRATION_FILE = 'file://assistants/.migration_version'
 
   /**
@@ -87,167 +68,36 @@ export default class JanAssistantExtension extends AssistantExtension {
   private async runMigrations(): Promise<void> {
     const currentVersion = await this.getCurrentMigrationVersion()
 
-    if (currentVersion < 1) {
-      console.log('Running migration v1: Update assistant instructions')
-      await this.migrateAssistantInstructions()
-      await this.saveMigrationVersion(1)
+    if (currentVersion < this.CURRENT_MIGRATION_VERSION) {
+      // v4 supersedes v1–v3. Running their broad matches first could destroy
+      // customized prompts before the exact-match migration gets to see them.
+      await this.migrateDefaultInstructions()
+      await this.saveMigrationVersion(this.CURRENT_MIGRATION_VERSION)
     }
-
-    if (currentVersion < 2) {
-      console.log('Running migration v2: Update to Atomic Chat instructions')
-      await this.migrateToAtomicChatInstructions()
-      await this.saveMigrationVersion(2)
-    }
-
-    if (currentVersion < 3) {
-      console.log('Running migration v3: Stop narrating the thought process')
-      await this.migrateToDirectAnswerInstructions()
-      await this.saveMigrationVersion(3)
-    }
-
-    console.log(
-      `Migrations complete. Current version: ${this.CURRENT_MIGRATION_VERSION}`
-    )
   }
 
-  /**
-   * Migration v1: Update assistant instructions from old format to new format
-   */
-  private async migrateAssistantInstructions(): Promise<void> {
-    const OLD_INSTRUCTION = 'You are a helpful AI assistant.'
-    const NEW_INSTRUCTION = 'You are Atomic Chat, a helpful AI assistant.'
-
-    if (!(await fs.existsSync('file://assistants'))) {
-      return
-    }
-
+  private async migrateDefaultInstructions(): Promise<void> {
     const assistants = await this.getAssistants()
-
     for (const assistant of assistants) {
-      // Check if this assistant has the old instruction format
-      if (assistant.instructions?.startsWith(OLD_INSTRUCTION)) {
-        // Replace old instruction with new one, preserving the rest of the content
-        const restOfInstructions = assistant.instructions.substring(
-          OLD_INSTRUCTION.length
-        )
-        assistant.instructions = NEW_INSTRUCTION + restOfInstructions
+      if (!priorDefaultInstructions.has(assistant.instructions)) continue
 
-        // Save the updated assistant
-        const assistantPath = await joinPath([
-          'file://assistants',
-          assistant.id,
-          'assistant.json',
-        ])
-
-        try {
-          await fs.writeFileSync(
-            assistantPath,
-            JSON.stringify(assistant, null, 2)
-          )
-          console.log(`Migrated instructions for assistant: ${assistant.id}`)
-        } catch (error) {
-          console.error(`Failed to migrate assistant ${assistant.id}:`, error)
-        }
+      const migrated: Assistant = {
+        ...assistant,
+        instructions: this.defaultAssistant.instructions,
       }
-    }
-  }
-
-  /**
-   * Migration v2: Update assistant instructions to Atomic Chat format and set default parameters
-   */
-  private async migrateToAtomicChatInstructions(): Promise<void> {
-    const OLD_INSTRUCTION_PREFIX = 'You are Jan, a helpful AI assistant.'
-    const NEW_INSTRUCTION = ATOMIC_CHAT_INSTRUCTIONS
-
-    const DEFAULT_PARAMETERS = {
-      temperature: 0.7,
-      top_k: 20,
-      top_p: 0.8,
-      repeat_penalty: 1.12,
-    }
-
-    if (!(await fs.existsSync('file://assistants'))) {
-      return
-    }
-
-    const assistants = await this.getAssistants()
-
-    for (const assistant of assistants) {
-      // Check if this assistant has the old instruction format
-      if (assistant.instructions?.startsWith(OLD_INSTRUCTION_PREFIX)) {
-        assistant.instructions = NEW_INSTRUCTION
-
-        // Add default parameters to the assistant
-        const assistantWithParams = {
-          ...assistant,
-          parameters: DEFAULT_PARAMETERS,
-        }
-
-        // Save the updated assistant
-        const assistantPath = await joinPath([
-          'file://assistants',
-          assistant.id,
-          'assistant.json',
-        ])
-
-        try {
-          await fs.writeFileSync(
-            assistantPath,
-            JSON.stringify(assistantWithParams, null, 2)
-          )
-          console.log(
-            `Migrated to Menlo instructions for assistant: ${assistant.id}`
-          )
-        } catch (error) {
-          console.error(`Failed to migrate assistant ${assistant.id}:`, error)
-        }
+      if (assistant.name === 'Jan') {
+        migrated.name = this.defaultAssistant.name
       }
-    }
-  }
-
-  /**
-   * Migration v3: stop instructing the model to narrate its thought process.
-   * The v2 instructions told the assistant to "articulate your complete
-   * thought process in natural language", which made models emit their
-   * reasoning as plain text (shown outside the reasoning UI) and sometimes
-   * omit the actual answer. Replace with the direct-answer format.
-   */
-  private async migrateToDirectAnswerInstructions(): Promise<void> {
-    const OLD_FORMAT_MARKER = 'Mandatory logical analysis'
-
-    if (!(await fs.existsSync('file://assistants'))) {
-      return
-    }
-
-    const assistants = await this.getAssistants()
-
-    for (const assistant of assistants) {
       if (
-        !assistant.instructions?.includes(OLD_FORMAT_MARKER) &&
-        !assistant.instructions?.startsWith('You are Jan,')
+        assistant.description ===
+        'Jan is a helpful desktop assistant that can reason through complex tasks and use tools to complete them on the user’s behalf.'
       ) {
-        continue
+        migrated.description = this.defaultAssistant.description
       }
 
-      assistant.instructions = ATOMIC_CHAT_INSTRUCTIONS
-
-      const assistantPath = await joinPath([
-        'file://assistants',
-        assistant.id,
-        'assistant.json',
-      ])
-
-      try {
-        await fs.writeFileSync(
-          assistantPath,
-          JSON.stringify(assistant, null, 2)
-        )
-        console.log(
-          `Migrated to direct-answer instructions for assistant: ${assistant.id}`
-        )
-      } catch (error) {
-        console.error(`Failed to migrate assistant ${assistant.id}:`, error)
-      }
+      // Propagate write failures so the version is not advanced; successfully
+      // migrated assistants no longer match, making the next launch safe to retry.
+      await this.createAssistant(migrated)
     }
   }
 
@@ -313,7 +163,8 @@ export default class JanAssistantExtension extends AssistantExtension {
     description:
       'Atomic Chat is a helpful desktop assistant that can reason through complex tasks and use tools to complete them on the user’s behalf.',
     model: '*',
-    instructions: ATOMIC_CHAT_INSTRUCTIONS,
+    instructions:
+      'You are Atomic Chat, a helpful AI assistant.\n\nCurrent date: {{current_date}}',
     tools: [
       {
         type: 'retrieval',

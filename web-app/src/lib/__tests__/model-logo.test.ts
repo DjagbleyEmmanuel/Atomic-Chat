@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
+import { BASELINE_DIFFUSION_CATALOG } from '@/services/diffusion-catalog-baseline'
 import {
+  DIFFUSION_FAMILY_ICON_KEYS,
   HUGGINGFACE_LOGO_SRC,
   iconKeyLogoSrc,
   isMonochromeFamilyLogo,
@@ -83,8 +85,9 @@ describe('modelFamilyLogoSrc', () => {
       '/images/model-provider/nvidia.svg'
     )
     expect(modelFamilyLogoSrc('unsloth/gpt-oss-20b-GGUF')).toBe(
-      '/images/model-provider/openai.svg'
+      '/svg/openai-mark.svg'
     )
+    expect(isMonochromeFamilyLogo('/svg/openai-mark.svg')).toBe(true)
     expect(modelFamilyLogoSrc('ibm-granite/granite-4.0-h-tiny-GGUF')).toBe(
       '/svg/ibm.svg'
     )
@@ -118,6 +121,55 @@ describe('modelFamilyLogoSrc', () => {
   })
 })
 
+describe('image and video families', () => {
+  it('gives every family in the offline catalog a bundled mark, by id and by name', () => {
+    for (const family of BASELINE_DIFFUSION_CATALOG.families) {
+      const byId = iconKeyLogoSrc(DIFFUSION_FAMILY_ICON_KEYS[family.id])
+      expect(byId, `no icon key for "${family.id}"`).toBeTruthy()
+      // A card drawn from the family name must not show another mark than one
+      // drawn from its id.
+      expect(
+        modelFamilyLogoSrc(family.name),
+        `name rule for "${family.name}"`
+      ).toBe(byId)
+    }
+  })
+
+  it('draws each family under its publisher', () => {
+    expect(modelFamilyLogoSrc('FLUX.2 Klein 4B')).toBe('/svg/bfl.svg')
+    expect(modelFamilyLogoSrc('black-forest-labs/FLUX.1-schnell')).toBe(
+      '/svg/bfl.svg'
+    )
+    expect(modelFamilyLogoSrc('city96/flux1-dev-gguf')).toBe('/svg/bfl.svg')
+    expect(modelFamilyLogoSrc('Z-Image Turbo')).toBe('/svg/z-image.svg')
+    expect(modelFamilyLogoSrc('Qwen-Image')).toBe('/svg/qwen-color.svg')
+    expect(modelFamilyLogoSrc('Wan 2.2 TI2V 5B')).toBe('/svg/qwen-color.svg')
+    expect(modelFamilyLogoSrc('Wan-AI/Wan2.2-TI2V-5B')).toBe(
+      '/svg/qwen-color.svg'
+    )
+    expect(modelFamilyLogoSrc('Lightricks/LTX-2')).toBe('/svg/lightricks.svg')
+    expect(modelFamilyLogoSrc('Lightricks/LTX-Video')).toBe(
+      '/svg/lightricks.svg'
+    )
+  })
+
+  it('does not hand text models an image-lab mark', () => {
+    expect(modelFamilyLogoSrc('someone/Swan-7B-GGUF')).toBeNull()
+    expect(modelFamilyLogoSrc('someone/influx-3b')).toBeNull()
+  })
+
+  it('ships the new marks as files and tints the single-color ones', async () => {
+    const { existsSync } = await import('node:fs')
+    const { resolve } = await import('node:path')
+    for (const src of ['/svg/bfl.svg', '/svg/lightricks.svg']) {
+      expect(existsSync(resolve(__dirname, '../../../public', `.${src}`))).toBe(
+        true
+      )
+      expect(isMonochromeFamilyLogo(src)).toBe(true)
+    }
+  })
+})
+
 describe('isMonochromeFamilyLogo', () => {
   it('flags marks that must be tinted through a CSS mask', () => {
     expect(isMonochromeFamilyLogo('/svg/liquid.svg')).toBe(true)
@@ -125,7 +177,30 @@ describe('isMonochromeFamilyLogo', () => {
     expect(isMonochromeFamilyLogo('/svg/nousresearch.svg')).toBe(true)
     expect(isMonochromeFamilyLogo('/svg/zai.svg')).toBe(true)
     expect(isMonochromeFamilyLogo('/svg/minimax.svg')).toBe(true)
+    // A dark mark on transparency: a plain <img> loses it in dark mode.
+    expect(
+      isMonochromeFamilyLogo('/images/model-provider/prism-ml.webp')
+    ).toBe(true)
+    expect(isMonochromeFamilyLogo('/images/model-provider/ling.webp')).toBe(
+      false
+    )
     expect(isMonochromeFamilyLogo('/svg/qwen-color.svg')).toBe(false)
     expect(isMonochromeFamilyLogo('/svg/ai2-color.svg')).toBe(false)
+  })
+})
+
+describe('bundled Google mark', () => {
+  it('ships the 2025 gradient "G", not the flat four-colour one', async () => {
+    // Google redrew the "G" in May 2025: the four flat segments became one
+    // continuous gradient. The resolver keeps the old path so nothing else
+    // changes; the file behind it is what has to be current.
+    const { readFileSync } = await import('node:fs')
+    const { resolve } = await import('node:path')
+    const svg = readFileSync(
+      resolve(__dirname, '../../../public/svg/google-color.svg'),
+      'utf8'
+    )
+    expect(svg).toContain('<linearGradient')
+    expect(svg).not.toMatch(/#EA4335|#4285F4|#FBBC05|#34A853/i)
   })
 })

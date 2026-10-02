@@ -1,11 +1,14 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { Card, CardItem } from '@/containers/Card'
+import { DecisionModelsSection } from '@/containers/DecisionModelsSection'
 import HeaderPage from '@/containers/HeaderPage'
 import SettingsMenu from '@/containers/SettingsMenu'
 import { useModelProvider } from '@/hooks/useModelProvider'
 import { isOnboardingPending } from '@/lib/onboarding'
 import { captureProviderKeyConfigured } from '@/lib/onboarding-telemetry'
 import { buildApiKeyUpdate } from '@/lib/provider-api-key'
+import { isLocalEngineProvider } from '@/lib/cloud-providers'
+import { refreshProviderModels } from '@/lib/refresh-provider-models'
 import {
   cn,
   getProviderTitle,
@@ -15,6 +18,7 @@ import {
 import {
   createFileRoute,
   Link,
+  redirect,
   useNavigate,
   useParams,
 } from '@tanstack/react-router'
@@ -43,6 +47,12 @@ import { DialogDeleteModel } from '@/containers/dialogs/DeleteModel'
 import { FavoriteModelAction } from '@/containers/FavoriteModelAction'
 import { route } from '@/constants/routes'
 import DeleteProvider from '@/containers/dialogs/DeleteProvider'
+import { ResetEngineSettings } from '@/containers/dialogs/ResetEngineSettings'
+import {
+  customEngineSettingKeys,
+  hasEngineSettingDefaults,
+  withDefaultEngineSettings,
+} from '@/lib/engine-settings-defaults'
 import { useServiceHub } from '@/hooks/useServiceHub'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
@@ -55,6 +65,7 @@ import {
   isKeylessRemoteProvider,
   isLocalProvider,
   isLoopbackUrl,
+  isSubscriptionProvider,
   unregisterRemoteProvider,
 } from '@/utils/registerRemoteProvider'
 import { syncActiveModelsFromEngines } from '@/utils/activeModelsSync'
@@ -70,14 +81,11 @@ import {
 import { useBackendMismatch } from '@/hooks/useBackendMismatch'
 import { toast } from 'sonner'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import {
-  isKnownProvider,
-  useProviderRegistryStore,
-} from '@/stores/provider-registry-store'
+import { isKnownProvider } from '@/stores/provider-registry-store'
 import { EMBEDDING_MODEL_ID } from '@/constants/models'
 import { getModelCapabilities } from '@/lib/models'
 import { useModelLoad } from '@/hooks/useModelLoad'
-import { switchToModel } from '@/utils/switchModel'
+import { stopAllLocalModelsByUser, switchToModel } from '@/utils/switchModel'
 import { useLlamacppDevices } from '@/hooks/useLlamacppDevices'
 import {
   useBackendUpdater,
@@ -93,6 +101,27 @@ import { restartLocalModel } from '@/utils/restartLocalModel'
 
 // as route.threadsDetail
 export const Route = createFileRoute('/settings/providers/$providerName')({
+  /**
+   * Cloud providers are configured on `/cloud` now. The route stays alive
+   * because bookmarks, the model picker's gear and `DeleteProvider` all point
+   * at it; it just forwards.
+   *
+   * `beforeLoad` rather than a redirect inside the component: it runs outside
+   * React, so it cannot disturb the hook order of a 2800-line component. An
+   * unresolved provider (zustand-persist not rehydrated yet on a cold start)
+   * falls through to the page's own "no provider" render instead of bouncing.
+   */
+  beforeLoad: ({ params }) => {
+    const provider = useModelProvider
+      .getState()
+      .getProviderByName(params.providerName)
+    if (provider && !isLocalEngineProvider(provider)) {
+      throw redirect({
+        to: route.cloud.index,
+        search: { provider: params.providerName },
+      })
+    }
+  },
   component: ProviderDetail,
   validateSearch: (search: Record<string, unknown>): { step?: string } => {
     // validate and parse the search params into a typed state
@@ -111,6 +140,7 @@ function ProviderDetail() {
     useShallow((state) => [state.activeModels, state.setActiveModels])
   )
   const [loadingModels, setLoadingModels] = useState<string[]>([])
+  const [stoppingModels, setStoppingModels] = useState<string[]>([])
   const [refreshingModels, setRefreshingModels] = useState(false)
   const [isInstallingBackend, setIsInstallingBackend] = useState(false)
   const [isRecheckingBackend, setIsRecheckingBackend] = useState(false)
@@ -315,6 +345,30 @@ function ProviderDetail() {
     },
     [debouncedRestartLlamacppModel]
   )
+
+  // "Reset settings" for a local engine (see `engine-settings-defaults`),
+  // written like any other change here: queued behind earlier writes, then a
+  // loaded model restarts to pick the values up.
+  const customEngineKeys = provider
+    ? customEngineSettingKeys(provider.provider, provider.settings)
+    : []
+  const handleResetEngineSettings = () => {
+    if (!provider || customEngineKeys.length === 0) return
+    const settings = withDefaultEngineSettings(
+      provider.provider,
+      provider.settings
+    )
+    updateProvider(provider.provider, { settings })
+    providerSettingsWriteRef.current = providerSettingsWriteRef.current
+      .catch((error) => {
+        console.error('Previous provider settings update failed:', error)
+      })
+      .then(() =>
+        serviceHub.providers().updateSettings(provider.provider, settings)
+      )
+    debouncedRestartLlamacppModel(provider.provider)
+    toast.success(t('providers:resetEngineSettings.success'))
+  }
 
   const hasDownloadedModels =
     (provider?.models.filter((m) => m.id !== EMBEDDING_MODEL_ID).length ?? 0) >
@@ -657,21 +711,25 @@ function ProviderDetail() {
             .fetchModelsFromProvider(prov)
           if (cancelled) return
 
-          const existing = new Set(prov.models.map((m) => m.id))
+          // The provider as it is now, not as it was before the request: the
+          // key or a setting may have been edited while it ran, and writing the
+          // earlier snapshot back would undo that. Only `models` is written.
+          const current =
+            useModelProvider.getState().getProviderByName(providerName) ?? prov
+          const existing = new Set(current.models.map((m) => m.id))
           const newModels = liveIds
             .filter((id) => !existing.has(id))
             .map((id) => ({
               id,
               model: id,
               name: id,
-              capabilities: getModelCapabilities(prov.provider, id),
+              capabilities: getModelCapabilities(current.provider, id),
               version: '1.0',
             }))
 
           if (newModels.length > 0) {
-            updateProvider(prov.provider, {
-              ...prov,
-              models: [...prov.models, ...newModels],
+            updateProvider(current.provider, {
+              models: [...current.models, ...newModels],
             })
           }
         } catch (err) {
@@ -698,158 +756,12 @@ function ProviderDetail() {
 
     setRefreshingModels(true)
     try {
-      // Step 1 — Pull the latest manifest from our remote registry on GitHub
-      // (the curated source for known cloud providers).
-      try {
-        await useProviderRegistryStore.getState().refresh({ force: true })
-      } catch (err) {
-        console.warn(
-          `[providers:${provider.provider}] registry refresh failed:`,
-          err
-        )
-      }
-
-      const state = useProviderRegistryStore.getState()
-      if (state.error) {
-        toast.error(t('providers:models'), {
-          description: state.error,
-        })
-        return
-      }
-
-      // Count models that will newly appear on this provider after the
-      // registry merge — for the success toast.
-      const fresh = await serviceHub.providers().getProviders()
-      const registryProvider = fresh.find(
-        (p) => p.provider === provider.provider
-      )
-      const existingIds = new Set(provider.models.map((m) => m.id))
-      let newCount = registryProvider
-        ? registryProvider.models.filter((m) => !existingIds.has(m.id)).length
-        : 0
-
-      // Step 2 — Hybrid: also query the provider's live /v1/models endpoint
-      // (ATO-209). The registry only covers known cloud providers; custom /
-      // self-hosted providers (vLLM, llama-server, LM Studio, etc.) are
-      // invisible to the registry, so this is the only path that surfaces
-      // their actual model list. We do it for all non-local providers that
-      // have a base_url configured. Errors are non-fatal — if the live
-      // endpoint is unavailable we still apply the registry results, but we
-      // remember the error so the toast can warn instead of falsely claiming
-      // "no new models" (ATO-210).
-      //
-      // P2 (ATO — registry-driven behavior): a registry provider may opt out
-      // of live model listing via `supports_model_listing: false` (some clouds
-      // expose hundreds of junk/internal IDs at /v1/models). When the flag is
-      // explicitly false we show the curated registry list only and skip the
-      // live probe. Missing/true keeps the hybrid behavior.
-      let liveNewModels: Model[] = []
-      let liveFetchError: Error | null = null
-      const registrySupportsListing =
-        registryProvider?.supports_model_listing !== false
-      if (
-        provider.base_url &&
-        !isLocalProvider(provider.provider) &&
-        registrySupportsListing
-      ) {
-        try {
-          const liveModelIds = await serviceHub
-            .providers()
-            .fetchModelsFromProvider(provider)
-
-          // Collect IDs already present after the registry pass so we only
-          // add genuinely new entries.
-          const afterRegistryIds = new Set([
-            ...existingIds,
-            ...(registryProvider?.models ?? []).map((m) => m.id),
-          ])
-          liveNewModels = liveModelIds
-            .filter((id) => !afterRegistryIds.has(id))
-            .map((id) => ({
-              id,
-              model: id,
-              name: id,
-              capabilities: getModelCapabilities(provider.provider, id),
-              version: '1.0',
-            }))
-
-          if (liveNewModels.length > 0) newCount += liveNewModels.length
-
-          console.info(
-            `[providers:${provider.provider}] live /models: ${liveModelIds.length} total, ${liveNewModels.length} new`
-          )
-        } catch (liveErr) {
-          // Non-fatal: registry results still apply even if the live
-          // endpoint is unreachable or returns an error. We surface the error
-          // in the toast below so the user knows the list may be incomplete.
-          liveFetchError =
-            liveErr instanceof Error ? liveErr : new Error(String(liveErr))
-          console.warn(
-            `[providers:${provider.provider}] live /models fetch failed (non-fatal):`,
-            liveErr
-          )
-        }
-      }
-
-      // Apply the registry refresh. `setProviders` merges catalog updates while
-      // preserving API keys, base URLs, and user-tweaked settings per provider,
-      // and never removes existing models.
-      setProviders(fresh)
-
-      // Persist the live-discovered models onto THIS provider. We cannot inject
-      // into `fresh` because custom / self-hosted providers (AIML, Cerebras,
-      // LM Studio, vLLM, …) are NOT part of getProviders() output — they live
-      // only in useModelProvider state, so the old `fresh.map()` injection
-      // silently dropped them (toast said "Added N" but the list stayed empty).
-      // updateProvider operates on current state and works for both registry
-      // and custom providers.
-      if (liveNewModels.length > 0) {
-        const current =
-          useModelProvider.getState().getProviderByName(provider.provider) ??
-          provider
-        // Dedupe by id (first-seen wins) so both newly fetched duplicates and
-        // any duplicates already persisted from an earlier refresh collapse to
-        // a single row.
-        const byId = new Map<string, Model>()
-        for (const m of [...current.models, ...liveNewModels]) {
-          if (m.id && !byId.has(m.id)) byId.set(m.id, m)
-        }
-        updateProvider(provider.provider, { models: Array.from(byId.values()) })
-      }
-
-      if (newCount > 0) {
-        toast.success(t('providers:models'), {
-          description: t('providers:refreshModelsSuccess', {
-            count: newCount,
-            provider: provider.provider,
-          }),
-        })
-      } else if (liveFetchError) {
-        // Live fetch failed, so the "no new models" result may be incomplete —
-        // warn with the underlying error instead of a misleading success.
-        toast.warning(t('providers:models'), {
-          description: t('providers:refreshModelsLiveFailed', {
-            provider: provider.provider,
-            error:
-              liveFetchError.message ||
-              t('providers:refreshModelsFailed', {
-                provider: provider.provider,
-              }),
-          }),
-        })
-      } else {
-        toast.success(t('providers:models'), {
-          description: t('providers:noNewModels'),
-        })
-      }
-    } catch (err) {
-      console.error(`[providers:${provider.provider}] refresh failed:`, err)
-      const detail =
-        err instanceof Error && err.message
-          ? err.message
-          : t('providers:refreshModelsFailed', { provider: provider.provider })
-      toast.error(t('providers:models'), {
-        description: detail,
+      await refreshProviderModels({
+        provider,
+        serviceHub,
+        setProviders,
+        updateProvider,
+        t,
       })
     } finally {
       setRefreshingModels(false)
@@ -874,12 +786,17 @@ function ProviderDetail() {
     }
   }
 
-  const handleStopModel = async () => {
+  const handleStopModel = async (modelId: string) => {
     if (!provider) return
+    // The unload waits for the engine process to exit; without a pending
+    // state the button looked dead and a second click queued behind the first.
+    setStoppingModels((prev) => [...prev, modelId])
+    const isLocalEngine = isLocalProvider(provider.provider)
     try {
-      const isLocalEngine = isLocalProvider(provider.provider)
       if (isLocalEngine) {
-        await serviceHub.models().stopAllModels()
+        // Recorded as a user stop, so the composer's auto-start does not load
+        // the model straight back when a chat is opened.
+        await stopAllLocalModelsByUser(serviceHub)
       } else {
         // Cloud "stop": drop the proxy registration so incoming chat requests
         // for this provider's models stop being routed upstream. Local engines
@@ -888,12 +805,7 @@ function ProviderDetail() {
       }
       await window.core?.api?.stopServer()
       useAppState.getState().setServerStatus('stopped')
-      if (isLocalEngine) {
-        const models = await serviceHub
-          .models()
-          .getActiveModels(provider.provider)
-        syncActiveModelsFromEngines(models || [])
-      } else {
+      if (!isLocalEngine) {
         // Remove any of this cloud provider's models from the active list
         // while leaving other providers' active entries intact.
         const providerModelIds = new Set(provider.models.map((m) => m.id))
@@ -904,6 +816,21 @@ function ProviderDetail() {
       }
     } catch (error) {
       console.error('Error stopping model:', error)
+      toast.error(
+        t('providers:stopFailed', { defaultValue: 'Could not stop the model' }),
+        { description: error instanceof Error ? error.message : String(error) }
+      )
+    } finally {
+      // Re-read the engines whatever happened above: a failure halfway through
+      // used to leave the row on "Stop" for a model that was already gone.
+      if (isLocalEngine) {
+        const models = await serviceHub
+          .models()
+          .getActiveModels()
+          .catch(() => null)
+        if (models) syncActiveModelsFromEngines(models)
+      }
+      setStoppingModels((prev) => prev.filter((id) => id !== modelId))
     }
   }
 
@@ -1505,7 +1432,7 @@ function ProviderDetail() {
     ]
   )
 
-  /// Toggle the upstream-llama MTP flag (`--spec-type draft-mtp`). Qwen
+  /// Toggle the upstream-llama MTP flag (`--spec-type draft-mtp`). Embedded
   /// capability is read from canonical GGUF metadata; Gemma 4 uses a separate
   /// draft head downloaded by the extension.
   ///
@@ -1555,16 +1482,17 @@ function ProviderDetail() {
       try {
         if (nextEnabled) {
           /// Capability check. Two MTP shapes are supported:
-          ///  - Qwen built-in MTP: canonical GGUF metadata reports the embedded
-          ///    NextN layers (head inside the same GGUF).
+          ///  - Built-in MTP (Qwen3.5/3.6, Qwen3-Next, GLM, DeepSeek and every
+          ///    other upstream MTP architecture): canonical GGUF metadata
+          ///    reports the embedded NextN layers (head inside the same GGUF).
           ///  - Gemma 4 MTP (31B / 26B-A4B): needs a SEPARATE draft head GGUF
           ///    downloaded next to the model (PR #23398).
           /// If the loaded model id is neither, refuse the toggle and surface
           /// the popup — don't write the setting (the Switch stays off).
           if (activeModel) {
-            const isQwenMtp =
+            const isEmbeddedMtp =
               (await engine.checkEmbeddedMtpSupport?.(activeModel)) ?? false
-            if (!isQwenMtp) {
+            if (!isEmbeddedMtp) {
               const isGemmaMtp =
                 (await engine.checkGemmaMtpSupport?.(activeModel)) ?? false
               if (!isGemmaMtp) {
@@ -2022,24 +1950,29 @@ function ProviderDetail() {
               )}
             >
               {/* Settings */}
-              <Card>
+              <Card
+                header={
+                  provider && hasEngineSettingDefaults(provider.provider) ? (
+                    <div className="flex items-center justify-between mb-4">
+                      <h1 className="text-foreground font-medium text-base">
+                        {t('providers:engineSettings')}
+                      </h1>
+                      <ResetEngineSettings
+                        disabled={customEngineKeys.length === 0}
+                        onReset={handleResetEngineSettings}
+                      />
+                    </div>
+                  ) : undefined
+                }
+              >
                 {provider?.settings.map((setting, settingIndex) => {
-                  // Concurrent Mode acts as a master toggle over `parallel`,
-                  // `cont_batching` and `expose_metrics`. When it's on, those
-                  // rows are visually dimmed to signal they're managed.
-                  const concurrentModeOn = !!(
-                    provider?.settings.find((s) => s.key === 'concurrent_mode')
-                      ?.controller_props as { value?: boolean } | undefined
-                  )?.value
-                  const isManagedByConcurrentMode =
-                    concurrentModeOn &&
-                    (setting.key === 'parallel' ||
-                      setting.key === 'cont_batching' ||
-                      setting.key === 'expose_metrics')
-                  // Concurrent Slots only makes sense when Concurrent Mode is
-                  // on; hide the row entirely otherwise to reduce clutter.
-                  const isHiddenByConcurrentMode =
-                    !concurrentModeOn && setting.key === 'concurrent_slots'
+                  // Concurrent Mode is not offered: its rows stay in the core's
+                  // schema, and both llama.cpp extensions switch a stored
+                  // `concurrent_mode: true` off on start
+                  // (migrateConcurrentModeOff).
+                  const isHiddenConcurrentMode =
+                    setting.key === 'concurrent_mode' ||
+                    setting.key === 'concurrent_slots'
 
                   // The DFlash speculative-decoding toggle is the master
                   // switch over `block_size`; the MTP toggle does the
@@ -2243,7 +2176,7 @@ function ProviderDetail() {
                           controllerProps={setting.controller_props}
                           className={cn(
                             setting.key === 'device' && 'hidden',
-                            isHiddenByConcurrentMode && 'hidden',
+                            isHiddenConcurrentMode && 'hidden',
                             isHiddenByDflash && 'hidden'
                           )}
                           onChange={(newValue) => {
@@ -2276,6 +2209,7 @@ function ProviderDetail() {
                             }
                             if (provider) {
                               const newSettings = [...provider.settings]
+                              const changedSettingKeys = new Set([setting.key])
                               // Handle different value types by forcing the type
                               // Use type assertion to bypass type checking
 
@@ -2284,28 +2218,6 @@ function ProviderDetail() {
                                   value: string | boolean | number
                                 }
                               ).value = newValue
-
-                              // Concurrent Mode implies Prometheus /metrics:
-                              // when the user turns the master toggle on,
-                              // reflect the implicit expose_metrics=true in
-                              // the UI so the Prometheus checkbox matches the
-                              // server-side behaviour enforced in args.rs.
-                              if (
-                                setting.key === 'concurrent_mode' &&
-                                newValue === true
-                              ) {
-                                const metricsIdx = newSettings.findIndex(
-                                  (s) => s.key === 'expose_metrics'
-                                )
-                                if (metricsIdx !== -1) {
-                                  (
-                                    newSettings[metricsIdx]
-                                      .controller_props as {
-                                      value: boolean
-                                    }
-                                  ).value = true
-                                }
-                              }
 
                               // Create update object with updated settings
                               const updateObj: Partial<ModelProvider> = {
@@ -2390,6 +2302,13 @@ function ProviderDetail() {
                                 (providerName === 'llamacpp' ||
                                   providerName === 'llamacpp-upstream')
                               ) {
+                                // Backend discovery can update version_backend while this
+                                // page still holds an older provider snapshot. Persist only
+                                // the controls this action changed, so toggling e.g. fit
+                                // cannot overwrite the selected backend and start a download.
+                                const changedSettings = newSettings.filter((item) =>
+                                  changedSettingKeys.has(item.key)
+                                )
                                 providerSettingsWriteRef.current =
                                   providerSettingsWriteRef.current
                                     .catch((error) => {
@@ -2403,7 +2322,7 @@ function ProviderDetail() {
                                         .providers()
                                         .updateSettings(
                                           providerName,
-                                          updateObj.settings ?? []
+                                          changedSettings
                                         )
                                     )
                                 debouncedRestartLlamacppModel(providerName)
@@ -2440,10 +2359,8 @@ function ProviderDetail() {
                       title={setting.title}
                       className={cn(
                         setting.key === 'device' && 'hidden',
-                        isHiddenByConcurrentMode && 'hidden',
-                        isHiddenByDflash && 'hidden',
-                        isManagedByConcurrentMode &&
-                          'opacity-60 pointer-events-none'
+                        isHiddenConcurrentMode && 'hidden',
+                        isHiddenByDflash && 'hidden'
                       )}
                       column={
                         setting.controller_type === 'input' &&
@@ -2474,14 +2391,6 @@ function ProviderDetail() {
                               ),
                             }}
                           />
-                          {setting.key === 'concurrent_slots' &&
-                            concurrentModeOn && (
-                              <div className="mt-1 text-sm text-muted-foreground">
-                                {t(
-                                  'providers:llamacpp.concurrentMode.perSlotContextWarning'
-                                )}
-                              </div>
-                            )}
                           {setting.key === 'version_backend' &&
                             setting.controller_props?.recommended && (
                               <div className="mt-1 text-sm text-muted-foreground">
@@ -2692,6 +2601,10 @@ function ProviderDetail() {
                 <DeleteProvider provider={provider} />
               </Card>
 
+              {/* Decision models: the column is reversed for llama.cpp, so
+                  this shows under the chat models. */}
+              {providerName === 'llamacpp' && <DecisionModelsSection />}
+
               {/* Models */}
               <Card
                 header={
@@ -2875,15 +2788,22 @@ function ProviderDetail() {
                                     provider.provider === 'mlx'
                                   // Cloud providers need an API key before
                                   // they can be "started" (registered with the
-                                  // proxy). Local engines don't.
+                                  // proxy). Local engines don't, and neither do
+                                  // subscriptions — their token lives in the
+                                  // backend, not on the provider object.
                                   const needsApiKey =
                                     !isLocalProvider(provider.provider) &&
                                     !provider.api_key &&
-                                    !isKeylessRemoteProvider(provider)
+                                    !isKeylessRemoteProvider(provider) &&
+                                    !isSubscriptionProvider(provider.provider)
                                   const isActive = activeModels.some(
                                     (activeModel) => activeModel === model.id
                                   )
                                   const isLoading = loadingModels.includes(
+                                    model.id
+                                  )
+
+                                  const isStopping = stoppingModels.includes(
                                     model.id
                                   )
 
@@ -2893,9 +2813,21 @@ function ProviderDetail() {
                                         <Button
                                           size="sm"
                                           variant="destructive"
-                                          onClick={() => handleStopModel()}
+                                          disabled={isStopping}
+                                          onClick={() =>
+                                            handleStopModel(model.id)
+                                          }
                                         >
-                                          {t('providers:stop')}
+                                          {isStopping ? (
+                                            <div className="flex items-center gap-2">
+                                              <IconLoader
+                                                size={16}
+                                                className="animate-spin"
+                                              />
+                                            </div>
+                                          ) : (
+                                            t('providers:stop')
+                                          )}
                                         </Button>
                                       </div>
                                     )

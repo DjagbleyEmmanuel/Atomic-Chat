@@ -1,9 +1,22 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { act, renderHook } from '@testing-library/react'
 import { useThreads } from '../useThreads'
+import { useAgentMode } from '../useAgentMode'
 import type { PathService } from '@/services/path/types'
 import type { ThreadsService } from '@/services/threads/types'
 import { seedServiceHub } from '@/test/service-hub'
+
+const { deleteCollectionSpy } = vi.hoisted(() => ({
+  deleteCollectionSpy: vi.fn().mockResolvedValue(undefined),
+}))
+
+vi.mock('@/lib/extension', () => ({
+  ExtensionManager: {
+    getInstance: () => ({
+      get: () => ({ deleteCollection: deleteCollectionSpy }),
+    }),
+  },
+}))
 
 // Mock ulid
 vi.mock('ulidx', () => ({
@@ -231,6 +244,90 @@ describe('useThreads', () => {
     })
 
     expect(result.current.threads).toEqual({})
+  })
+
+  it('deep-merges metadata updates instead of clobbering siblings', () => {
+    const { result } = renderHook(() => useThreads())
+
+    act(() => {
+      result.current.setThreads([
+        {
+          id: 'thread1',
+          title: 'Thread 1',
+          messages: [],
+          metadata: { project: { id: 'p1', name: 'P1', updated_at: 1 } },
+        },
+      ])
+    })
+
+    act(() => {
+      result.current.updateThread('thread1', {
+        metadata: { hasDocuments: true },
+      })
+    })
+
+    // The partial update must not evict the thread from its project.
+    expect(result.current.threads['thread1'].metadata).toMatchObject({
+      hasDocuments: true,
+      project: { id: 'p1' },
+    })
+  })
+
+  it('cleans up the vector collection with the bare thread id', () => {
+    const { result } = renderHook(() => useThreads())
+
+    act(() => {
+      result.current.setThreads([{ id: 'thread1', title: 'T', messages: [] }])
+    })
+    act(() => {
+      result.current.deleteThread('thread1')
+    })
+
+    // The extension prefixes `attachments_` itself; a pre-prefixed id used to
+    // double up and the real collection was never deleted.
+    expect(deleteCollectionSpy).toHaveBeenCalledWith('thread1')
+    // Exactly one collection, under the bare id, and the thread is gone.
+    expect(deleteCollectionSpy.mock.calls).toEqual([['thread1']])
+    expect(result.current.threads).toEqual({})
+  })
+
+  it('clears per-thread agent state on bulk deletes', () => {
+    const originalRemove = useAgentMode.getState().removeThread
+    // Spy through to the real store action so the cleared state is observable.
+    const removeThread = vi.fn(originalRemove)
+    useAgentMode.setState({ approvalModes: {}, removeThread })
+    useAgentMode.getState().setApprovalMode('projectThread', 'skip')
+    useAgentMode.getState().setApprovalMode('looseThread', 'skip')
+    const { result } = renderHook(() => useThreads())
+
+    act(() => {
+      result.current.setThreads([
+        {
+          id: 'projectThread',
+          title: 'In project',
+          messages: [],
+          metadata: { project: { id: 'p1', name: 'P1', updated_at: 1 } },
+        },
+        { id: 'looseThread', title: 'Loose', messages: [] },
+      ])
+    })
+
+    act(() => {
+      result.current.deleteAllThreadsByProject('p1')
+    })
+    expect(removeThread).toHaveBeenCalledWith('projectThread')
+    expect(useAgentMode.getState().approvalModes).toEqual({
+      looseThread: 'skip',
+    })
+
+    act(() => {
+      result.current.deleteAllThreads()
+    })
+    expect(removeThread).toHaveBeenCalledWith('looseThread')
+    expect(useAgentMode.getState().approvalModes).toEqual({})
+    expect(result.current.threads).toEqual({})
+
+    useAgentMode.setState({ removeThread: originalRemove })
   })
 
   it('should unstar all threads', () => {

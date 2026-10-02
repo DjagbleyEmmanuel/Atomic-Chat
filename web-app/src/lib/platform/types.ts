@@ -61,4 +61,17 @@ export enum PlatformFeature {
 
   // File attachments/RAG UI and tooling (desktop-only for now)
   FILE_ATTACHMENTS = 'fileAttachments',
+
+  // Voice input / dictation. Needs native microphone capture and the local
+  // llama.cpp engine, so desktop only.
+  VOICE_INPUT = 'voiceInput',
+
+  // Signing in with a ChatGPT subscription. Needs a loopback HTTP listener on
+  // a fixed port for the OAuth callback and a place to keep a refresh token
+  // out of browser storage, so desktop only.
+  CHATGPT_SUBSCRIPTION = 'chatgptSubscription',
+
+  // Local image (and later video) generation. Needs the native diffusion
+  // plugin that supervises `sd-server`, so desktop only.
+  MEDIA_GENERATION = 'mediaGeneration',
 }

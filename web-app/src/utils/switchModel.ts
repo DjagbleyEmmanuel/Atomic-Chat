@@ -1,30 +1,44 @@
 import { toast } from 'sonner'
-import { useAppState } from '@/hooks/useAppState'
+import { MODEL_LOAD_CANCELLED_CODE } from '@janhq/core'
+import { modelStopKey, useAppState } from '@/hooks/useAppState'
 import { useLocalApiServer } from '@/hooks/useLocalApiServer'
 import { useModelLoad } from '@/hooks/useModelLoad'
 import { useModelProvider } from '@/hooks/useModelProvider'
+import { readProviderFit } from '@/lib/provider-fit'
+import { DEFAULT_CTX_LEN } from '@/lib/context-size'
 import { useThreads } from '@/hooks/useThreads'
 import { localStorageKey } from '@/constants/localStorage'
 import { showModelLoadErrorToast } from '@/containers/ModelLoadErrorToast'
 import i18n from '@/i18n/setup'
 import type { ServiceHub } from '@/services'
+import type { ModelLoadProgress } from '@/lib/inference-status'
 import {
   isKeylessRemoteProvider,
+  isSubscriptionProvider,
   registerRemoteProvider,
 } from '@/utils/registerRemoteProvider'
 import { syncActiveModelsFromEngines } from '@/utils/activeModelsSync'
-import posthog from 'posthog-js'
 import {
   isRecoverableModelLoadCode,
   loadBackendFromProvider,
+  normalizeModelId,
+  classifyModelLoadFailure,
+  execBackend,
+  gpuOffloadBucket,
   mmprojProjectorType,
+  rememberExecBackend,
   modelLoadSource,
   oomSubtype,
   quantFromModelId,
   sanitizeStderrTail,
   shouldCaptureModelLoadSentry,
   shouldEmitModelLoadFailure,
+  shouldEmitModelLoadSuccess,
+  sizeBucket,
+  type RuntimeDeviceSnapshot,
 } from '@/lib/telemetry'
+import { queuedCapture } from '@/lib/telemetry-queue'
+import { ExtensionManager } from '@/lib/extension'
 import { captureHandledError } from '@/lib/sentry'
 import {
   getProviderTitle,
@@ -39,6 +53,10 @@ type LoadableModel = {
   id: string
   capabilities?: string[]
   settings?: Record<string, ModelSettingEntry>
+  /** Scanner that found an imported model (ollama / lmstudio / unsloth / …). */
+  source?: string
+  /** On-disk size, summed across shards by the engine at import time. */
+  sizeBytes?: number
 }
 
 function settingNum(
@@ -65,6 +83,35 @@ function settingStr(
  * providers do not load weights). PII contract: only ids/enums/numbers; the
  * stderr tail is byte-capped and PII-scrubbed by `sanitizeStderrTail`.
  */
+/**
+ * Ask the engine what the loaded model actually ran on.
+ *
+ * Resolved through `ExtensionManager` rather than the service hub because
+ * only the llama.cpp engines can answer — MLX and foundation-models have no
+ * equivalent, and an older bundled extension will not have the method at all,
+ * so both degrade to `null`. Never throws: telemetry must not break a load.
+ */
+async function readRuntimeDevice(
+  modelId: string
+): Promise<RuntimeDeviceSnapshot | null> {
+  try {
+    const engines = ExtensionManager.getInstance().listExtensions()
+    for (const ext of engines) {
+      const reader = (
+        ext as unknown as {
+          getRuntimeDeviceInfo?: (id: string) => Promise<unknown>
+        }
+      ).getRuntimeDeviceInfo
+      if (typeof reader !== 'function') continue
+      const info = await reader.call(ext, modelId)
+      if (info) return info as RuntimeDeviceSnapshot
+    }
+  } catch (err) {
+    console.debug('runtime device read failed:', err)
+  }
+  return null
+}
+
 function emitModelLoad(
   status: 'success' | 'failed',
   args: {
@@ -73,10 +120,18 @@ function emitModelLoad(
     durationMs: number
     model?: LoadableModel
     error?: unknown
+    isAutoStart?: boolean
+    runtimeDevice?: RuntimeDeviceSnapshot | null
   }
 ): void {
   try {
     const settings = args.model?.settings
+    const backend = loadBackendFromProvider(args.providerName)
+    // ATO-468: successes were never throttled, so a stop/start oscillation
+    // that keeps working emitted without limit. One device produced 62.9% of
+    // every `model_load` event in the project.
+    if (status === 'success' && !shouldEmitModelLoadSuccess(args.modelId, backend))
+      return
     const props: Record<string, unknown> = {
       // NOT `status`. PostHog types a property globally by its observed values,
       // and `api_server_request.status` (an HTTP code) already claimed that
@@ -85,14 +140,47 @@ function emitModelLoad(
       // the Models & Errors dashboard: ~42k events of success/failed were
       // unreadable. Keep this name event-specific.
       load_status: status,
-      model_id: args.modelId,
-      backend: loadBackendFromProvider(args.providerName),
+      model_id: normalizeModelId(args.modelId),
+      backend,
       model_source: modelLoadSource(args.modelId),
+      // Where an imported model came from — the scanner that found it
+      // (ollama / lmstudio / unsloth / hf cache). Persisted in `model.yml` and
+      // already on the store model; `model_source: 'local_disk'` on its own
+      // cannot tell an import from a re-load of something downloaded earlier.
+      import_source: args.model?.source ?? null,
+      // ATO-468: separates loop traffic from loads a user asked for, without
+      // any heuristic — the flag is already on the call.
+      is_auto_start: args.isAutoStart ?? false,
       load_duration_ms: args.durationMs,
       backend_version: settingStr(settings, 'version_backend'),
       ctx: settingNum(settings, 'ctx_len') ?? settingNum(settings, 'ctx_size'),
+      // Under fit the engine sizes the context itself and `ctx` is what the
+      // *previous* load settled on (mirrored back from `/props`), not a
+      // request. Read from the provider, where the flag lives.
+      fit_enabled: readProviderFit(
+        useModelProvider.getState().getProviderByName(args.providerName)
+      ),
+      // The UI setting, i.e. what was *asked for*. 98.3% of events read 100,
+      // the "offload everything" sentinel that is set on every model of every
+      // engine — including MLX, where the concept does not apply. How many
+      // layers actually landed on the GPU is not known here; see ATO-468.
+      n_gpu_layers_requested:
+        settingNum(settings, 'ngl') ?? settingNum(settings, 'n_gpu_layers'),
       n_gpu_layers:
         settingNum(settings, 'ngl') ?? settingNum(settings, 'n_gpu_layers'),
+      size_bucket: sizeBucket(args.model?.sizeBytes),
+      // What actually happened, as opposed to what was asked for. This is the
+      // field "what share of devices run on GPU versus CPU" is counted on.
+      gpu_offload_bucket: gpuOffloadBucket(args.runtimeDevice),
+      gpu_layers_offloaded: args.runtimeDevice?.gpu_layers_offloaded ?? null,
+      gpu_layers_total: args.runtimeDevice?.total_layers ?? null,
+      // The backend that computed, not the build the device downloaded — the
+      // distinction `active_backend` never made.
+      exec_backend: execBackend(args.runtimeDevice),
+      // A CUDA build that cannot find its runtime silently falls back to CPU;
+      // without this that is indistinguishable from a healthy CPU load.
+      cuda_runtime_missing: args.runtimeDevice?.cuda_runtime_missing ?? null,
+      has_device_init_error: Boolean(args.runtimeDevice?.device_init_error),
       is_multimodal:
         (args.model?.capabilities || []).includes('vision') ||
         settingStr(settings, 'mmproj_path') != null,
@@ -106,12 +194,29 @@ function emitModelLoad(
       // and over; drop duplicates within the throttle window so event-weighted
       // metrics aren't dominated by a handful of stuck devices.
       if (!shouldEmitModelLoadFailure(args.modelId, errorCode)) return
+      // The actual OOM flag, from the same predicate the Sentry severity
+      // already uses. On macOS a Metal OOM arrives as
+      // `LLAMA_CPP_PROCESS_ERROR` with the cause only in the stderr tail —
+      // 2251 events across 124 devices, against 16 carrying `OUT_OF_MEMORY` —
+      // so every alert built on `error_code = 'OUT_OF_MEMORY'` was blind to
+      // the whole platform.
+      const isOom = isOutOfMemoryError(err)
       props.error_code = errorCode
+      // Null on 68% of failures, which is why `load_failure_kind` exists.
+      props.load_failure_kind = classifyModelLoadFailure(
+        errorCode,
+        haystack,
+        isOom
+      )
+      props.is_oom = isOom
+      // What `oom_subtype` always was: a memory-domain tag written on every
+      // failure with a default of 'unknown', not a sign of running out.
+      props.memory_domain = oomSubtype(haystack)
       props.oom_subtype = oomSubtype(haystack)
       props.mmproj_projector_type = mmprojProjectorType(haystack)
       props.stderr_tail = sanitizeStderrTail(haystack)
     }
-    posthog.capture('model_load', props)
+    queuedCapture('model_load', props)
   } catch (telemetryError) {
     console.debug('model_load telemetry failed:', telemetryError)
   }
@@ -261,10 +366,192 @@ export function shouldAttemptAutoStart(
   modelId: string
 ): boolean {
   if (isExplicitSwitchPending(providerName, modelId)) return false
+  // Stopped by hand: stays down until the user asks for it again.
+  if (isStoppedByUser(providerName, modelId)) return false
   const prev = autoStartFailures.get(autoStartKey(providerName, modelId))
   if (!prev) return true
   if (prev.terminal) return false
   return Date.now() - prev.ts >= AUTO_START_BACKOFF_MS
+}
+
+function isStoppedByUser(providerName: string, modelId: string): boolean {
+  return useAppState
+    .getState()
+    .userStoppedModels.includes(modelStopKey(providerName, modelId))
+}
+
+function clearUserStop(providerName: string, modelId: string): void {
+  const { userStoppedModels, setUserStoppedModels } = useAppState.getState()
+  const key = modelStopKey(providerName, modelId)
+  if (userStoppedModels.includes(key)) {
+    setUserStoppedModels(userStoppedModels.filter((k) => k !== key))
+  }
+}
+
+/**
+ * Stop every local model because the user asked to (the Stop button), and
+ * remember which ones so {@link shouldAttemptAutoStart} leaves them down.
+ * Without the record, ChatInput's auto-start loaded the model straight back
+ * the moment a chat was on screen, and Stop looked like it did nothing. An
+ * explicit switch — a pick in the dropdown, a Start, or a Send — clears it.
+ */
+export async function stopAllLocalModelsByUser(
+  serviceHub: ServiceHub
+): Promise<void> {
+  const loaded = await Promise.all(
+    LOCAL_PROVIDERS.map(async (provider) => {
+      const models = await serviceHub
+        .models()
+        .getActiveModels(provider)
+        .catch(() => [] as string[])
+      return models.map((modelId) => modelStopKey(provider, modelId))
+    })
+  )
+  // Recorded before the unload: an auto-start that fires while it runs must
+  // already see the model as stopped.
+  const { userStoppedModels, setUserStoppedModels } = useAppState.getState()
+  setUserStoppedModels([...new Set([...userStoppedModels, ...loaded.flat()])])
+  await serviceHub.models().stopAllModels()
+  const { selectedProvider, selectedModel } = useModelProvider.getState()
+  if (
+    selectedModel &&
+    loaded.flat().includes(modelStopKey(selectedProvider, selectedModel.id))
+  ) {
+    // Some engines return a failed UnloadResult instead of throwing, which
+    // stopAllModels does not propagate. Confirm this provider actually stopped.
+    const remaining = await serviceHub
+      .models()
+      .getActiveModels(selectedProvider)
+      .catch(() => null)
+    if (remaining && !remaining.includes(selectedModel.id)) {
+      clearUnloadedSelection(selectedProvider, selectedModel.id)
+    }
+  }
+}
+
+function clearUnloadedSelection(providerName: string, modelId: string): void {
+  const state = useModelProvider.getState()
+  // An unload may finish after the user has already picked another model,
+  // including the same id on another engine, or begun loading this one again.
+  if (
+    state.selectedProvider === providerName &&
+    state.selectedModel?.id === modelId &&
+    !isExplicitSwitchPending(providerName, modelId)
+  ) {
+    state.selectModelProvider('', '')
+  }
+}
+
+/**
+ * Point an empty composer back at a thread's own model before a Retry. A
+ * failed load clears the selection (see {@link switchToModel}), and the chat
+ * transport answers with whatever is selected, so the Retry under that very
+ * failure had no model to try again. A model the user has picked since wins.
+ */
+export function selectThreadModelIfNone(
+  model: { id: string; provider: string } | undefined
+): void {
+  const state = useModelProvider.getState()
+  if (state.selectedModel || !model) return
+  state.selectModelProvider(model.provider, model.id)
+}
+
+function clearFailedSelection(providerName: string, modelId: string): void {
+  const state = useModelProvider.getState()
+  // The user may have picked another model while this one was failing.
+  if (
+    state.selectedProvider === providerName &&
+    state.selectedModel?.id === modelId
+  ) {
+    state.selectModelProvider('', '')
+  }
+}
+
+function recordUserStop(providerName: string, modelId: string): void {
+  const { userStoppedModels, setUserStoppedModels } = useAppState.getState()
+  const key = modelStopKey(providerName, modelId)
+  if (!userStoppedModels.includes(key)) {
+    setUserStoppedModels([...userStoppedModels, key])
+  }
+}
+
+/**
+ * Unload one local model because the user asked to — the status dot in the
+ * composer pill (ATO-530). Recorded like a Stop, so the auto-start leaves it
+ * down until the user picks it again. Clear only the runtime selection after
+ * a successful unload; the provider and its downloaded models stay registered.
+ */
+export async function unloadModelByUser(params: {
+  modelId: string
+  providerName: string
+  serviceHub: ServiceHub
+}): Promise<void> {
+  const { modelId, providerName, serviceHub } = params
+  recordUserStop(providerName, modelId)
+  try {
+    const result = await serviceHub.models().stopModel(modelId, providerName)
+    if (result && !result.success) {
+      throw new Error(result.error || `Failed to stop model '${modelId}'`)
+    }
+    clearUnloadedSelection(providerName, modelId)
+  } finally {
+    const active = await serviceHub
+      .models()
+      .getActiveModels()
+      .catch(() => null)
+    if (active) syncActiveModelsFromEngines(active)
+  }
+}
+
+/**
+ * The local load `doSwitchToModel` is running, so a Cancel can reach it.
+ * Cloud switches load nothing and never set it.
+ */
+let currentLocalLoad: {
+  modelId: string
+  providerName: string
+  cancelRequested: boolean
+} | null = null
+
+function cancelledLoadError(): Error & { code: string } {
+  const error = new Error('The model load was cancelled.') as Error & {
+    code: string
+  }
+  error.code = MODEL_LOAD_CANCELLED_CODE
+  return error
+}
+
+/** Whether a switch ended because the user cancelled its load. */
+export function isModelLoadCancelled(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const { code } = error as { code?: unknown }
+  return typeof code === 'string' && code === MODEL_LOAD_CANCELLED_CODE
+}
+
+function throwIfLoadCancelled(): void {
+  if (currentLocalLoad?.cancelRequested) throw cancelledLoadError()
+}
+
+/**
+ * Stop the local model load in flight (ATO-530). The model stays selected
+ * but not loaded, recorded as a user stop so the composer's auto-start does
+ * not load it straight back. The switch ends with a cancelled error, which
+ * raises no failure anywhere.
+ */
+export async function cancelModelLoad(serviceHub: ServiceHub): Promise<void> {
+  const load = currentLocalLoad
+  if (!load || load.cancelRequested) return
+  load.cancelRequested = true
+  useAppState.getState().setLoadingModelCancelling(true)
+  recordUserStop(load.providerName, load.modelId)
+  // An engine that cannot stop its load finishes it; the switch then unloads
+  // the model at its next step instead.
+  await serviceHub
+    .models()
+    .cancelModelLoad(load.providerName, load.modelId)
+    .catch((error) => {
+      console.warn('[switchToModel] engine could not cancel the load:', error)
+    })
 }
 
 /**
@@ -278,12 +565,6 @@ function clearModelLoadError() {
   toast.dismiss('model-load-error')
   useModelLoad.getState().setModelLoadError(undefined)
 }
-
-/**
- * Legacy event name retained for the dormant once-ever Turboquant dialog.
- * Startup detection now feeds the shared chat mismatch prompt instead.
- */
-export const TURBOQUANT_OPTIMAL_PROMPT_EVENT = 'turboquant:offer-optimal-backend'
 
 function syncModelSelection(providerName: string, modelId: string) {
   const serverState = useLocalApiServer.getState()
@@ -380,6 +661,8 @@ export async function switchToModel(params: {
   const explicitKey = autoStartKey(params.providerName, params.modelId)
   if (isExplicit) {
     pendingExplicitSwitch = explicitKey
+    // Asking for the model again is what lifts a hand Stop.
+    clearUserStop(params.providerName, params.modelId)
   }
 
   const run = async (): Promise<void> => {
@@ -422,7 +705,18 @@ export async function switchToModel(params: {
       return
     }
 
-    await doSwitchToModel(params)
+    try {
+      await doSwitchToModel(params)
+    } catch (error) {
+      // A failed load leaves nothing to chat with, so the composer goes back
+      // to "Select Model" rather than showing the model that did not come
+      // up. A cancel keeps its selection, and a switch requested after this
+      // one owns the selection from here on.
+      if (!isModelLoadCancelled(error) && mySeq === switchSeq) {
+        clearFailedSelection(params.providerName, params.modelId)
+      }
+      throw error
+    }
   }
 
   // Chain strictly after any in-flight/queued switch. A prior failure must not
@@ -536,7 +830,31 @@ async function doSwitchToModel(params: {
   }
 
   setServerStatus(shouldStartServer ? 'pending' : 'stopped')
-  updateLoadingModel(true)
+  // ATO-535: a switch that has to tear a *running local engine* down first is
+  // a restart, not a cold start — a different wait, and the status surface says
+  // which of the two the user is looking at. `activeModels` also carries cloud
+  // model ids (step 6 writes them), and those hold no engine, so the id is
+  // matched back to its provider rather than merely counted.
+  const localEngineWasServing = useAppState
+    .getState()
+    .activeModels.some(
+      (active) =>
+        active !== modelId &&
+        useModelProvider
+          .getState()
+          .providers.some(
+            (candidate) =>
+              isLocalEngineProvider(candidate.provider) &&
+              candidate.models?.some((model) => model.id === active)
+          )
+    )
+  updateLoadingModel(true, {
+    modelId,
+    kind: localEngineWasServing ? 'restart' : 'start',
+  })
+  const { setLoadingModelProgress } = useAppState.getState()
+  const load = isLocal ? { modelId, providerName, cancelRequested: false } : null
+  currentLocalLoad = load
   console.log(
     '[switchToModel] Switching to model:',
     modelId,
@@ -546,11 +864,27 @@ async function doSwitchToModel(params: {
   )
 
   try {
-    // 1. Stop ALL local engines (llamacpp + mlx). This is a no-op for cloud
-    //    but guarantees only one model is ever "active" globally.
-    await serviceHub.models().stopAllModels()
-    setActiveModels([])
-    console.log('[switchToModel] All local models stopped')
+    // 1. Stop every other local model (llamacpp + mlx) so only one model is
+    //    ever "active" globally. For a local target the target engine's own
+    //    copy is left alone: `startModel` short-circuits on an already-loaded
+    //    model, so a switch whose only job is to drop a stray copy in another
+    //    provider never kills a server that may be streaming right now.
+    if (isLocal) {
+      if (localEngineWasServing) {
+        setLoadingModelProgress({ kind: 'unloadingPrevious' })
+      }
+      await serviceHub.models().stopAllModelsExcept(modelId, providerName)
+      const stillActive = await serviceHub
+        .models()
+        .getActiveModels(providerName)
+        .catch(() => [] as string[])
+      setActiveModels(stillActive.filter((m) => m === modelId))
+      console.log('[switchToModel] Other local models stopped')
+    } else {
+      await serviceHub.models().stopAllModels()
+      setActiveModels([])
+      console.log('[switchToModel] All local models stopped')
+    }
 
     // 2. Stop the API server so we start it fresh with the new configuration.
     try {
@@ -559,6 +893,7 @@ async function doSwitchToModel(params: {
     } catch {
       // Server may not have been running — that's fine
     }
+    throwIfLoadCancelled()
 
     // 3. Resolve the provider definition.
     const allProviders = useModelProvider.getState().providers
@@ -571,25 +906,55 @@ async function doSwitchToModel(params: {
       | undefined
 
     if (isLocal) {
-      // 4a. Local branch — load the model into its engine.
+      // 4a. Local branch — load the model into its engine. An out-of-memory
+      //     failure is retried down a ladder (smaller context, then CPU)
+      //     rather than surfaced as a dead end; see `planOomRetry`.
       loadStartTs = Date.now()
-      await taggedWithTimeout(
-        serviceHub.models().startModel(provider, modelId, true),
-        MODEL_LOAD_WATCHDOG_MS,
-        `Timed out waiting for model "${modelId}" to finish loading.`
-      )
+      modelConfig = await loadLocalModelWithOomRetry({
+        serviceHub,
+        providerName,
+        modelId,
+        onProgress: setLoadingModelProgress,
+      })
+      // The load came back before a Cancel could stop it — an engine that
+      // cannot cancel, or one that became ready first. The user still asked
+      // for the model to be gone.
+      if (load?.cancelRequested) {
+        await serviceHub
+          .models()
+          .stopModel(modelId, providerName)
+          .catch(() => undefined)
+        throw cancelledLoadError()
+      }
+      // Awaited rather than fired-and-forgotten: the event has to carry it,
+      // and the read is a single IPC against an already-running process.
+      const runtimeDevice = await readRuntimeDevice(modelId)
+      // Cached so chat responses can name the executing backend without an
+      // IPC on the response path.
+      rememberExecBackend(modelId, execBackend(runtimeDevice))
       emitModelLoad('success', {
         modelId,
         providerName,
         durationMs: Date.now() - loadStartTs,
         model: modelConfig,
+        isAutoStart,
+        runtimeDevice,
       })
       console.log('[switchToModel] Local model started:', modelId)
       await settleAfterLocalStart(serviceHub, providerName, modelId)
     } else {
       // 4b. Cloud branch — register the provider so the proxy can route
       //     requests for `modelId` to provider.base_url.
-      if (!provider.api_key && !isKeylessRemoteProvider(provider)) {
+      //     Subscriptions (ChatGPT/Codex) carry no `api_key` by design — the
+      //     bearer token lives in the Rust backend and the proxy attaches it
+      //     itself — so they must pass this gate exactly like keyless
+      //     self-hosted servers do. Mirrors `registerRemoteProvider` and
+      //     `ensureRemoteProviderReady`.
+      if (
+        !provider.api_key &&
+        !isKeylessRemoteProvider(provider) &&
+        !isSubscriptionProvider(providerName)
+      ) {
         throw new Error(
           `Provider '${providerName}' has no API key. Add one in Settings before selecting this model.`
         )
@@ -618,6 +983,7 @@ async function doSwitchToModel(params: {
     //    they start it regardless of the toggle (see `shouldStartServer`
     //    computed up front).
     if (shouldStartServer) {
+      if (isLocal) setLoadingModelProgress({ kind: 'startingServer' })
       await startLocalApiServer()
     } else {
       // Local model + auto-start disabled + server wasn't running: keep the
@@ -650,7 +1016,12 @@ async function doSwitchToModel(params: {
     clearModelLoadError()
     console.log('[switchToModel] Global state synchronised')
   } catch (error) {
-    console.error('[switchToModel] Failed to switch model:', error)
+    const cancelled = isModelLoadCancelled(error)
+    if (cancelled) {
+      console.log('[switchToModel] Load cancelled by the user:', modelId)
+    } else {
+      console.error('[switchToModel] Failed to switch model:', error)
+    }
     if (wasServerRunning) {
       try {
         await startLocalApiServer()
@@ -667,6 +1038,17 @@ async function doSwitchToModel(params: {
     } else {
       useAppState.getState().setServerStatus('stopped')
     }
+    if (cancelled) {
+      // The user's choice, not a failure: no auto-start backoff, telemetry,
+      // crash report or toast. The stop record set by `cancelModelLoad` is
+      // what keeps the model down.
+      const active = await serviceHub
+        .models()
+        .getActiveModels()
+        .catch(() => null)
+      if (active) syncActiveModelsFromEngines(active)
+      throw error
+    }
     // WS2: record the failure so the auto-start effect doesn't re-loop on it —
     // terminal codes (missing model/binary) are never auto-retried; others back
     // off. Explicit user switches bypass `shouldAttemptAutoStart`, so a manual
@@ -679,6 +1061,7 @@ async function doSwitchToModel(params: {
         durationMs: loadStartTs ? Date.now() - loadStartTs : 0,
         model: modelConfig,
         error,
+        isAutoStart,
       })
     }
     // ATO-113 / WS1.5: explicit Sentry capture at the model-load choke point with
@@ -686,12 +1069,17 @@ async function doSwitchToModel(params: {
     // Recoverable user/config conditions (missing file, unsupported projector) are
     // NOT crashes and are skipped, and repeats are throttled (model+code, 5-min
     // window) so a load crashloop cannot flood the crash channel.
+    // A local engine's failure is reported by the core, to its own project and
+    // with the engine's context, whoever asked for the load (core ADR
+    // 2026-09-21-report-core-errors-to-its-own-sentry-project); reporting it here
+    // too would count every such failure twice. Only cloud providers remain.
     {
       const err = toErrorObject(error)
       const haystack = err.details ?? err.message
       const settings = modelConfig?.settings
       const errorCode = err.code ?? null
       if (
+        !isLocal &&
         !isRecoverableModelLoadCode(errorCode) &&
         shouldCaptureModelLoadSentry(modelId, errorCode)
       ) {
@@ -705,7 +1093,7 @@ async function doSwitchToModel(params: {
             backend: isLocal
               ? loadBackendFromProvider(providerName)
               : providerName,
-            model_id: modelId,
+            model_id: normalizeModelId(modelId),
             quant: quantFromModelId(modelId),
             context_length:
               settingNum(settings, 'ctx_len') ??
@@ -718,8 +1106,244 @@ async function doSwitchToModel(params: {
     reportModelLoadError(error, providerName, isAutoStart, modelId)
     throw error
   } finally {
+    if (currentLocalLoad === load) currentLocalLoad = null
     useAppState.getState().updateLoadingModel(false)
   }
+}
+
+/**
+ * Out-of-memory retry ladder (ATO-465).
+ *
+ * A load that ran out of memory used to be the end of the road: a toast
+ * saying "pick a smaller model or reduce the context", and nothing tried
+ * either. With fit off the ladder halves the context down to
+ * {@link OOM_RETRY_CTX_FLOOR}, then sends the model to the CPU; each rung is
+ * persisted on the model so the next launch starts from what worked. With
+ * fit on the engine already sized the context, so the one thing worth
+ * trying is a wider fit margin. Partial GPU offload is not a rung: the
+ * layer count is only known to the engine, and fit covers that case.
+ */
+const OOM_RETRY_MAX_ATTEMPTS = 4
+const OOM_RETRY_CTX_FLOOR = 4096
+const OOM_RETRY_DEFAULT_FIT_TARGET_MIB = 1024
+
+export type OomRetryStep =
+  | { kind: 'ctx'; from: number; to: number }
+  | { kind: 'ngl'; from: number; to: number }
+  | { kind: 'fit_target'; from: number; to: number }
+
+function modelSettingNumber(
+  model: { settings?: Record<string, { controller_props?: { value?: unknown } }> } | undefined,
+  key: string
+): number | undefined {
+  const raw = model?.settings?.[key]?.controller_props?.value
+  const n = typeof raw === 'string' ? Number(raw) : raw
+  return typeof n === 'number' && Number.isFinite(n) ? n : undefined
+}
+
+function providerFitTargetMib(provider: ModelProvider): number {
+  const raw = provider.settings?.find((s) => s.key === 'fit_target')
+    ?.controller_props?.value
+  const first = String(raw ?? '')
+    .split(',')[0]
+    .trim()
+  const n = Number(first)
+  return Number.isFinite(n) && n > 0 ? n : OOM_RETRY_DEFAULT_FIT_TARGET_MIB
+}
+
+/**
+ * The next thing to try after an OOM, or `null` when the ladder is spent.
+ * Pure: reads the provider as it is now, so a rung already taken is not
+ * taken twice.
+ */
+export function planOomRetry(
+  provider: ModelProvider,
+  modelId: string,
+  attempt: number
+): OomRetryStep | null {
+  const model = provider.models?.find((m) => m.id === modelId)
+  if (readProviderFit(provider) === true) {
+    // The engine chose the context; ask it to leave more room, once.
+    if (attempt > 0) return null
+    const from = providerFitTargetMib(provider)
+    return { kind: 'fit_target', from, to: from * 2 }
+  }
+  const ctx = modelSettingNumber(model, 'ctx_len') ?? DEFAULT_CTX_LEN
+  if (ctx > OOM_RETRY_CTX_FLOOR) {
+    return {
+      kind: 'ctx',
+      from: ctx,
+      to: Math.max(OOM_RETRY_CTX_FLOOR, Math.floor(ctx / 2)),
+    }
+  }
+  const ngl = modelSettingNumber(model, 'ngl') ?? 100
+  if (ngl !== 0) return { kind: 'ngl', from: ngl, to: 0 }
+  return null
+}
+
+function applyOomRetryStep(
+  serviceHub: ServiceHub,
+  provider: ModelProvider,
+  modelId: string,
+  step: OomRetryStep
+): void {
+  const { updateProvider } = useModelProvider.getState()
+  if (step.kind === 'fit_target') {
+    const settings = (provider.settings ?? []).map((s) =>
+      s.key === 'fit_target'
+        ? {
+            ...s,
+            controller_props: { ...s.controller_props, value: String(step.to) },
+          }
+        : s
+    )
+    void serviceHub.providers().updateSettings(provider.provider, settings)
+    updateProvider(provider.provider, { settings })
+    return
+  }
+  const key = step.kind === 'ctx' ? 'ctx_len' : 'ngl'
+  const models = (provider.models ?? []).map((m) =>
+    m.id === modelId
+      ? {
+          ...m,
+          settings: {
+            ...m.settings,
+            [key]: {
+              ...(m.settings?.[key] ?? { key }),
+              controller_props: {
+                ...(m.settings?.[key]?.controller_props ?? {}),
+                value: step.to,
+              },
+            },
+          },
+        }
+      : m
+  )
+  updateProvider(provider.provider, { models: models as Model[] })
+}
+
+function emitModelLoadRetry(args: {
+  modelId: string
+  providerName: string
+  attempt: number
+  step: OomRetryStep
+  outcome: 'retrying' | 'recovered' | 'exhausted'
+  fitEnabled: boolean | null
+}): void {
+  try {
+    queuedCapture('model_load_retry', {
+      model_id: normalizeModelId(args.modelId),
+      backend: loadBackendFromProvider(args.providerName),
+      retry_attempt: args.attempt,
+      retry_reason: 'oom',
+      retry_step: args.step.kind,
+      retry_outcome: args.outcome,
+      fit_enabled: args.fitEnabled,
+      ctx_before: args.step.kind === 'ctx' ? args.step.from : null,
+      ctx_after: args.step.kind === 'ctx' ? args.step.to : null,
+      ngl_before: args.step.kind === 'ngl' ? args.step.from : null,
+      ngl_after: args.step.kind === 'ngl' ? args.step.to : null,
+      fit_target_before: args.step.kind === 'fit_target' ? args.step.from : null,
+      fit_target_after: args.step.kind === 'fit_target' ? args.step.to : null,
+    })
+  } catch (telemetryError) {
+    console.debug('model_load_retry telemetry failed:', telemetryError)
+  }
+}
+
+/**
+ * Load a local model, walking the OOM ladder on each out-of-memory failure.
+ * Resolves to the model as it was finally loaded (its settings may have
+ * changed); rethrows the last error when the ladder is spent or the failure
+ * is not memory.
+ */
+async function loadLocalModelWithOomRetry(args: {
+  serviceHub: ServiceHub
+  providerName: string
+  modelId: string
+  onProgress?: (progress: ModelLoadProgress) => void
+}): Promise<LoadableModel | undefined> {
+  const { serviceHub, providerName, modelId, onProgress } = args
+  let lastStep: OomRetryStep | null = null
+  for (let attempt = 0; attempt < OOM_RETRY_MAX_ATTEMPTS; attempt++) {
+    const provider = useModelProvider
+      .getState()
+      .providers.find((p) => p.provider === providerName)
+    if (!provider) throw new Error(`Provider '${providerName}' not found`)
+    const fitEnabled = readProviderFit(provider)
+    const retry = lastStep?.kind
+    try {
+      await taggedWithTimeout(
+        serviceHub.models().startModel(provider, modelId, true, {
+          onStage: (stage) => onProgress?.({ ...stage, retry }),
+        }),
+        MODEL_LOAD_WATCHDOG_MS,
+        `Timed out waiting for model "${modelId}" to finish loading.`
+      )
+      if (lastStep) {
+        emitModelLoadRetry({
+          modelId,
+          providerName,
+          attempt,
+          step: lastStep,
+          outcome: 'recovered',
+          fitEnabled,
+        })
+        toast.info(i18n.t('model-errors:oomRetryRecoveredTitle'), {
+          id: `oom-retry-${providerName}-${modelId}`,
+          description:
+            lastStep.kind === 'ctx'
+              ? i18n.t('model-errors:oomRetryRecoveredContext', {
+                  context: lastStep.to,
+                })
+              : lastStep.kind === 'ngl'
+                ? i18n.t('model-errors:oomRetryRecoveredCpu')
+                : i18n.t('model-errors:oomRetryRecoveredFit'),
+        })
+      }
+      return provider.models?.find((m) => m.id === modelId) as
+        | LoadableModel
+        | undefined
+    } catch (error) {
+      if (isModelLoadCancelled(error)) throw error
+      if (!isOutOfMemoryError(toErrorObject(error))) throw error
+      throwIfLoadCancelled()
+      const step =
+        attempt < OOM_RETRY_MAX_ATTEMPTS - 1
+          ? planOomRetry(provider, modelId, attempt)
+          : null
+      if (!step) {
+        if (lastStep) {
+          emitModelLoadRetry({
+            modelId,
+            providerName,
+            attempt,
+            step: lastStep,
+            outcome: 'exhausted',
+            fitEnabled,
+          })
+        }
+        throw error
+      }
+      console.warn(
+        `[switchToModel] ${modelId} ran out of memory; retrying with ${step.kind} ${step.from} → ${step.to}`
+      )
+      applyOomRetryStep(serviceHub, provider, modelId, step)
+      // Said at once: the next attempt reports its own steps only once the
+      // engine reaches them.
+      onProgress?.({ kind: 'loadingWeights', cachedFraction: null, retry: step.kind })
+      emitModelLoadRetry({
+        modelId,
+        providerName,
+        attempt: attempt + 1,
+        step,
+        outcome: 'retrying',
+        fitEnabled,
+      })
+      lastStep = step
+    }
+  }
+  return undefined
 }
 
 const OOM_CODES = new Set([
@@ -846,129 +1470,123 @@ function unsupportedDescription(
 }
 
 /**
- * Surface a user-visible banner when a model fails to load.
- * OOM errors get a persistent toast so the user cannot miss them.
+ * What to tell the user about a failed model load: one sentence saying what
+ * went wrong, and where the copy has one, the next thing to try. `details`
+ * carries the raw engine output for the "Show details" toggle.
+ *
+ * Pure, and separate from the toast, because the compact picker status and the
+ * standard failure toast must classify the same engine error the same way.
  */
-function reportModelLoadError(
-  rawError: unknown,
-  providerName?: string,
-  isAutoStart?: boolean,
-  modelId?: string
-): void {
-  const err = toErrorObject(rawError)
-  useModelLoad.getState().setModelLoadError(err, modelId)
+export type ModelLoadFailure = {
+  title: string
+  description: string
+  details?: string
+  /** The user has to act before this can succeed, so the toast never expires. */
+  persistent: boolean
+}
 
+export function describeModelLoadFailure(
+  rawError: unknown,
+  providerName?: string
+): ModelLoadFailure {
+  const err = toErrorObject(rawError)
   const t = i18n.t.bind(i18n)
 
-  // ATO-270: a startup watchdog timeout must surface even on auto-start —
-  // the alternative is an infinite "Starting Server" spinner with zero
-  // feedback and no way for the user to know anything went wrong, let alone
-  // retry. This is the one exception to the "auto-start fails silently"
-  // policy below.
+  const simple = (
+    key: string,
+    persistent = false
+  ): ModelLoadFailure => ({
+    title: t(`model-errors:${key}Title`),
+    description: t(`model-errors:${key}Description`),
+    persistent,
+  })
+
   if (err.code === LOCAL_API_SERVER_START_TIMEOUT_CODE) {
-    toast.error(t('model-errors:startupTimedOutTitle'), {
-      id: 'model-load-error',
-      description: t('model-errors:startupTimedOutDescription'),
-      duration: 10000,
-      closeButton: true,
-    })
-    return
+    return simple('startupTimedOut')
   }
-
-  // Only user-initiated loads surface a toast for every other failure.
-  // Automatic/background loads (startup auto-start, ChatInput auto-start,
-  // onboarding launches, post-import auto-switch) pass `isAutoStart` and
-  // fail silently — the error is still stored above for any inline UI that
-  // wants to read it.
-  if (isAutoStart) return
-
   if (isOutOfMemoryError(err)) {
-    toast.error(t('model-errors:outOfMemoryTitle'), {
-      id: 'model-load-error',
-      description: t('model-errors:outOfMemoryDescription'),
-      duration: Infinity,
-      closeButton: true,
-    })
-    return
+    return simple('outOfMemory', true)
   }
-
   // ATO-121: map well-classified engine errors to an actionable message + hint
   // instead of the opaque generic "unexpected error". The codes come from the
   // Rust plugins' `LlamacppError` (from_stderr / from_exit_status).
   if (err.code === 'MULTIMODAL_PROJECTOR_LOAD_FAILED') {
-    toast.error(t('model-errors:multimodalUnsupportedTitle'), {
-      id: 'model-load-error',
-      description: unsupportedDescription(t, 'multimodalUnsupported', providerName),
-      duration: 10000,
-      closeButton: true,
-    })
-    return
+    return {
+      title: t('model-errors:multimodalUnsupportedTitle'),
+      description: unsupportedDescription(
+        t,
+        'multimodalUnsupported',
+        providerName
+      ),
+      persistent: false,
+    }
   }
   if (err.code === 'MODEL_ARCH_NOT_SUPPORTED') {
     // The backend names the architecture it choked on, which is the one thing
     // a bug report needs. Keep it one click away instead of dropping it.
-    showModelLoadErrorToast({
+    return {
       title: t('model-errors:archNotSupportedTitle'),
       description: unsupportedDescription(t, 'archNotSupported', providerName),
       details: splitModelLoadError(err).details,
-      duration: 10000,
-    })
-    return
+      persistent: false,
+    }
   }
   if (err.code === 'MODEL_FILE_NOT_FOUND') {
-    toast.error(t('model-errors:modelFileMissingTitle'), {
-      id: 'model-load-error',
-      description: t('model-errors:modelFileMissingDescription'),
-      duration: 10000,
-      closeButton: true,
-    })
-    return
+    return simple('modelFileMissing')
   }
   // A shard set missing members is an incomplete download by another name, and
   // the remedy the corrupt-file copy already gives — delete and download again —
   // is exactly right for it.
-  if (err.code === 'MODEL_FILE_CORRUPT' || err.code === 'MODEL_SHARDS_INCOMPLETE') {
-    toast.error(t('model-errors:modelFileCorruptTitle'), {
-      id: 'model-load-error',
-      description: t('model-errors:modelFileCorruptDescription'),
-      duration: 10000,
-      closeButton: true,
-    })
-    return
+  if (
+    err.code === 'MODEL_FILE_CORRUPT' ||
+    err.code === 'MODEL_SHARDS_INCOMPLETE'
+  ) {
+    return simple('modelFileCorrupt')
   }
   // ATO-190: the bundled macOS engine links a Metal symbol absent on older
   // macOS (e.g. Catalina), so the binary fails to load. Tell the user their
   // OS is too old instead of showing a generic crash.
   if (err.code === 'OS_VERSION_UNSUPPORTED') {
-    toast.error(t('model-errors:osVersionUnsupportedTitle'), {
-      id: 'model-load-error',
-      description: t('model-errors:osVersionUnsupportedDescription'),
-      duration: Infinity,
-      closeButton: true,
-    })
-    return
+    return simple('osVersionUnsupported', true)
   }
   // ATO-185: the host CPU lacks the AVX instruction set the bundled engine
   // requires; loading would otherwise crash with a silent SIGILL surfaced as
   // the opaque LLAMA_CPP_PROCESS_ERROR. Tell the user plainly that their CPU
   // is unsupported instead.
   if (err.code === 'CPU_NO_AVX') {
-    toast.error(t('model-errors:cpuNoAvxTitle'), {
-      id: 'model-load-error',
-      description: t('model-errors:cpuNoAvxDescription'),
-      duration: 10000,
-      closeButton: true,
-    })
-    return
+    return simple('cpuNoAvx')
   }
 
   const { summary, details } = splitModelLoadError(err)
-  showModelLoadErrorToast({
+  return {
     title: t('model-errors:modelLoadFailedTitle'),
     description: t('model-errors:modelLoadFailedDescription', {
       message: summary,
     }).trim(),
     details,
-    duration: 10000,
+    persistent: false,
+  }
+}
+
+/**
+ * Surface a user-visible banner when a model fails to load.
+ * OOM errors get a persistent toast so the user cannot miss them.
+ */
+function reportModelLoadError(
+  rawError: unknown,
+  providerName?: string,
+  _isAutoStart?: boolean,
+  modelId?: string
+): void {
+  const err = toErrorObject(rawError)
+  useModelLoad.getState().setModelLoadError(err, modelId)
+
+  const failure = describeModelLoadFailure(err, providerName)
+
+  showModelLoadErrorToast({
+    title: failure.title,
+    description: failure.description,
+    details: failure.details,
+    duration: failure.persistent ? Infinity : 10000,
   })
 }

@@ -123,6 +123,52 @@ pub fn read_file_sync<R: Runtime>(
     fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
+/// Upper bound on the bytes a single `read_file_chunk` call returns.
+///
+/// Every custom-protocol response — the asset protocol and the IPC channel
+/// alike — is materialised by WebView2 as one in-memory stream, and bodies
+/// past roughly 10 MB fail to arrive in the webview ("Failed to fetch" on a
+/// 200 response, #261). Callers page through a file well below that.
+const READ_FILE_CHUNK_MAX: u64 = 8 * 1024 * 1024;
+
+/// Read `length` bytes of `path` starting at `offset` and return them as a raw
+/// binary IPC response (an `ArrayBuffer` on the JS side, no base64 detour).
+/// Returns fewer bytes at end of file; an empty body means `offset` is at or
+/// past the end.
+#[tauri::command]
+pub fn read_file_chunk<R: Runtime>(
+    app_handle: tauri::AppHandle<R>,
+    path: String,
+    offset: u64,
+    length: u64,
+) -> Result<tauri::ipc::Response, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if path.is_empty() || length == 0 {
+        return Err("read_file_chunk error: Invalid argument".to_string());
+    }
+
+    let path = resolve_path(app_handle, &path);
+    let mut file = fs::File::open(&path).map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if metadata.is_dir() {
+        return Err("read_file_chunk error: path is a directory".to_string());
+    }
+
+    let to_read = length
+        .min(READ_FILE_CHUNK_MAX)
+        .min(metadata.len().saturating_sub(offset));
+    let mut buf = Vec::with_capacity(to_read as usize);
+    if to_read > 0 {
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| e.to_string())?;
+        file.take(to_read)
+            .read_to_end(&mut buf)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(tauri::ipc::Response::new(buf))
+}
+
 #[tauri::command]
 pub fn write_file_sync<R: Runtime>(
     app_handle: tauri::AppHandle<R>,
@@ -145,6 +191,45 @@ pub fn get_os_home_dir() -> Result<String, String> {
     dirs::home_dir()
         .map(|p| p.to_string_lossy().to_string())
         .ok_or_else(|| "Could not resolve OS home directory".to_string())
+}
+
+/// Environment variables that name where other apps keep their models.
+///
+/// The renderer cannot read the process environment, and the local-model
+/// scanner used to hardcode every store's default location — a user whose
+/// `OLLAMA_MODELS` or `HF_HOME` points at a second disk was invisible to it.
+/// Only this list is readable: it is the full set of keys the scanner uses,
+/// and nothing else about the environment has any business in the webview.
+const SCAN_ENV_KEYS: &[&str] = &[
+    "OLLAMA_MODELS",
+    "HF_HOME",
+    "HF_HUB_CACHE",
+    "TRANSFORMERS_CACHE",
+    "UNSLOTH_STUDIO_HOME",
+    "STUDIO_HOME",
+    "LLAMA_CACHE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "XDG_DATA_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+];
+
+/// Returns the subset of `keys` that are both on the scanner's allow-list and
+/// set to a non-empty value. Unknown keys are silently dropped rather than
+/// rejected, so an older renderer asking for a key a newer build no longer
+/// exposes degrades to "not set".
+#[tauri::command]
+pub fn get_env_vars(keys: Vec<String>) -> std::collections::HashMap<String, String> {
+    keys.into_iter()
+        .filter(|key| SCAN_ENV_KEYS.contains(&key.as_str()))
+        .filter_map(|key| {
+            std::env::var(&key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| (key, value))
+        })
+        .collect()
 }
 
 /// Creates a filesystem link from `link` to an existing `target`, WITHOUT
@@ -431,9 +516,16 @@ pub fn normalize_backend_layout<R: Runtime>(
 
 // rfd native file dialog
 #[tauri::command]
+#[cfg_attr(feature = "e2e", allow(unreachable_code, unused_variables, unused_mut))]
 pub async fn open_dialog(
     options: Option<DialogOpenOptions>,
 ) -> Result<Option<serde_json::Value>, String> {
+    // A native file dialog cannot be driven from a test and would sit on the
+    // desktop of whoever runs it; an end-to-end build answers with what the
+    // runner queued, or "cancelled" when it queued nothing.
+    #[cfg(feature = "e2e")]
+    return Ok(crate::core::e2e::take_dialog_answer(&crate::core::e2e::data_root()));
+
     let mut dialog = AsyncFileDialog::new();
 
     if let Some(opts) = options {
@@ -477,7 +569,12 @@ pub async fn open_dialog(
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "e2e", allow(unreachable_code, unused_variables, unused_mut))]
 pub async fn save_dialog(options: Option<DialogOpenOptions>) -> Result<Option<String>, String> {
+    #[cfg(feature = "e2e")]
+    return Ok(crate::core::e2e::take_dialog_answer(&crate::core::e2e::data_root())
+        .and_then(|answer| answer.as_str().map(str::to_string)));
+
     let mut dialog = AsyncFileDialog::new();
 
     if let Some(opts) = options {

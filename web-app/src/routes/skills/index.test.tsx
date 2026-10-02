@@ -30,8 +30,6 @@ const hookState = vi.hoisted(() => ({
 }))
 const dialogOpen = vi.hoisted(() => vi.fn())
 const navigate = vi.hoisted(() => vi.fn())
-const setSidebarMode = vi.hoisted(() => vi.fn())
-const setAgentMode = vi.hoisted(() => vi.fn())
 
 vi.mock('@tanstack/react-router', () => ({
   createFileRoute: () => (config: object) => config,
@@ -44,11 +42,6 @@ vi.mock('@/containers/HeaderPage', () => ({
 
 vi.mock('@/hooks/useAgentSkills', () => ({
   useAgentSkills: () => hookState.value,
-}))
-
-vi.mock('@/hooks/useAgentMode', () => ({
-  useAgentMode: (selector: (state: object) => unknown) =>
-    selector({ setSidebarMode, setAgentMode }),
 }))
 
 vi.mock('@/i18n/react-i18next-compat', () => ({
@@ -121,8 +114,6 @@ describe('SkillsPage', () => {
   beforeEach(() => {
     dialogOpen.mockReset()
     navigate.mockReset()
-    setSidebarMode.mockReset()
-    setAgentMode.mockReset()
     seedServiceHub({
       dialog: {
         open: dialogOpen,
@@ -166,7 +157,7 @@ describe('SkillsPage', () => {
     expect(screen.getAllByText('common:writeSkillInstructions')).toHaveLength(2)
   })
 
-  it('shows modular skill details without badges and confirms uninstall', () => {
+  it('shows modular skill details without badges and confirms deletion', () => {
     render(<SkillsPage />)
 
     expect(
@@ -176,7 +167,7 @@ describe('SkillsPage', () => {
     expect(screen.queryByText('common:skillEnabled')).not.toBeInTheDocument()
     expect(screen.getAllByText('common:downloadSkill')).toHaveLength(1)
     expect(screen.getAllByText('common:editSkill')).toHaveLength(1)
-    fireEvent.click(screen.getAllByText('common:uninstallSkill')[0])
+    fireEvent.click(screen.getAllByText('common:delete')[0])
 
     const dialog = screen.getByRole('dialog')
     fireEvent.click(within(dialog).getByText('common:delete'))
@@ -204,7 +195,7 @@ describe('SkillsPage', () => {
     expect(screen.getAllByText('Invalid SKILL.md')).toHaveLength(2)
     expect(screen.queryByText('common:bundled')).not.toBeInTheDocument()
     expect(screen.queryByText('common:editSkill')).not.toBeInTheDocument()
-    expect(screen.queryByText('common:uninstallSkill')).not.toBeInTheDocument()
+    expect(screen.queryByText('common:delete')).not.toBeInTheDocument()
     for (const button of screen.getAllByText('common:tryInChat')) {
       expect(button.closest('button')).toBeDisabled()
     }
@@ -224,13 +215,11 @@ describe('SkillsPage', () => {
     )
   })
 
-  it('opens a new Agent chat with the selected skill', () => {
+  it('opens a new chat with the selected skill', () => {
     render(<SkillsPage />)
 
     fireEvent.click(screen.getAllByText('common:tryInChat')[0])
 
-    expect(setSidebarMode).toHaveBeenCalledWith('agent')
-    expect(setAgentMode).toHaveBeenCalledWith('temporary-chat', true)
     expect(navigate).toHaveBeenCalledWith({
       to: '/',
       search: { agentSkill: 'custom-skill' },

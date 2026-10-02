@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import '@testing-library/jest-dom'
 import DropdownModelProvider from '../DropdownModelProvider'
 import { useModelProvider } from '@/hooks/useModelProvider'
@@ -79,16 +79,24 @@ vi.mock('../ModelSupportStatus', () => ({
   ModelSupportStatus: () => <div data-testid="model-support-status" />,
 }))
 
-vi.mock('../SamplerPopover', () => ({
-  SamplerPopover: () => <div data-testid="sampler-popover" />,
-}))
-
 const providerHeaderOrder = () =>
   Array.from(
     screen
       .getByTestId('popover-content')
       .querySelectorAll('[data-testid^="provider-avatar-"]')
   ).map((el) => el.getAttribute('data-testid')?.replace('provider-avatar-', ''))
+
+/**
+ * Renders the picker and steps from the model row into the list. The panel
+ * opens on the row whenever a model is selected — the list is one click in —
+ * and the list is what these tests are about.
+ */
+const renderPicker = () => {
+  const result = render(<DropdownModelProvider />)
+  const row = screen.queryByRole('button', { name: 'common:changeModel' })
+  if (row) fireEvent.click(row)
+  return result
+}
 
 describe('DropdownModelProvider - provider ordering', () => {
   const mockProviders = [
@@ -150,8 +158,8 @@ describe('DropdownModelProvider - provider ordering', () => {
     cleanup()
   })
 
-  it('renders turboquant last, below the remote providers', () => {
-    render(<DropdownModelProvider />)
+  it('includes connected cloud providers and keeps turboquant last', () => {
+    renderPicker()
 
     expect(providerHeaderOrder()).toEqual([
       'llamacpp-upstream',
@@ -160,12 +168,78 @@ describe('DropdownModelProvider - provider ordering', () => {
     ])
   })
 
-  it('keeps upstream and turboquant apart', () => {
-    render(<DropdownModelProvider />)
+  it('leaves out an engine with no models, so the ones with models lead', () => {
+    // The reported picker: MLX had nothing downloaded, yet its bare header
+    // sat between llama.cpp and the cloud provider the user actually uses.
+    const providers = [
+      ...mockProviders,
+      {
+        provider: 'mlx',
+        active: true,
+        api_key: '',
+        models: [],
+        settings: [],
+      },
+    ]
+    mockModelProvider({
+      providers,
+      selectedProvider: 'llamacpp-upstream',
+      selectedModel: mockProviders[1].models[0],
+      getProviderByName: vi.fn((name: string) =>
+        providers.find((p) => p.provider === name)
+      ),
+      selectModelProvider: vi.fn(),
+      getModelBy: vi.fn(),
+      updateProvider: vi.fn(),
+    })
 
-    const order = providerHeaderOrder()
-    expect(
-      Math.abs(order.indexOf('llamacpp') - order.indexOf('llamacpp-upstream'))
-    ).toBeGreaterThan(1)
+    renderPicker()
+
+    expect(providerHeaderOrder()).toEqual([
+      'llamacpp-upstream',
+      'openai',
+      'llamacpp',
+    ])
+  })
+
+  it('omits inactive and empty providers without disturbing stable order', () => {
+    const providers = [
+      ...mockProviders,
+      {
+        provider: 'anthropic',
+        active: false,
+        api_key: 'sk-inactive',
+        models: [{ id: 'claude-opus', capabilities: ['completion'] }],
+        settings: [],
+      },
+      {
+        provider: 'mlx',
+        active: true,
+        api_key: '',
+        models: [],
+        settings: [],
+      },
+    ]
+    mockModelProvider({
+      providers,
+      selectedProvider: 'llamacpp-upstream',
+      selectedModel: mockProviders[1].models[0],
+      getProviderByName: vi.fn((name: string) =>
+        providers.find((p) => p.provider === name)
+      ),
+      selectModelProvider: vi.fn(),
+      getModelBy: vi.fn(),
+      updateProvider: vi.fn(),
+    })
+
+    renderPicker()
+
+    expect(providerHeaderOrder()).toEqual([
+      'llamacpp-upstream',
+      'openai',
+      'llamacpp',
+    ])
+    expect(providerHeaderOrder()).not.toContain('anthropic')
+    expect(providerHeaderOrder()).not.toContain('mlx')
   })
 })

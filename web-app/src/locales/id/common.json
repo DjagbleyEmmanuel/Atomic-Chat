@@ -1,7 +1,11 @@
 {
+  "api": "API",
+  "cloud": "Cloud",
   "assistants": "Asisten",
   "hardware": "Perangkat Keras",
   "mcp-servers": "Server MCP",
+  "connectors": "Konektor",
+  "plugins": "Plugin",
   "local_api_server": "Server API Lokal",
   "https_proxy": "Proksi HTTPS",
   "extensions": "Ekstensi",
@@ -22,6 +26,9 @@
   "recents": "Terbaru",
   "hub": "Hub",
   "models": "Model",
+  "images": "Images",
+  "video": "Video",
+  "media": "Media",
   "helpSupport": "Bantuan & Dukungan",
   "helpUsImproveJan": "Bantu Kami Meningkatkan Atomic Bot",
   "unstarAll": "Batal Bintangi Semua",
@@ -385,5 +392,18 @@
     "searchProjects": "Cari proyek...",
     "noProjectsFound": "Tidak ada proyek ditemukan",
     "tryDifferentSearch": "Coba kata kunci pencarian lain"
+  },
+  "skills": "Keahlian",
+  "pluginsMenu": {
+    "title": "Plugin",
+    "emptySkills": "Belum ada keahlian",
+    "manageSkills": "Kelola keahlian"
+  },
+  "desktopNotification": {
+    "modelReadyTitle": "Model diunduh",
+    "modelReadyBody": "{{name}} siap digunakan.",
+    "engineReadyTitle": "Mesin terpasang",
+    "chatEngineReadyBody": "llama.cpp siap menjalankan model.",
+    "mediaEngineReadyBody": "Mesin gambar dan video sudah siap."
   }
 }

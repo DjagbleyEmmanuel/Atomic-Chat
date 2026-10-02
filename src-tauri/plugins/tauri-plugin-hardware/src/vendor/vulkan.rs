@@ -62,17 +62,21 @@ pub fn get_vulkan_gpus() -> Vec<GpuInfo> {
         match get_vulkan_gpus_internal() {
             Ok(gpus) => gpus,
             Err(e) => {
-                // Already at `error!`. Keep the level but enrich the
-                // message — the most common cause is a missing
-                // `vulkan-1.dll` on Windows (no Vulkan loader installed
-                // by the GPU driver), which means AMD/Intel GPUs won't
-                // be enumerated at all.
-                log::error!(
-                    "Failed to enumerate Vulkan GPUs (most likely the Vulkan loader \
-                     is not installed — `vulkan-1.dll` on Windows / `libvulkan.so` \
-                     on Linux): {:?}",
-                    e
-                );
+                // A machine with no Vulkan loader installed is a supported
+                // configuration, not a defect: the most common cause is a
+                // missing `vulkan-1.dll` on Windows, which only means AMD/Intel
+                // GPUs are not enumerated. This runs again on every window
+                // focus (the hardware cache is invalidated there), so `error!`
+                // filed a fresh crash every time the user alt-tabbed back.
+                static LOG_FAILURE_ONCE: std::sync::Once = std::sync::Once::new();
+                LOG_FAILURE_ONCE.call_once(|| {
+                    log::warn!(
+                        "Failed to enumerate Vulkan GPUs (most likely the Vulkan loader \
+                         is not installed — `vulkan-1.dll` on Windows / `libvulkan.so` \
+                         on Linux): {:?}",
+                        e
+                    );
+                });
                 vec![]
             }
         }
@@ -81,8 +85,8 @@ pub fn get_vulkan_gpus() -> Vec<GpuInfo> {
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn get_vulkan_gpus_internal() -> Result<Vec<GpuInfo>, Box<dyn std::error::Error>> {
-    //* На macOS инференс идёт через Metal; MoltenVK тянется через относительный dlopen и ломается под Hardened Runtime.
-    //? Пустой список GPU — ожидаемый путь: дальше используется unified memory / RAM.
+    //* On macOS inference runs through Metal; MoltenVK is pulled in via a relative dlopen and breaks under Hardened Runtime.
+    //? An empty GPU list is the expected path: unified memory / RAM is used from there.
     #[cfg(target_os = "macos")]
     {
         // Logged once per process — this path is hit on every poll (~5s),

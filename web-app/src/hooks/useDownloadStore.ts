@@ -1,4 +1,20 @@
 import { create } from 'zustand'
+import {
+  advanceSpeedSample,
+  newSpeedSample,
+  type SpeedSample,
+} from '@/lib/downloadFormat'
+
+/**
+ * What the Rust downloader is doing while it has no bytes to report. Mirrors
+ * `DownloadStage` in `src-tauri/src/core/downloads/models.rs`, relayed by the
+ * download extension.
+ */
+export interface DownloadStage {
+  kind: string
+  attempt: number
+  maxAttempts: number
+}
 
 export interface DownloadProgressProps {
   id: string
@@ -6,6 +22,25 @@ export interface DownloadProgressProps {
   name: string
   current: number
   total: number
+  // ATO — #290: a transfer that cannot reach the host spends ~60s inside the
+  // retry ladders with no bytes and no events, which rendered as a permanent
+  // "Preparing". The stage is the only thing the row can show in that window.
+  stage?: DownloadStage
+  // ATO-462: speed and ETA are the two numbers the panel needs and the app
+  // never had. They live here rather than in the panel so the Hub card, the
+  // onboarding screen and the panel all quote the same figure, and so the
+  // estimate survives the panel being collapsed or unmounted.
+  speed: SpeedSample
+  /**
+   * The first byte count this run reported, and when. The terminal
+   * `model_download` event derives the run's average speed from it: the
+   * smoothed `speed` is reset by every stall and says nothing about the run.
+   */
+  transferStart?: { bytes: number; time: number }
+  /** Times the transfer went quiet (`stalled`), for the terminal event. */
+  stalls?: number
+  /** Reconnect attempts reported (`retrying`), for the terminal event. */
+  retries?: number
 }
 
 // ATO-154: parameters needed to resume a paused model download from the
@@ -20,6 +55,16 @@ export interface DownloadResumeParams {
   hfToken?: string
   skipVerification?: boolean
 }
+
+/**
+ * Why a text-model download was started.
+ *
+ * A download is passive unless a blocked Send explicitly adopts it. Keeping
+ * this separate from `downloadOriginByModelId` is intentional: that map names
+ * the Hugging Face card/repository for collision handling, while this map
+ * carries the user intent that is allowed to select/start the model later.
+ */
+export type DownloadRequestOrigin = 'standalone' | 'reply-gate'
 
 // Zustand store for thinking block state
 export type DownloadState = {
@@ -36,6 +81,9 @@ export type DownloadState = {
   // fixes the root cause; this map keeps the UI honest for clients on
   // an older cached catalog.
   downloadOriginByModelId: { [modelId: string]: string }
+  downloadRequestOriginByModelId: {
+    [modelId: string]: DownloadRequestOrigin
+  }
   // ATO-154: ids the user has paused (vs cancelled). A paused id keeps its
   // `downloads[id]` entry so the popover row survives, and makes the
   // stop/error listeners early-return instead of cleaning up.
@@ -50,6 +98,7 @@ export type DownloadState = {
     current?: number,
     total?: number
   ) => void
+  updateStage: (id: string, stage: DownloadStage) => void
   addLocalDownloadingModel: (modelId: string) => void
   removeLocalDownloadingModel: (modelId: string) => void
   markResumableDownload: (modelId: string) => void
@@ -58,7 +107,15 @@ export type DownloadState = {
   clearPausedDownload: (modelId: string) => void
   setResumeParams: (modelId: string, params: DownloadResumeParams) => void
   clearResumeParams: (modelId: string) => void
-  setDownloadOrigin: (modelId: string, modelName: string) => void
+  setDownloadOrigin: (
+    modelId: string,
+    modelName: string,
+    requestOrigin?: DownloadRequestOrigin
+  ) => void
+  setDownloadRequestOrigin: (
+    modelId: string,
+    requestOrigin: DownloadRequestOrigin
+  ) => void
   clearDownloadOrigin: (modelId: string) => void
 }
 
@@ -72,6 +129,7 @@ export const useDownloadStore = create<DownloadState>((set) => ({
   pausedDownloads: new Set(),
   resumeParams: {},
   downloadOriginByModelId: {},
+  downloadRequestOriginByModelId: {},
   removeDownload: (id: string) =>
     set((state) => {
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -80,21 +138,71 @@ export const useDownloadStore = create<DownloadState>((set) => ({
     }),
 
   updateProgress: (id, progress, name, current, total) =>
-    set((state) => ({
-      downloads: {
-        ...state.downloads,
-        [id]: {
-          ...state.downloads[id],
-          // `??` (not `||`) so explicit zero values — e.g. a restarted or
-          // resumed transfer whose byte counter resets to 0 — are honored
-          // instead of being replaced by the stale previous value.
-          name: name ?? state.downloads[id]?.name ?? '',
-          progress,
-          current: current ?? state.downloads[id]?.current ?? 0,
-          total: total ?? state.downloads[id]?.total ?? 0,
+    set((state) => {
+      const previous = state.downloads[id]
+      // `??` (not `||`) so explicit zero values — e.g. a restarted or
+      // resumed transfer whose byte counter resets to 0 — are honored
+      // instead of being replaced by the stale previous value.
+      const nextCurrent = current ?? previous?.current ?? 0
+      const transferStart =
+        previous?.transferStart && nextCurrent >= previous.transferStart.bytes
+          ? previous.transferStart
+          : { bytes: nextCurrent, time: Date.now() }
+      return {
+        downloads: {
+          ...state.downloads,
+          [id]: {
+            ...previous,
+            name: name ?? previous?.name ?? '',
+            progress,
+            current: nextCurrent,
+            total: total ?? previous?.total ?? 0,
+            speed: advanceSpeedSample(previous?.speed, nextCurrent),
+            transferStart,
+            // Bytes moved, so whatever the ladder was reporting is stale.
+            stage: undefined,
+          },
         },
-      },
-    })),
+      }
+    }),
+
+  // A stage update is a status change, never progress: it must not touch
+  // `current`/`total`, or a retry would rewind the bar to zero.
+  updateStage: (id, stage) =>
+    set((state) => {
+      const previous = state.downloads[id]
+      const current = previous?.current ?? 0
+      // No bytes are moving while the downloader waits on a quiet connection
+      // or a reconnect. Keeping the last estimate made the panel quote a live
+      // speed and a frozen ETA for a transfer that had stopped (field
+      // feedback, 2026-09-29); dropping it hides the ETA until bytes flow and
+      // the estimate restarts from the new rate.
+      const idle = stage.kind === 'stalled' || stage.kind === 'retrying'
+      const newStall =
+        stage.kind === 'stalled' && previous?.stage?.kind !== 'stalled'
+      return {
+        downloads: {
+          ...state.downloads,
+          [id]: {
+            ...previous,
+            // A stage can come first (the preflight ladder runs before any
+            // byte): name the row after its id, as `updateProgress` callers
+            // do, so the panel labels it and routes its Cancel by that id.
+            name: previous?.name ?? id,
+            progress: previous?.progress ?? 0,
+            current,
+            total: previous?.total ?? 0,
+            speed: idle
+              ? newSpeedSample(current)
+              : advanceSpeedSample(previous?.speed, current),
+            stalls: (previous?.stalls ?? 0) + (newStall ? 1 : 0),
+            retries:
+              (previous?.retries ?? 0) + (stage.kind === 'retrying' ? 1 : 0),
+            stage,
+          },
+        },
+      }
+    }),
 
   addLocalDownloadingModel: (modelId: string) =>
     set((state) => ({
@@ -152,21 +260,48 @@ export const useDownloadStore = create<DownloadState>((set) => ({
       return { resumeParams: rest }
     }),
 
-  setDownloadOrigin: (modelId: string, modelName: string) =>
+  setDownloadOrigin: (
+    modelId: string,
+    modelName: string,
+    requestOrigin: DownloadRequestOrigin = 'standalone'
+  ) =>
     set((state) => ({
       downloadOriginByModelId: {
         ...state.downloadOriginByModelId,
         [modelId]: modelName,
       },
+      downloadRequestOriginByModelId: {
+        ...state.downloadRequestOriginByModelId,
+        [modelId]: requestOrigin,
+      },
+    })),
+
+  // A Send may intentionally adopt a transfer that was already running from
+  // the Hub/reminder. That is the only promotion from passive to reply-gated.
+  setDownloadRequestOrigin: (modelId, requestOrigin) =>
+    set((state) => ({
+      downloadRequestOriginByModelId: {
+        ...state.downloadRequestOriginByModelId,
+        [modelId]: requestOrigin,
+      },
     })),
 
   clearDownloadOrigin: (modelId: string) =>
     set((state) => {
-      if (!(modelId in state.downloadOriginByModelId)) {
+      if (
+        !(modelId in state.downloadOriginByModelId) &&
+        !(modelId in state.downloadRequestOriginByModelId)
+      ) {
         return state
       }
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const { [modelId]: _, ...rest } = state.downloadOriginByModelId
-      return { downloadOriginByModelId: rest }
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { [modelId]: __, ...requestOrigins } =
+        state.downloadRequestOriginByModelId
+      return {
+        downloadOriginByModelId: rest,
+        downloadRequestOriginByModelId: requestOrigins,
+      }
     }),
 }))

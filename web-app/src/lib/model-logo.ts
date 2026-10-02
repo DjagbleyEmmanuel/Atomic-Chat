@@ -1,3 +1,5 @@
+import type { DiffusionFamilyId } from '@/services/diffusion/types'
+
 // Bundled brand logos served from web-app/public. Matching is done on the model
 // *family*, so a community quant (e.g. a Gemma repack by some user) still shows
 // the recognizable brand mark instead of the quantizer's avatar or a letter.
@@ -13,11 +15,15 @@ const FAMILY_LOGO_RULES: Array<[RegExp, string]> = [
   [/\bling\b/i, '/images/model-provider/ling.webp'],
   [/qwen|qwq/i, '/svg/qwen-color.svg'],
   [/(?<!o)llama/i, '/svg/meta-color.svg'],
-  [/mi[sx]tral|magistral|ministral|codestral|devstral/i, '/images/model-provider/mistral.svg'],
+  [/\bmuse-(spark|glimmer|image)/i, '/svg/meta-color.svg'],
+  [
+    /mi[sx]tral|magistral|ministral|codestral|devstral|voxtral/i,
+    '/images/model-provider/mistral.svg',
+  ],
   [/minimax/i, '/svg/minimax.svg'],
   [/lfm/i, '/svg/liquid.svg'],
   [/nemotron/i, '/images/model-provider/nvidia.svg'],
-  [/gpt-oss/i, '/images/model-provider/openai.svg'],
+  [/gpt-oss/i, '/svg/openai-mark.svg'],
   [/granite/i, '/svg/ibm.svg'],
   [/olmo/i, '/svg/ai2-color.svg'],
   [/hermes/i, '/svg/nousresearch.svg'],
@@ -25,51 +31,99 @@ const FAMILY_LOGO_RULES: Array<[RegExp, string]> = [
   [/laguna/i, '/svg/poolside-color.svg'],
   [/\brnj\b/i, '/svg/essentialai-color.svg'],
   [/\bphi-?\d/i, '/svg/microsoft-color.svg'],
+  // Image and video checkpoints. Z-Image is from Tongyi-MAI, not the Qwen
+  // model family, so it has its own mark rather than inheriting Qwen.
+  [/\bz[- ]?image/i, '/svg/z-image.svg'],
+  [/\bflux[.-]?\d/i, '/svg/bfl.svg'],
+  // Krea has no mark of its own here; Krea 2 is drawn like FLUX.1 Krea, as its
+  // family id's icon key (`bfl`) already has it.
+  [/\bkrea[- ]?2\b/i, '/svg/bfl.svg'],
+  // `Wan2.2-TI2V-5B` on the Hub, `Wan 2.2 TI2V 5B` in the catalog.
+  [/\bwan[- ]?\d/i, '/svg/qwen-color.svg'],
+  [/\bltx-?(video|\d)/i, '/svg/lightricks.svg'],
 ]
 
-// Single-color brand marks (drawn with `fill="currentColor"`). They must be
+// Single-color brand marks (drawn with `fill="currentColor"`, or a raster
+// mark in one dark color on transparency like PrismML's). They must be
 // tinted with the current text color rather than rendered as a plain <img>,
 // otherwise a black-on-transparent mark vanishes on dark backgrounds. See
 // ModelLogo's CSS-mask render path.
 const MONOCHROME_FAMILY_LOGOS: ReadonlySet<string> = new Set([
+  '/images/model-provider/prism-ml.webp',
   '/svg/liquid.svg',
   '/svg/ibm.svg',
   '/svg/nousresearch.svg',
   '/svg/zai.svg',
   '/svg/minimax.svg',
+  '/svg/bfl.svg',
+  '/svg/lightricks.svg',
+  '/svg/openai-mark.svg',
+  '/svg/z-image.svg',
 ])
 
 // Explicit icon keys addressable from the staff-picks manifest. Curators pick
 // the mark by name instead of relying on the repo id matching a family regex,
 // which breaks as soon as a repo is renamed.
 const ICON_KEY_LOGOS: Readonly<Record<string, string>> = {
-  deepseek: '/svg/deepseek-color.svg',
-  gemma: '/svg/google-color.svg',
-  google: '/svg/google-color.svg',
-  glm: '/svg/zai.svg',
-  qwen: '/svg/qwen-color.svg',
-  llama: '/svg/meta-color.svg',
-  meta: '/svg/meta-color.svg',
-  mistral: '/images/model-provider/mistral.svg',
-  lfm: '/svg/liquid.svg',
-  liquid: '/svg/liquid.svg',
-  minimax: '/svg/minimax.svg',
-  nvidia: '/images/model-provider/nvidia.svg',
-  openai: '/images/model-provider/openai.svg',
-  ibm: '/svg/ibm.svg',
-  allenai: '/svg/ai2-color.svg',
-  nous: '/svg/nousresearch.svg',
-  bytedance: '/svg/bytedance-color.svg',
-  poolside: '/svg/poolside-color.svg',
-  essentialai: '/svg/essentialai-color.svg',
-  microsoft: '/svg/microsoft-color.svg',
-  prism: '/images/model-provider/prism-ml.webp',
-  ling: '/images/model-provider/ling.webp',
-  inclusionai: '/images/model-provider/inclusionai.webp',
-  nanbeige: '/images/model-provider/nanbeige.webp',
-  ornith: '/images/model-provider/ornith.webp',
-  huggingface: '/images/model-provider/huggingface.svg',
+  'deepseek': '/svg/deepseek-color.svg',
+  'gemma': '/svg/google-color.svg',
+  'google': '/svg/google-color.svg',
+  'glm': '/svg/zai.svg',
+  'qwen': '/svg/qwen-color.svg',
+  'llama': '/svg/meta-color.svg',
+  'meta': '/svg/meta-color.svg',
+  'muse': '/svg/meta-color.svg',
+  'mistral': '/images/model-provider/mistral.svg',
+  'lfm': '/svg/liquid.svg',
+  'liquid': '/svg/liquid.svg',
+  'minimax': '/svg/minimax.svg',
+  'nvidia': '/images/model-provider/nvidia.svg',
+  'openai': '/svg/openai-mark.svg',
+  'ibm': '/svg/ibm.svg',
+  'allenai': '/svg/ai2-color.svg',
+  'nous': '/svg/nousresearch.svg',
+  'bytedance': '/svg/bytedance-color.svg',
+  'poolside': '/svg/poolside-color.svg',
+  'essentialai': '/svg/essentialai-color.svg',
+  'microsoft': '/svg/microsoft-color.svg',
+  'prism': '/images/model-provider/prism-ml.webp',
+  'ling': '/images/model-provider/ling.webp',
+  'inclusionai': '/images/model-provider/inclusionai.webp',
+  'nanbeige': '/images/model-provider/nanbeige.webp',
+  'ornith': '/images/model-provider/ornith.webp',
+  'convai': '/images/model-provider/convai.webp',
+  'bfl': '/svg/bfl.svg',
+  'flux': '/svg/bfl.svg',
+  'tongyi': '/svg/qwen-color.svg',
+  'wan': '/svg/qwen-color.svg',
+  'lightricks': '/svg/lightricks.svg',
+  'ltx': '/svg/lightricks.svg',
+  'z-image': '/svg/z-image.svg',
+  'huggingface': '/images/model-provider/huggingface.svg',
 }
+
+// Icon key per image/video family id. The catalog is remote and its display
+// names can change without a release; the ids are the stable contract, and a
+// `Record` over the id union makes a new family fail to compile without a mark.
+export const DIFFUSION_FAMILY_ICON_KEYS: Readonly<
+  Record<DiffusionFamilyId, string>
+> = {
+  'z-image': 'z-image',
+  'flux.2-klein': 'bfl',
+  'flux.1': 'bfl',
+  'flux.1-uncensored': 'bfl',
+  'flux.1-abliterated': 'bfl',
+  'flux.1-nsfw-realism': 'bfl',
+  'flux.1-krea': 'bfl',
+  'krea-2-turbo': 'bfl',
+  'qwen-image': 'qwen',
+  'qwen-image-2.1': 'qwen',
+  'wan2.2-ti2v-5b': 'wan',
+  'ltx-2': 'ltx',
+}
+
+/** Every decision model in the catalog is a Convai laya checkpoint. */
+export const DECISION_ICON_KEY = 'convai'
 
 /** The Hugging Face mark, used as the neutral avatar for long-tail results. */
 export const HUGGINGFACE_LOGO_SRC = ICON_KEY_LOGOS.huggingface

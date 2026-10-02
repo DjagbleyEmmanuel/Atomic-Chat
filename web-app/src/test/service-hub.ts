@@ -34,6 +34,7 @@ export function createMockServiceHub(
       overrides.assistants ?? (emptyService as ServiceInstances['assistants']),
     dialog: overrides.dialog ?? (emptyService as ServiceInstances['dialog']),
     opener: overrides.opener ?? (emptyService as ServiceInstances['opener']),
+    auth: overrides.auth ?? (emptyService as ServiceInstances['auth']),
     updater: overrides.updater ?? (emptyService as ServiceInstances['updater']),
     path: overrides.path ?? (emptyService as ServiceInstances['path']),
     core: overrides.core ?? (emptyService as ServiceInstances['core']),
@@ -43,6 +44,11 @@ export function createMockServiceHub(
       overrides.projects ?? (emptyService as ServiceInstances['projects']),
     rag: overrides.rag ?? (emptyService as ServiceInstances['rag']),
     uploads: overrides.uploads ?? (emptyService as ServiceInstances['uploads']),
+    voice: overrides.voice ?? (emptyService as ServiceInstances['voice']),
+    diffusion:
+      overrides.diffusion ?? (emptyService as ServiceInstances['diffusion']),
+    decision:
+      overrides.decision ?? (emptyService as ServiceInstances['decision']),
   }
 
   return {
@@ -60,6 +66,7 @@ export function createMockServiceHub(
     assistants: () => services.assistants,
     dialog: () => services.dialog,
     opener: () => services.opener,
+    auth: () => services.auth,
     updater: () => services.updater,
     path: () => services.path,
     core: () => services.core,
@@ -67,6 +74,9 @@ export function createMockServiceHub(
     projects: () => services.projects,
     rag: () => services.rag,
     uploads: () => services.uploads,
+    voice: () => services.voice,
+    diffusion: () => services.diffusion,
+    decision: () => services.decision,
   }
 }
 
